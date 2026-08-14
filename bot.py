@@ -17,8 +17,7 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = 1682289834
 WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 DB_PATH = os.getenv("DB_PATH", "users.db")
-
-REPORT_COOLDOWN_SECONDS = 600  # 10 минут между жалобами с одного аккаунта
+REPORT_COOLDOWN_SECONDS = 600
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -49,9 +48,6 @@ class ReportTargetState(StatesGroup):
     waiting = State()
 
 class ReportReasonState(StatesGroup):
-    waiting = State()
-
-class ReportConfirmState(StatesGroup):
     waiting = State()
 
 class AdminReplyState(StatesGroup):
@@ -180,7 +176,7 @@ def increment_messages(user_id):
     conn.commit()
     conn.close()
 
-def last_report_time(user_id):
+def last_report_timestamp(user_id):
     conn = db()
     row = conn.execute(
         "SELECT created_at FROM reports WHERE reporter_id = ? ORDER BY id DESC LIMIT 1",
@@ -188,6 +184,18 @@ def last_report_time(user_id):
     ).fetchone()
     conn.close()
     return row["created_at"] if row else None
+
+def report_cooldown_left(user_id):
+    stamp = last_report_timestamp(user_id)
+    if not stamp:
+        return 0
+    try:
+        elapsed = (
+            datetime.now(timezone.utc) - datetime.fromisoformat(stamp)
+        ).total_seconds()
+    except ValueError:
+        return 0
+    return max(0, int(REPORT_COOLDOWN_SECONDS - elapsed))
 
 def increment_reports(user_id):
     conn = db()
@@ -198,14 +206,21 @@ def increment_reports(user_id):
     conn.commit()
     conn.close()
 
-def has_reported_target(reporter_id, target_user_id):
-    if target_user_id is None:
-        return False
+def has_reported_target(reporter_id, target_user_id, target_text=None):
     conn = db()
-    row = conn.execute(
-        "SELECT 1 FROM reports WHERE reporter_id = ? AND target_user_id = ? LIMIT 1",
-        (reporter_id, target_user_id)
-    ).fetchone()
+    if target_user_id is not None:
+        row = conn.execute(
+            "SELECT 1 FROM reports WHERE reporter_id = ? AND target_user_id = ? LIMIT 1",
+            (reporter_id, target_user_id)
+        ).fetchone()
+    else:
+        normalized = (target_text or "").strip().lstrip("@").lower()
+        row = conn.execute(
+            "SELECT 1 FROM reports "
+            "WHERE reporter_id = ? "
+            "AND lower(ltrim(target_text, '@')) = ? LIMIT 1",
+            (reporter_id, normalized)
+        ).fetchone()
     conn.close()
     return row is not None
 
@@ -333,13 +348,6 @@ def cancel_kb():
         [InlineKeyboardButton(text="୨ৎ  Отмена", callback_data="u:cancel")]
     ])
 
-def report_confirm_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="⚠️  Отправить жалобу", callback_data="u:report_confirm")],
-        [InlineKeyboardButton(text="୨ৎ  Изменить причину", callback_data="u:report_edit")],
-        [InlineKeyboardButton(text="୨ৎ  Отмена", callback_data="u:cancel")],
-    ])
-
 def after_send_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="📨  Ещё сообщение", callback_data="u:send")],
@@ -439,9 +447,24 @@ async def user_info(callback: CallbackQuery):
         f"{bullet('Администрация получает сообщение и может ответить вам через бота.')}\n\n"
         "♡ Спасибо, что помогаете поддерживать комфорт и работу флуда.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📨  Обратная связь", callback_data="u:send")],
+            [InlineKeyboardButton(text="📨  О сообщениях", callback_data="u:send_info")],
             [InlineKeyboardButton(text="⚠️  О жалобах", callback_data="u:report_info")],
             [InlineKeyboardButton(text="୨ৎ  Назад", callback_data="u:home")]
+        ])
+    )
+    await callback.answer()
+
+@dp.callback_query(F.data == "u:send_info")
+async def send_info(callback: CallbackQuery):
+    await callback.message.edit_text(
+        f"{title('О сообщениях')}\\n\\n"
+        f"{bullet('Вы пишете сообщение через бота.')}\\n"
+        f"{bullet('Обычным пользователям ваш профиль не показывается.')}\\n"
+        f"{bullet('Администрация получает сообщение и может ответить вам через бота.')}\\n\\n"
+        "♡ Спасибо, что помогаете поддерживать комфорт и работу флуда.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="📨  Оставить сообщение", callback_data="u:send")],
+            [InlineKeyboardButton(text="୨ৎ  Назад", callback_data="u:info")]
         ])
     )
     await callback.answer()
@@ -449,13 +472,12 @@ async def user_info(callback: CallbackQuery):
 @dp.callback_query(F.data == "u:report_info")
 async def report_info(callback: CallbackQuery):
     await callback.message.edit_text(
-        f"⚠️ {title('О жалобах')}\n\n"
-        f"{bullet('Жалоба отправляется администрации, а не другим участникам.')}"
-        f"\n{bullet('Одна жалоба с аккаунта на одного пользователя.')}"
-        f"\n{bullet('Между жалобами действует пауза 10 минут.')}"
-        f"\n{bullet('Нельзя пожаловаться на самого себя.')}"
-        f"\n{bullet('Администрация видит, кто отправил жалобу.')}"
-        "\n\nПеред отправкой бот покажет вам итоговую карточку и попросит подтверждение.",
+        f"⚠️ {title('О жалобах')}\\n\\n"
+        f"{bullet('Жалоба не является анонимной: администрация видит заявителя.')}\\n"
+        f"{bullet('Один аккаунт может пожаловаться на одного пользователя только один раз.')}\\n"
+        f"{bullet('Между жалобами действует пауза 10 минут.')}\\n"
+        f"{bullet('На самого себя пожаловаться нельзя.')}\\n\\n"
+        "Перед отправкой бот покажет данные жалобы и попросит подтверждение.",
         reply_markup=InlineKeyboardMarkup(inline_keyboard=[
             [InlineKeyboardButton(text="⚠️  Подать жалобу", callback_data="u:report")],
             [InlineKeyboardButton(text="୨ৎ  Назад", callback_data="u:info")]
@@ -473,25 +495,7 @@ async def user_send(callback: CallbackQuery, state: FSMContext):
         f"{title('Новое сообщение')}\n\n"
         "Напишите текст следующим сообщением.\n\n"
         "♡ Спасибо, что помогаете поддерживать комфорт и работу флуда.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="✦  Что будет с сообщением", callback_data="u:send_info")],
-            [InlineKeyboardButton(text="୨ৎ  Отмена", callback_data="u:cancel")]
-        ])
-    )
-    await callback.answer()
-
-@dp.callback_query(F.data == "u:send_info")
-async def send_info(callback: CallbackQuery):
-    await callback.message.edit_text(
-        f"✦ {title('Что будет с сообщением')}\n\n"
-        f"{bullet('Сообщение получит администрация бота.')}"
-        f"\n{bullet('Ваш профиль не показывается в обычном пользовательском интерфейсе.')}"
-        f"\n{bullet('Администрация может ответить вам через бота.')}"
-        "\n\n♡ Спасибо за обратную связь.",
-        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-            [InlineKeyboardButton(text="📨  Написать сообщение", callback_data="u:send")],
-            [InlineKeyboardButton(text="୨ৎ  Назад", callback_data="u:home")]
-        ])
+        reply_markup=cancel_kb()
     )
     await callback.answer()
 
@@ -574,21 +578,14 @@ async def report_start(callback: CallbackQuery, state: FSMContext):
         await callback.answer("Доступ ограничен.", show_alert=True)
         return
 
-    last = last_report_time(callback.from_user.id)
-    if last:
-        try:
-            from datetime import datetime, timezone
-            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds()
-            if elapsed < REPORT_COOLDOWN_SECONDS:
-                left = int(REPORT_COOLDOWN_SECONDS - elapsed)
-                minutes = max(1, (left + 59) // 60)
-                await callback.answer(
-                    f"Следующую жалобу можно отправить примерно через {minutes} мин.",
-                    show_alert=True
-                )
-                return
-        except ValueError:
-            pass
+    left = report_cooldown_left(callback.from_user.id)
+    if left:
+        minutes = (left + 59) // 60
+        await callback.answer(
+            f"Следующую жалобу можно отправить примерно через {minutes} мин.",
+            show_alert=True
+        )
+        return
 
     await state.set_state(ReportTargetState.waiting)
     await callback.message.edit_text(
@@ -620,7 +617,7 @@ async def report_target(message: Message, state: FSMContext):
             )
             return
 
-        if has_reported_target(message.from_user.id, target_user_id):
+        if has_reported_target(message.from_user.id, target_user_id, value):
             await state.clear()
             await message.answer(
                 f"{title('Жалоба уже отправлена')}\\n\\n"
@@ -657,31 +654,32 @@ async def report_reason(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
+    target = data.get("target_text", "")
     await state.update_data(reason=reason)
-    await state.set_state(ReportConfirmState.waiting)
 
     await message.answer(
-        f"⚠️ {title('Проверьте жалобу')}\n\n"
-        f"{section('На пользователя')}\n"
-        f"{bullet(data['target_text'])}\n\n"
-        f"{section('Причина')}\n"
-        f"{reason}\n\n"
-        "Важно: жалоба не является анонимной. "
-        "Администрация увидит ваш аккаунт как заявителя.\n\n"
-        "Если всё верно, отправьте жалобу.",
-        reply_markup=report_confirm_kb()
+        f"{title('Проверьте жалобу')}\\n\\n"
+        f"{section('Пользователь')}\\n{bullet(target)}\\n\\n"
+        f"{section('Причина')}\\n{reason}\\n\\n"
+        "⚠️ Важно: эта жалоба не анонимна. Администрация увидит ваш аккаунт.\\n\\n"
+        "Если всё верно, нажмите кнопку отправки.",
+        reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="⚠️  Отправить жалобу", callback_data="u:report_confirm")],
+            [InlineKeyboardButton(text="୨ৎ  Изменить причину", callback_data="u:report_edit")],
+            [InlineKeyboardButton(text="୨ৎ  Отмена", callback_data="u:cancel")]
+        ])
     )
 
 @dp.callback_query(F.data == "u:report_edit")
 async def report_edit(callback: CallbackQuery, state: FSMContext):
     data = await state.get_data()
     if not data.get("target_text"):
-        await callback.answer("Сначала укажите пользователя.", show_alert=True)
+        await callback.answer("Данные жалобы устарели.", show_alert=True)
         return
+
     await state.set_state(ReportReasonState.waiting)
     await callback.message.edit_text(
-        f"{title('Причина жалобы')}\n\n"
-        "Напишите причину заново.",
+        f"{title('Причина жалобы')}\\n\\nНапишите причину заново.",
         reply_markup=cancel_kb()
     )
     await callback.answer()
@@ -694,35 +692,40 @@ async def report_confirm(callback: CallbackQuery, state: FSMContext):
         return
 
     data = await state.get_data()
-    if not data.get("target_text") or not data.get("reason"):
+    target = data.get("target_text")
+    reason = data.get("reason")
+    target_id = data.get("target_user_id")
+
+    if not target or not reason:
         await state.clear()
         await callback.answer("Данные жалобы устарели.", show_alert=True)
         return
 
-    last = last_report_time(callback.from_user.id)
-    if last:
-        try:
-            from datetime import datetime, timezone
-            elapsed = (datetime.now(timezone.utc) - datetime.fromisoformat(last)).total_seconds()
-            if elapsed < REPORT_COOLDOWN_SECONDS:
-                left = int(REPORT_COOLDOWN_SECONDS - elapsed)
-                minutes = max(1, (left + 59) // 60)
-                await state.clear()
-                await callback.message.edit_text(
-                    f"{title('Слишком часто')}\n\n"
-                    f"Следующую жалобу можно отправить примерно через {minutes} мин.",
-                    reply_markup=main_kb()
-                )
-                await callback.answer()
-                return
-        except ValueError:
-            pass
+    left = report_cooldown_left(callback.from_user.id)
+    if left:
+        await state.clear()
+        minutes = (left + 59) // 60
+        await callback.message.edit_text(
+            f"{title('Слишком часто')}\\n\\n"
+            f"Следующую жалобу можно отправить примерно через {minutes} мин.",
+            reply_markup=main_kb()
+        )
+        await callback.answer()
+        return
 
-    target_id = data.get("target_user_id")
-    if target_id is not None and has_reported_target(callback.from_user.id, target_id):
+    if target_id == callback.from_user.id:
         await state.clear()
         await callback.message.edit_text(
-            f"{title('Жалоба уже отправлена')}\n\n"
+            f"{title('Жалоба')}\\n\\nНельзя пожаловаться на самого себя.",
+            reply_markup=main_kb()
+        )
+        await callback.answer()
+        return
+
+    if has_reported_target(callback.from_user.id, target_id, target):
+        await state.clear()
+        await callback.message.edit_text(
+            f"{title('Жалоба уже отправлена')}\\n\\n"
             "Вы уже отправляли жалобу на этого пользователя.",
             reply_markup=main_kb()
         )
@@ -731,15 +734,15 @@ async def report_confirm(callback: CallbackQuery, state: FSMContext):
 
     report_id = create_report(
         callback.from_user.id,
-        data["target_text"],
+        target,
         target_id,
-        data["reason"]
+        reason
     )
 
     if report_id is None:
         await state.clear()
         await callback.message.edit_text(
-            f"{title('Жалоба уже отправлена')}\n\n"
+            f"{title('Жалоба уже отправлена')}\\n\\n"
             "Вы уже отправляли жалобу на этого пользователя.",
             reply_markup=main_kb()
         )
@@ -752,20 +755,21 @@ async def report_confirm(callback: CallbackQuery, state: FSMContext):
     reporter = get_user(callback.from_user.id)
     reporter_name = display_name(reporter)
     reporter_username = (
-        f"@{reporter['username']}" if reporter and reporter["username"]
+        f"@{reporter['username']}"
+        if reporter and reporter["username"]
         else "нет username"
     )
     target_id_text = str(target_id) if target_id else "не указан"
 
     admin_text = (
-        f"⚠️ {title(f'Жалоба #{report_id}')}\n\n"
-        f"{section('На пользователя')}\n"
-        f"{bullet('Указано: ' + data['target_text'])}\n"
-        f"{bullet('ID: ' + target_id_text)}\n\n"
-        f"{section('Причина')}\n{data['reason']}\n\n"
-        f"{section('Заявитель')}\n"
-        f"{bullet('Имя: ' + reporter_name)}\n"
-        f"{bullet('Username: ' + reporter_username)}\n"
+        f"⚠️ {title(f'Жалоба #{report_id}')}\\n\\n"
+        f"{section('На пользователя')}\\n"
+        f"{bullet('Указано: ' + target)}\\n"
+        f"{bullet('ID: ' + target_id_text)}\\n\\n"
+        f"{section('Причина')}\\n{reason}\\n\\n"
+        f"{section('Заявитель')}\\n"
+        f"{bullet('Имя: ' + reporter_name)}\\n"
+        f"{bullet('Username: ' + reporter_username)}\\n"
         f"{bullet('ID: ' + str(callback.from_user.id))}"
     )
 
@@ -776,13 +780,13 @@ async def report_confirm(callback: CallbackQuery, state: FSMContext):
     )
 
     await callback.message.edit_text(
-        f"{title('Жалоба отправлена')}\n\n"
-        "Администрация получила обращение.\n\n"
-        "⚠️ Напоминаем: заявитель виден администрации.\n\n"
-        "Ограничение: следующую жалобу можно будет отправить не раньше чем через 10 минут.",
+        f"{title('Жалоба отправлена')}\\n\\n"
+        "Администрация получила обращение.\\n\\n"
+        "⚠️ Заявитель виден администрации.\\n"
+        "Следующую жалобу можно будет отправить через 10 минут.",
         reply_markup=main_kb()
     )
-    await callback.answer("Жалоба отправлена.")
+    await callback.answer("Жалоба отправлена")
 
 @dp.message(ReportTargetState.waiting)
 @dp.message(ReportReasonState.waiting)
