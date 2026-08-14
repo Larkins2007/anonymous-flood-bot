@@ -45,30 +45,31 @@ dp = Dispatcher(storage=MemoryStorage())
 
 # =========================================================
 # DESIGN
+# ЕДИНЫЙ СТИЛЬ: ♡₊˚ ... ˚₊♡
 # =========================================================
 
 def title(text: str) -> str:
-    return f"╭─ ୨୧ {text} ୨୧ ─╮"
+    return f"♡₊˚ {text} ˚₊♡"
 
 
 def subtitle(text: str) -> str:
-    return f"┊ 〔 {text} 〕"
+    return f"₊˚⊹ {text} ⊹˚₊"
 
 
 def section(text: str) -> str:
-    return f"✦  {text}"
+    return f"୨୧ {text}"
 
 
 def bullet(text: str) -> str:
-    return f"│  ◇ {text}"
+    return f"♡ {text}"
 
 
 def note(text: str) -> str:
-    return f"╰─ ♡ {text}"
+    return f"₊˚♡ {text} ♡˚₊"
 
 
 def divider() -> str:
-    return "┈┈┈┈┈┈┈┈┈┈┈"
+    return "┈┈┈┈┈┈୨୧┈┈┈┈┈┈"
 
 
 # =========================================================
@@ -598,19 +599,19 @@ def main_kb():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✉  Оставить сообщение",
+                    text="♡₊˚ Оставить сообщение ˚₊♡",
                     callback_data="u:send",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="❖  Как это работает",
+                    text="୨୧ Как это работает ୨୧",
                     callback_data="u:info",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⚠  Пожаловаться",
+                    text="₊˚ Жалоба ˚₊",
                     callback_data="u:report",
                 )
             ],
@@ -623,7 +624,7 @@ def cancel_kb():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="‹  Отмена",
+                    text="‹₊˚ Отмена ˚₊",
                     callback_data="u:cancel",
                 )
             ]
@@ -636,13 +637,13 @@ def after_send_kb():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="✉  Ещё сообщение",
+                    text="♡ Ещё сообщение ♡",
                     callback_data="u:send",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⌂  В меню",
+                    text="₊˚⌂ В меню ˚₊",
                     callback_data="u:home",
                 )
             ],
@@ -659,33 +660,33 @@ def admin_kb():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="♙  Пользователи",
+                    text="୨୧ Пользователи ୨୧",
                     callback_data="a:users:0",
                 ),
                 InlineKeyboardButton(
-                    text="✉  Сообщения",
+                    text="♡ Сообщения ♡",
                     callback_data="a:messages",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="⚠  Жалобы",
+                    text="₊˚ Жалобы ˚₊",
                     callback_data="a:reports",
                 ),
                 InlineKeyboardButton(
-                    text="▦  Статистика",
+                    text="୨୧ Статистика ୨୧",
                     callback_data="a:stats",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="⊘  Заблокированные",
+                    text="♡ Заблокированные ♡",
                     callback_data="a:blocked",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="➤  Рассылка",
+                    text="₊˚ Рассылка ˚₊",
                     callback_data="a:broadcast",
                 )
             ],
@@ -698,7 +699,7 @@ def back_admin():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="‹  В админку",
+                    text="‹₊˚ В админку ˚₊",
                     callback_data="a:home",
                 )
             ]
@@ -712,22 +713,22 @@ def user_admin_kb(user_id, blocked):
             [
                 InlineKeyboardButton(
                     text=(
-                        "♢  Разблокировать"
+                        "♡ Разблокировать ♡"
                         if blocked
-                        else "⊘  Заблокировать"
+                        else "₊˚ Заблокировать ˚₊"
                     ),
                     callback_data=f"a:toggle:{user_id}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="↳  Ответить",
+                    text="୨୧ Ответить ୨୧",
                     callback_data=f"a:replyuser:{user_id}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="‹  Назад",
+                    text="‹₊˚ Назад ˚₊",
                     callback_data="a:users:0",
                 )
             ],
@@ -745,7 +746,7 @@ def report_admin_kb(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="⊘  Заблокировать пользователя",
+                    text="₊˚ Заблокировать пользователя ˚₊",
                     callback_data=f"a:block:{target_user_id}",
                 )
             ]
@@ -754,7 +755,7 @@ def report_admin_kb(
     rows.append(
         [
             InlineKeyboardButton(
-                text="✓  Закрыть жалобу",
+                text="♡ Закрыть жалобу ♡",
                 callback_data=f"a:close_report:{report_id}",
             )
         ]
@@ -763,7 +764,7 @@ def report_admin_kb(
     rows.append(
         [
             InlineKeyboardButton(
-                text="‹  К жалобам",
+                text="‹₊˚ К жалобам ˚₊",
                 callback_data="a:reports",
             )
         ]
@@ -838,27 +839,28 @@ async def user_info(callback: CallbackQuery):
         f"{section('Сообщения')}\n"
         f"{bullet('Вы отправляете текст через этого бота.')}\n"
         f"{bullet('Другие участники не видят ваш профиль.')}\n"
-        f"{bullet('Администрация видит отправителя сообщения.')}\n\n"
+        f"{bullet('Администрация видит отправителя.')}\n\n"
         f"{section('Ответы')}\n"
         f"{bullet('Администратор может ответить вам прямо через бота.')}\n\n"
+        f"{divider()}\n"
         f"{note('Спасибо за обратную связь.')}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="✉  О сообщениях",
+                        text="♡ О сообщениях ♡",
                         callback_data="u:send_info",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="⚠  О жалобах",
+                        text="₊˚ О жалобах ˚₊",
                         callback_data="u:report_info",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="‹  Назад",
+                        text="‹₊˚ Назад ˚₊",
                         callback_data="u:home",
                     )
                 ],
@@ -877,18 +879,19 @@ async def send_info(callback: CallbackQuery):
         f"{bullet('Обычным пользователям ваш профиль не показывается.')}\n"
         f"{bullet('Администрация видит отправителя.')}\n"
         f"{bullet('При необходимости администрация может ответить вам.')}\n\n"
+        f"{divider()}\n"
         f"{note('Сообщение можно отправить в любое время.')}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="✉  Оставить сообщение",
+                        text="♡₊˚ Оставить сообщение ˚₊♡",
                         callback_data="u:send",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="‹  Назад",
+                        text="‹₊˚ Назад ˚₊",
                         callback_data="u:info",
                     )
                 ],
@@ -902,24 +905,25 @@ async def send_info(callback: CallbackQuery):
 @dp.callback_query(F.data == "u:report_info")
 async def report_info(callback: CallbackQuery):
     await callback.message.edit_text(
-        f"⚠ {title('О жалобах')}\n\n"
+        f"{title('О жалобах')}\n\n"
         f"{bullet('Жалоба не является анонимной.')}\n"
         f"{bullet('Администрация видит аккаунт заявителя.')}\n"
         f"{bullet('Один аккаунт может пожаловаться на одного пользователя только один раз.')}\n"
         f"{bullet('Между жалобами действует пауза 10 минут.')}\n"
         f"{bullet('На самого себя пожаловаться нельзя.')}\n\n"
+        f"{divider()}\n"
         f"{note('Перед отправкой бот покажет жалобу и попросит подтверждение.')}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="⚠  Подать жалобу",
+                        text="₊˚ Подать жалобу ˚₊",
                         callback_data="u:report",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="‹  Назад",
+                        text="‹₊˚ Назад ˚₊",
                         callback_data="u:info",
                     )
                 ],
@@ -954,6 +958,7 @@ async def user_send(
         f"{title('Новое сообщение')}\n\n"
         f"{bullet('Напишите текст следующим сообщением.')}\n"
         f"{bullet('Максимальная длина — 4000 символов.')}\n\n"
+        f"{divider()}\n"
         f"{note('Ваше сообщение будет передано администрации.')}",
         reply_markup=cancel_kb(),
     )
@@ -1005,7 +1010,7 @@ async def feedback(
 
         await message.answer(
             f"{title('Доступ ограничен')}\n\n"
-            "Для вашего аккаунта отправка сообщений отключена."
+            f"{bullet('Для вашего аккаунта отправка сообщений отключена.')}"
         )
         return
 
@@ -1013,14 +1018,16 @@ async def feedback(
 
     if not text:
         await message.answer(
-            "Сообщение пустое. Попробуйте ещё раз.",
+            f"{title('Пустое сообщение')}\n\n"
+            f"{note('Попробуйте написать сообщение ещё раз.')}",
             reply_markup=cancel_kb(),
         )
         return
 
     if len(text) > 4000:
         await message.answer(
-            "Сообщение слишком длинное. Максимум — 4000 символов.",
+            f"{title('Слишком длинное сообщение')}\n\n"
+            f"{bullet('Максимальная длина — 4000 символов.')}",
             reply_markup=cancel_kb(),
         )
         return
@@ -1065,11 +1072,11 @@ async def feedback(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="↳  Ответить",
+                            text="୨୧ Ответить ୨୧",
                             callback_data=f"reply:{message.from_user.id}",
                         ),
                         InlineKeyboardButton(
-                            text="⊘  Заблокировать",
+                            text="₊˚ Заблокировать ˚₊",
                             callback_data=f"a:block:{message.from_user.id}",
                         ),
                     ]
@@ -1083,8 +1090,9 @@ async def feedback(
         )
 
         await message.answer(
-            "Не удалось передать сообщение администрации. "
-            "Попробуйте немного позже.",
+            f"{title('Ошибка')}\n\n"
+            f"{bullet('Не удалось передать сообщение администрации.')}\n"
+            f"{note('Попробуйте немного позже.')}",
             reply_markup=main_kb(),
         )
         return
@@ -1101,7 +1109,8 @@ async def feedback(
 @dp.message(FeedbackState.waiting)
 async def feedback_non_text(message: Message):
     await message.answer(
-        "Пожалуйста, отправьте сообщение текстом.",
+        f"{title('Нужен текст')}\n\n"
+        f"{note('Пожалуйста, отправьте сообщение текстом.')}",
         reply_markup=cancel_kb(),
     )
 
@@ -1140,12 +1149,12 @@ async def report_start(
     )
 
     await callback.message.edit_text(
-        f"⚠ {title('Жалоба на пользователя')}\n\n"
+        f"{title('Жалоба на пользователя')}\n\n"
         f"{bullet('Укажите username или Telegram ID пользователя.')}\n\n"
         f"{divider()}\n"
-        f"⚠ Важно\n"
-        "Жалоба НЕ является анонимной.\n"
-        "Администрация увидит ваш аккаунт как заявителя.",
+        f"{section('Важно')}\n"
+        f"{bullet('Жалоба НЕ является анонимной.')}\n"
+        f"{bullet('Администрация увидит ваш аккаунт как заявителя.')}",
         reply_markup=cancel_kb(),
     )
 
@@ -1164,7 +1173,8 @@ async def report_target(
 
     if len(value) < 2 or len(value) > 100:
         await message.answer(
-            "Укажите корректный username или Telegram ID.",
+            f"{title('Некорректный пользователь')}\n\n"
+            f"{note('Укажите корректный username или Telegram ID.')}",
             reply_markup=cancel_kb(),
         )
         return
@@ -1184,7 +1194,7 @@ async def report_target(
 
             await message.answer(
                 f"{title('Жалоба')}\n\n"
-                "Нельзя пожаловаться на самого себя.",
+                f"{bullet('Нельзя пожаловаться на самого себя.')}",
                 reply_markup=main_kb(),
             )
             return
@@ -1198,7 +1208,7 @@ async def report_target(
 
             await message.answer(
                 f"{title('Жалоба уже отправлена')}\n\n"
-                "Вы уже отправляли жалобу на этого пользователя.",
+                f"{bullet('Вы уже отправляли жалобу на этого пользователя.')}",
                 reply_markup=main_kb(),
             )
             return
@@ -1233,14 +1243,16 @@ async def report_reason(
 
     if len(reason) < 3:
         await message.answer(
-            "Опишите причину немного подробнее.",
+            f"{title('Слишком коротко')}\n\n"
+            f"{note('Опишите причину немного подробнее.')}",
             reply_markup=cancel_kb(),
         )
         return
 
     if len(reason) > 2000:
         await message.answer(
-            "Причина слишком длинная. Максимум — 2000 символов.",
+            f"{title('Слишком длинно')}\n\n"
+            f"{bullet('Максимальная длина — 2000 символов.')}",
             reply_markup=cancel_kb(),
         )
         return
@@ -1263,25 +1275,25 @@ async def report_reason(
         f"{section('Причина')}\n"
         f"{reason}\n\n"
         f"{divider()}\n"
-        "⚠ Заявитель виден администрации.\n\n"
-        "Если всё верно — подтвердите отправку.",
+        f"{bullet('Заявитель виден администрации.')}\n\n"
+        f"{note('Если всё верно — подтвердите отправку.')}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="⚠  Отправить жалобу",
+                        text="₊˚ Отправить жалобу ˚₊",
                         callback_data="u:report_confirm",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="↻  Изменить причину",
+                        text="୨୧ Изменить причину ୨୧",
                         callback_data="u:report_edit",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="‹  Отмена",
+                        text="‹₊˚ Отмена ˚₊",
                         callback_data="u:cancel",
                     )
                 ],
@@ -1310,7 +1322,7 @@ async def report_edit(
 
     await callback.message.edit_text(
         f"{title('Причина жалобы')}\n\n"
-        "Напишите причину заново.",
+        f"{note('Напишите причину заново.')}",
         reply_markup=cancel_kb(),
     )
 
@@ -1357,7 +1369,7 @@ async def report_confirm(
 
         await callback.message.edit_text(
             f"{title('Слишком часто')}\n\n"
-            f"Следующую жалобу можно отправить примерно через {minutes} мин.",
+            f"{bullet(f'Следующую жалобу можно отправить примерно через {minutes} мин.')}",
             reply_markup=main_kb(),
         )
 
@@ -1369,7 +1381,7 @@ async def report_confirm(
 
         await callback.message.edit_text(
             f"{title('Жалоба')}\n\n"
-            "Нельзя пожаловаться на самого себя.",
+            f"{bullet('Нельзя пожаловаться на самого себя.')}",
             reply_markup=main_kb(),
         )
 
@@ -1385,7 +1397,7 @@ async def report_confirm(
 
         await callback.message.edit_text(
             f"{title('Жалоба уже отправлена')}\n\n"
-            "Вы уже отправляли жалобу на этого пользователя.",
+            f"{bullet('Вы уже отправляли жалобу на этого пользователя.')}",
             reply_markup=main_kb(),
         )
 
@@ -1404,7 +1416,7 @@ async def report_confirm(
 
         await callback.message.edit_text(
             f"{title('Жалоба уже отправлена')}\n\n"
-            "Вы уже отправляли жалобу на этого пользователя.",
+            f"{bullet('Вы уже отправляли жалобу на этого пользователя.')}",
             reply_markup=main_kb(),
         )
 
@@ -1438,7 +1450,7 @@ async def report_confirm(
     )
 
     admin_text = (
-        f"⚠ {title(f'Жалоба #{report_id}')}\n\n"
+        f"{title(f'Жалоба #{report_id}')}\n\n"
         f"{section('На пользователя')}\n"
         f"{bullet('Указано: ' + target)}\n"
         f"{bullet('ID: ' + target_id_text)}\n\n"
@@ -1468,7 +1480,7 @@ async def report_confirm(
 
         await callback.message.edit_text(
             f"{title('Ошибка')}\n\n"
-            "Не удалось передать жалобу администрации.",
+            f"{bullet('Не удалось передать жалобу администрации.')}",
             reply_markup=main_kb(),
         )
 
@@ -1493,7 +1505,8 @@ async def report_confirm(
 @dp.message(ReportReasonState.waiting)
 async def report_non_text(message: Message):
     await message.answer(
-        "Пожалуйста, отправьте ответ текстом.",
+        f"{title('Нужен текст')}\n\n"
+        f"{note('Пожалуйста, отправьте ответ текстом.')}",
         reply_markup=cancel_kb(),
     )
 
@@ -1589,7 +1602,7 @@ async def admin_reply_user_start(
 
     await callback.message.answer(
         f"{title('Ответ пользователю')}\n\n"
-        "Напишите текст ответа.",
+        f"{bullet('Напишите текст ответа.')}",
         reply_markup=cancel_kb(),
     )
 
@@ -1615,7 +1628,8 @@ async def admin_reply(
 
     if not user_id:
         await message.answer(
-            "Получатель не найден."
+            f"{title('Ошибка')}\n\n"
+            f"{bullet('Получатель не найден.')}"
         )
         return
 
@@ -1629,7 +1643,7 @@ async def admin_reply(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="✉  Ответить администрации",
+                            text="♡ Ответить администрации ♡",
                             callback_data="u:send",
                         )
                     ]
@@ -1649,8 +1663,9 @@ async def admin_reply(
         )
 
         await message.answer(
-            "Не удалось доставить ответ. "
-            "Возможно, пользователь заблокировал бота.",
+            f"{title('Ошибка доставки')}\n\n"
+            f"{bullet('Не удалось доставить ответ.')}\n"
+            f"{note('Возможно, пользователь заблокировал бота.')}",
             reply_markup=admin_kb(),
         )
 
@@ -1661,7 +1676,8 @@ async def admin_reply_non_text(message: Message):
         return
 
     await message.answer(
-        "Пожалуйста, отправьте ответ текстом.",
+        f"{title('Нужен текст')}\n\n"
+        f"{note('Пожалуйста, отправьте ответ текстом.')}",
         reply_markup=cancel_kb(),
     )
 
@@ -1732,7 +1748,9 @@ async def admin_stats(callback: CallbackQuery):
         f"{bullet(f'Пользователей: {user_count()}')}\n"
         f"{bullet(f'Получено сообщений: {message_count()}')}\n"
         f"{bullet(f'Заблокировано: {blocked_count()}')}\n"
-        f"{bullet(f'Новых жалоб: {new_reports_count()}')}",
+        f"{bullet(f'Новых жалоб: {new_reports_count()}')}\n\n"
+        f"{divider()}\n"
+        f"{note('Статистика обновляется автоматически.')}",
         reply_markup=back_admin(),
     )
 
@@ -1751,6 +1769,7 @@ async def admin_messages(callback: CallbackQuery):
     await callback.message.edit_text(
         f"{title('Сообщения')}\n\n"
         f"{bullet(f'Всего получено: {message_count()}')}\n\n"
+        f"{divider()}\n"
         f"{note('Новые сообщения приходят прямо в чат администрации.')}",
         reply_markup=back_admin(),
     )
@@ -1791,7 +1810,7 @@ async def admin_users(callback: CallbackQuery):
         label = display_name(row)
 
         if row["blocked"]:
-            label = f"⊘  {label}"
+            label = f"⊘ {label}"
 
         buttons.append(
             [
@@ -1826,7 +1845,7 @@ async def admin_users(callback: CallbackQuery):
     buttons.append(
         [
             InlineKeyboardButton(
-                text="⌕  Поиск",
+                text="⌕₊˚ Поиск ˚₊",
                 callback_data="a:search",
             )
         ]
@@ -1835,7 +1854,7 @@ async def admin_users(callback: CallbackQuery):
     buttons.append(
         [
             InlineKeyboardButton(
-                text="‹  Назад",
+                text="‹₊˚ Назад ˚₊",
                 callback_data="a:home",
             )
         ]
@@ -1845,7 +1864,8 @@ async def admin_users(callback: CallbackQuery):
         f"{title('Пользователи')}\n\n"
         f"{bullet(f'Всего: {user_count()}')}\n"
         f"{bullet(f'Страница: {page + 1}')}\n\n"
-        "Выберите пользователя.",
+        f"{divider()}\n"
+        f"{note('Выберите пользователя.')}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=buttons
         ),
@@ -1899,7 +1919,7 @@ async def admin_search(
     if not rows:
         await message.answer(
             f"{title('Поиск')}\n\n"
-            "Пользователи не найдены.",
+            f"{note('Пользователи не найдены.')}",
             reply_markup=admin_kb(),
         )
         return
@@ -1910,7 +1930,7 @@ async def admin_search(
         label = display_name(row)
 
         if row["blocked"]:
-            label = f"⊘  {label}"
+            label = f"⊘ {label}"
 
         buttons.append(
             [
@@ -1923,7 +1943,8 @@ async def admin_search(
 
     await message.answer(
         f"{title('Результаты поиска')}\n\n"
-        f"{bullet(f'Найдено: {len(rows)}')}",
+        f"{bullet(f'Найдено: {len(rows)}')}\n\n"
+        f"{divider()}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=buttons
         ),
@@ -1936,7 +1957,8 @@ async def admin_search_non_text(message: Message):
         return
 
     await message.answer(
-        "Введите имя, username или Telegram ID.",
+        f"{title('Нужен текст')}\n\n"
+        f"{note('Введите имя, username или Telegram ID.')}",
         reply_markup=cancel_kb(),
     )
 
@@ -2065,10 +2087,12 @@ async def admin_toggle(callback: CallbackQuery):
 
     await callback.message.edit_text(
         f"{title('Пользователь')}\n\n"
+        f"{section('Профиль')}\n"
         f"{bullet('Имя: ' + display_name(row))}\n"
         f"{bullet('Username: ' + username)}\n"
-        f"{bullet('ID: ' + str(row['user_id']))}\n"
-        f"{bullet('Статус: ' + status)}",
+        f"{bullet('ID: ' + str(row['user_id']))}\n\n"
+        f"{section('Статус')}\n"
+        f"{bullet(status)}",
         reply_markup=user_admin_kb(
             user_id,
             bool(row["blocked"]),
@@ -2194,14 +2218,14 @@ async def admin_reports(callback: CallbackQuery):
 
     for row in rows:
         text += (
-            f"⚠ #{row['id']}  {row['target_text']}\n"
+            f"₊˚ #{row['id']}  {row['target_text']}\n"
             f"{bullet(row['reason'][:100])}\n\n"
         )
 
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text=f"Открыть жалобу #{row['id']}",
+                    text=f"୨୧ Открыть жалобу #{row['id']} ୨୧",
                     callback_data=f"a:report:{row['id']}",
                 )
             ]
@@ -2210,7 +2234,7 @@ async def admin_reports(callback: CallbackQuery):
     buttons.append(
         [
             InlineKeyboardButton(
-                text="‹  Назад",
+                text="‹₊˚ Назад ˚₊",
                 callback_data="a:home",
             )
         ]
@@ -2278,7 +2302,7 @@ async def admin_report(callback: CallbackQuery):
     )
 
     await callback.message.edit_text(
-        f"⚠ {title(f'Жалоба #{report_id}')}\n\n"
+        f"{title(f'Жалоба #{report_id}')}\n\n"
         f"{section('Статус')}\n"
         f"{bullet(status)}\n\n"
         f"{section('Пользователь')}\n"
@@ -2329,7 +2353,7 @@ async def admin_close_report(callback: CallbackQuery):
 
     await callback.message.edit_text(
         f"{title('Жалоба закрыта')}\n\n"
-        f"{bullet('Номер: #' + str(report_id))}\n"
+        f"{bullet('Номер: #' + str(report_id))}\n\n"
         f"{note('Обращение отмечено как рассмотренное.')}",
         reply_markup=back_admin(),
     )
@@ -2359,7 +2383,8 @@ async def admin_broadcast_start(
         f"{title('Рассылка')}\n\n"
         f"{bullet('Напишите текст для всех зарегистрированных пользователей.')}\n"
         f"{bullet('Заблокированные пользователи рассылку не получают.')}\n\n"
-        f"⚠ Используйте рассылку только для важных объявлений.",
+        f"{divider()}\n"
+        f"{note('Используйте рассылку только для важных объявлений.')}",
         reply_markup=cancel_kb(),
     )
 
@@ -2381,14 +2406,16 @@ async def admin_broadcast(
 
     if not text:
         await message.answer(
-            "Текст рассылки не может быть пустым.",
+            f"{title('Пустая рассылка')}\n\n"
+            f"{note('Текст рассылки не может быть пустым.')}",
             reply_markup=cancel_kb(),
         )
         return
 
     if len(text) > 4000:
         await message.answer(
-            "Текст слишком длинный. Максимум — 4000 символов.",
+            f"{title('Слишком длинный текст')}\n\n"
+            f"{bullet('Максимальная длина — 4000 символов.')}",
             reply_markup=cancel_kb(),
         )
         return
@@ -2432,6 +2459,7 @@ async def admin_broadcast(
         f"{title('Рассылка завершена')}\n\n"
         f"{bullet('Отправлено: ' + str(sent))}\n"
         f"{bullet('Не доставлено: ' + str(failed))}\n\n"
+        f"{divider()}\n"
         f"{note('Рассылка завершена.')}",
         reply_markup=admin_kb(),
     )
@@ -2443,7 +2471,8 @@ async def admin_broadcast_non_text(message: Message):
         return
 
     await message.answer(
-        "Пожалуйста, отправьте текст рассылки.",
+        f"{title('Нужен текст')}\n\n"
+        f"{note('Пожалуйста, отправьте текст рассылки.')}",
         reply_markup=cancel_kb(),
     )
 
