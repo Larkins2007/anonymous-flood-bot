@@ -1,2 +1,2 @@
-aiogram>=3.20,<4
-aiohttp>=3.10,<4
+aiogram>=3.7,<4.0
+aiohttp>=3.9,<4.0
