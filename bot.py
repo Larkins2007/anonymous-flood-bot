@@ -23,11 +23,8 @@ from aiogram.types import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-# Твой Telegram ID администратора
 ADMIN_ID = 1682289834
 
-# На Render можно указать свой путь через DB_PATH.
-# Для обычного запуска будет users.db
 DB_PATH = os.getenv("DB_PATH", "users.db")
 
 REPORT_COOLDOWN_SECONDS = 600
@@ -47,19 +44,31 @@ dp = Dispatcher(storage=MemoryStorage())
 
 
 # =========================================================
-# AESTHETIC
+# DESIGN
 # =========================================================
 
 def title(text: str) -> str:
-    return f"୨୧ {text} ୨୧"
+    return f"╭─ ୨୧ {text} ୨୧ ─╮"
+
+
+def subtitle(text: str) -> str:
+    return f"┊ 〔 {text} 〕"
 
 
 def section(text: str) -> str:
-    return f"✦ {text} ✧"
+    return f"✦  {text}"
 
 
 def bullet(text: str) -> str:
-    return f"୨ৎ {text}"
+    return f"│  ◇ {text}"
+
+
+def note(text: str) -> str:
+    return f"╰─ ♡ {text}"
+
+
+def divider() -> str:
+    return "┈┈┈┈┈┈┈┈┈┈┈"
 
 
 # =========================================================
@@ -152,19 +161,25 @@ def migrate_db():
 
     cols = {
         row["name"]
-        for row in conn.execute("PRAGMA table_info(users)").fetchall()
+        for row in conn.execute(
+            "PRAGMA table_info(users)"
+        ).fetchall()
     }
 
     if "reports_count" not in cols:
         conn.execute(
-            "ALTER TABLE users "
-            "ADD COLUMN reports_count INTEGER NOT NULL DEFAULT 0"
+            """
+            ALTER TABLE users
+            ADD COLUMN reports_count INTEGER NOT NULL DEFAULT 0
+            """
         )
 
     if "blocked" not in cols:
         conn.execute(
-            "ALTER TABLE users "
-            "ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0"
+            """
+            ALTER TABLE users
+            ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0
+            """
         )
 
     conn.commit()
@@ -230,7 +245,11 @@ def set_blocked(user_id, value):
     conn = db()
 
     conn.execute(
-        "UPDATE users SET blocked = ? WHERE user_id = ?",
+        """
+        UPDATE users
+        SET blocked = ?
+        WHERE user_id = ?
+        """,
         (1 if value else 0, user_id),
     )
 
@@ -338,7 +357,6 @@ def has_reported_target(
                 target_user_id,
             ),
         ).fetchone()
-
     else:
         normalized = (
             (target_text or "")
@@ -440,19 +458,15 @@ def close_report(report_id):
 
 def user_count():
     conn = db()
-
     value = conn.execute(
         "SELECT COUNT(*) FROM users"
     ).fetchone()[0]
-
     conn.close()
-
     return value
 
 
 def blocked_count():
     conn = db()
-
     value = conn.execute(
         """
         SELECT COUNT(*)
@@ -460,21 +474,16 @@ def blocked_count():
         WHERE blocked = 1
         """
     ).fetchone()[0]
-
     conn.close()
-
     return value
 
 
 def message_count():
     conn = db()
-
     value = conn.execute(
         "SELECT COUNT(*) FROM sent_messages"
     ).fetchone()[0]
-
     conn.close()
-
     return value
 
 
@@ -581,7 +590,7 @@ def display_name(row):
 
 
 # =========================================================
-# KEYBOARDS
+# USER KEYBOARDS
 # =========================================================
 
 def main_kb():
@@ -589,19 +598,19 @@ def main_kb():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📨  Оставить сообщение",
+                    text="✉  Оставить сообщение",
                     callback_data="u:send",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="✦  Как это работает",
+                    text="❖  Как это работает",
                     callback_data="u:info",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="⚠️  Пожаловаться",
+                    text="⚠  Пожаловаться",
                     callback_data="u:report",
                 )
             ],
@@ -614,7 +623,7 @@ def cancel_kb():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="୨ৎ  Отмена",
+                    text="‹  Отмена",
                     callback_data="u:cancel",
                 )
             ]
@@ -627,13 +636,13 @@ def after_send_kb():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="📨  Ещё сообщение",
+                    text="✉  Ещё сообщение",
                     callback_data="u:send",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="୨୧  В меню",
+                    text="⌂  В меню",
                     callback_data="u:home",
                 )
             ],
@@ -641,38 +650,42 @@ def after_send_kb():
     )
 
 
+# =========================================================
+# ADMIN KEYBOARDS
+# =========================================================
+
 def admin_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="👥  Пользователи",
+                    text="♙  Пользователи",
                     callback_data="a:users:0",
                 ),
                 InlineKeyboardButton(
-                    text="📨  Сообщения",
+                    text="✉  Сообщения",
                     callback_data="a:messages",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="⚠️  Жалобы",
+                    text="⚠  Жалобы",
                     callback_data="a:reports",
                 ),
                 InlineKeyboardButton(
-                    text="📊  Статистика",
+                    text="▦  Статистика",
                     callback_data="a:stats",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="🚫  Заблокированные",
+                    text="⊘  Заблокированные",
                     callback_data="a:blocked",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="📣  Рассылка",
+                    text="➤  Рассылка",
                     callback_data="a:broadcast",
                 )
             ],
@@ -685,7 +698,7 @@ def back_admin():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="୨ৎ  В админку",
+                    text="‹  В админку",
                     callback_data="a:home",
                 )
             ]
@@ -699,22 +712,22 @@ def user_admin_kb(user_id, blocked):
             [
                 InlineKeyboardButton(
                     text=(
-                        "Разблокировать"
+                        "♢  Разблокировать"
                         if blocked
-                        else "🚫  Заблокировать"
+                        else "⊘  Заблокировать"
                     ),
                     callback_data=f"a:toggle:{user_id}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="💬  Ответить",
+                    text="↳  Ответить",
                     callback_data=f"a:replyuser:{user_id}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="୨ৎ  Назад",
+                    text="‹  Назад",
                     callback_data="a:users:0",
                 )
             ],
@@ -732,7 +745,7 @@ def report_admin_kb(
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="🚫  Заблокировать пользователя",
+                    text="⊘  Заблокировать пользователя",
                     callback_data=f"a:block:{target_user_id}",
                 )
             ]
@@ -750,7 +763,7 @@ def report_admin_kb(
     rows.append(
         [
             InlineKeyboardButton(
-                text="୨ৎ  К жалобам",
+                text="‹  К жалобам",
                 callback_data="a:reports",
             )
         ]
@@ -762,15 +775,18 @@ def report_admin_kb(
 
 
 # =========================================================
-# USER UI
+# USER HOME
 # =========================================================
 
 def home_text():
     return (
         f"{title('Анонимная обратная связь')}\n\n"
-        "Здесь можно оставить сообщение администрации флуда.\n\n"
-        f"{bullet('Сообщение передаётся без отображения вашего профиля другим пользователям.')}\n\n"
-        f"{section('Выберите действие')}"
+        "Здесь вы можете оставить сообщение администрации.\n\n"
+        f"{bullet('Ваш профиль не показывается другим пользователям.')}\n"
+        f"{bullet('Администрация получает сообщение вместе с данными отправителя.')}\n"
+        f"{bullet('Администратор может ответить вам через бота.')}\n\n"
+        f"{divider()}\n"
+        f"{subtitle('Выберите действие')}"
     )
 
 
@@ -786,7 +802,7 @@ async def start(
     if is_blocked(message.from_user.id):
         await message.answer(
             f"{title('Доступ ограничен')}\n\n"
-            "Для вашего аккаунта отправка сообщений отключена."
+            f"{bullet('Для вашего аккаунта отправка сообщений отключена.')}"
         )
         return
 
@@ -811,31 +827,38 @@ async def user_home(
     await callback.answer()
 
 
+# =========================================================
+# USER INFO
+# =========================================================
+
 @dp.callback_query(F.data == "u:info")
 async def user_info(callback: CallbackQuery):
     await callback.message.edit_text(
         f"{title('Как это работает')}\n\n"
-        f"{bullet('Вы оставляете сообщение через этого бота.')}\n"
+        f"{section('Сообщения')}\n"
+        f"{bullet('Вы отправляете текст через этого бота.')}\n"
         f"{bullet('Другие участники не видят ваш профиль.')}\n"
-        f"{bullet('Администрация получает сообщение и может ответить вам через бота.')}\n\n"
-        "♡ Спасибо, что помогаете поддерживать комфорт и работу флуда.",
+        f"{bullet('Администрация видит отправителя сообщения.')}\n\n"
+        f"{section('Ответы')}\n"
+        f"{bullet('Администратор может ответить вам прямо через бота.')}\n\n"
+        f"{note('Спасибо за обратную связь.')}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="📨  О сообщениях",
+                        text="✉  О сообщениях",
                         callback_data="u:send_info",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="⚠️  О жалобах",
+                        text="⚠  О жалобах",
                         callback_data="u:report_info",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="୨ৎ  Назад",
+                        text="‹  Назад",
                         callback_data="u:home",
                     )
                 ],
@@ -850,21 +873,22 @@ async def user_info(callback: CallbackQuery):
 async def send_info(callback: CallbackQuery):
     await callback.message.edit_text(
         f"{title('О сообщениях')}\n\n"
-        f"{bullet('Вы пишете сообщение через бота.')}\n"
+        f"{bullet('Напишите сообщение через бота.')}\n"
         f"{bullet('Обычным пользователям ваш профиль не показывается.')}\n"
-        f"{bullet('Администрация получает сообщение и может ответить вам через бота.')}\n\n"
-        "♡ Спасибо, что помогаете поддерживать комфорт и работу флуда.",
+        f"{bullet('Администрация видит отправителя.')}\n"
+        f"{bullet('При необходимости администрация может ответить вам.')}\n\n"
+        f"{note('Сообщение можно отправить в любое время.')}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="📨  Оставить сообщение",
+                        text="✉  Оставить сообщение",
                         callback_data="u:send",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="୨ৎ  Назад",
+                        text="‹  Назад",
                         callback_data="u:info",
                     )
                 ],
@@ -878,23 +902,24 @@ async def send_info(callback: CallbackQuery):
 @dp.callback_query(F.data == "u:report_info")
 async def report_info(callback: CallbackQuery):
     await callback.message.edit_text(
-        f"⚠️ {title('О жалобах')}\n\n"
-        f"{bullet('Жалоба не является анонимной: администрация видит заявителя.')}\n"
+        f"⚠ {title('О жалобах')}\n\n"
+        f"{bullet('Жалоба не является анонимной.')}\n"
+        f"{bullet('Администрация видит аккаунт заявителя.')}\n"
         f"{bullet('Один аккаунт может пожаловаться на одного пользователя только один раз.')}\n"
         f"{bullet('Между жалобами действует пауза 10 минут.')}\n"
         f"{bullet('На самого себя пожаловаться нельзя.')}\n\n"
-        "Перед отправкой бот покажет данные жалобы и попросит подтверждение.",
+        f"{note('Перед отправкой бот покажет жалобу и попросит подтверждение.')}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="⚠️  Подать жалобу",
+                        text="⚠  Подать жалобу",
                         callback_data="u:report",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="୨ৎ  Назад",
+                        text="‹  Назад",
                         callback_data="u:info",
                     )
                 ],
@@ -904,6 +929,10 @@ async def report_info(callback: CallbackQuery):
 
     await callback.answer()
 
+
+# =========================================================
+# SEND FEEDBACK
+# =========================================================
 
 @dp.callback_query(F.data == "u:send")
 async def user_send(
@@ -923,8 +952,9 @@ async def user_send(
 
     await callback.message.edit_text(
         f"{title('Новое сообщение')}\n\n"
-        "Напишите текст следующим сообщением.\n\n"
-        "♡ Спасибо, что помогаете поддерживать комфорт и работу флуда.",
+        f"{bullet('Напишите текст следующим сообщением.')}\n"
+        f"{bullet('Максимальная длина — 4000 символов.')}\n\n"
+        f"{note('Ваше сообщение будет передано администрации.')}",
         reply_markup=cancel_kb(),
     )
 
@@ -954,14 +984,11 @@ async def command_cancel(
     await state.clear()
 
     await message.answer(
-        "୨ৎ Отправка отменена.",
+        f"{title('Отменено')}\n\n"
+        f"{note('Отправка отменена.')}",
         reply_markup=main_kb(),
     )
 
-
-# =========================================================
-# FEEDBACK
-# =========================================================
 
 @dp.message(
     FeedbackState.waiting,
@@ -975,8 +1002,10 @@ async def feedback(
 
     if is_blocked(message.from_user.id):
         await state.clear()
+
         await message.answer(
-            "Доступ ограничен."
+            f"{title('Доступ ограничен')}\n\n"
+            "Для вашего аккаунта отправка сообщений отключена."
         )
         return
 
@@ -1018,13 +1047,14 @@ async def feedback(
     )
 
     admin_text = (
-        f"📨 {title('Новое сообщение')}\n\n"
+        f"{title('Новое сообщение')}\n\n"
         f"{section('Текст')}\n"
         f"{text}\n\n"
+        f"{divider()}\n"
         f"{section('Отправитель')}\n"
-        f"{bullet(f'Имя: {sender_name}')}\n"
-        f"{bullet(f'Username: {username}')}\n"
-        f"{bullet(f'ID: {message.from_user.id}')}"
+        f"{bullet('Имя: ' + sender_name)}\n"
+        f"{bullet('Username: ' + username)}\n"
+        f"{bullet('ID: ' + str(message.from_user.id))}"
     )
 
     try:
@@ -1035,11 +1065,11 @@ async def feedback(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="💬  Ответить",
+                            text="↳  Ответить",
                             callback_data=f"reply:{message.from_user.id}",
                         ),
                         InlineKeyboardButton(
-                            text="🚫  Заблокировать",
+                            text="⊘  Заблокировать",
                             callback_data=f"a:block:{message.from_user.id}",
                         ),
                     ]
@@ -1061,16 +1091,15 @@ async def feedback(
 
     await message.answer(
         f"{title('Сообщение отправлено')}\n\n"
-        "Спасибо за обратную связь.\n\n"
-        "Сообщение передано администрации.",
+        f"{bullet('Ваше сообщение передано администрации.')}\n"
+        f"{bullet('При необходимости администрация сможет ответить вам.')}\n\n"
+        f"{note('Спасибо за обратную связь.')}",
         reply_markup=after_send_kb(),
     )
 
 
 @dp.message(FeedbackState.waiting)
-async def feedback_non_text(
-    message: Message,
-):
+async def feedback_non_text(message: Message):
     await message.answer(
         "Пожалуйста, отправьте сообщение текстом.",
         reply_markup=cancel_kb(),
@@ -1111,10 +1140,12 @@ async def report_start(
     )
 
     await callback.message.edit_text(
-        f"⚠️ {title('Жалоба на пользователя')}\n\n"
-        "Укажите username или Telegram ID пользователя.\n\n"
-        "⚠️ При отправке жалобы администрация увидит, от кого она поступила. "
-        "Эта жалоба не является анонимной.",
+        f"⚠ {title('Жалоба на пользователя')}\n\n"
+        f"{bullet('Укажите username или Telegram ID пользователя.')}\n\n"
+        f"{divider()}\n"
+        f"⚠ Важно\n"
+        "Жалоба НЕ является анонимной.\n"
+        "Администрация увидит ваш аккаунт как заявителя.",
         reply_markup=cancel_kb(),
     )
 
@@ -1167,8 +1198,7 @@ async def report_target(
 
             await message.answer(
                 f"{title('Жалоба уже отправлена')}\n\n"
-                "Вы уже отправляли жалобу на этого пользователя.\n"
-                "Повторная жалоба с этого аккаунта на того же пользователя недоступна.",
+                "Вы уже отправляли жалобу на этого пользователя.",
                 reply_markup=main_kb(),
             )
             return
@@ -1184,8 +1214,9 @@ async def report_target(
 
     await message.answer(
         f"{title('Причина жалобы')}\n\n"
-        "Кратко опишите, что произошло.\n"
-        "После отправки информация будет передана администрации.",
+        f"{bullet('Кратко опишите, что произошло.')}\n"
+        f"{bullet('Максимум — 2000 символов.')}\n\n"
+        f"{note('После этого вы сможете проверить жалобу перед отправкой.')}",
         reply_markup=cancel_kb(),
     )
 
@@ -1231,26 +1262,26 @@ async def report_reason(
         f"{bullet(target)}\n\n"
         f"{section('Причина')}\n"
         f"{reason}\n\n"
-        "⚠️ Важно: эта жалоба не анонимна. "
-        "Администрация увидит ваш аккаунт.\n\n"
-        "Если всё верно, нажмите кнопку отправки.",
+        f"{divider()}\n"
+        "⚠ Заявитель виден администрации.\n\n"
+        "Если всё верно — подтвердите отправку.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="⚠️  Отправить жалобу",
+                        text="⚠  Отправить жалобу",
                         callback_data="u:report_confirm",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="୨ৎ  Изменить причину",
+                        text="↻  Изменить причину",
                         callback_data="u:report_edit",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="୨ৎ  Отмена",
+                        text="‹  Отмена",
                         callback_data="u:cancel",
                     )
                 ],
@@ -1407,12 +1438,13 @@ async def report_confirm(
     )
 
     admin_text = (
-        f"⚠️ {title(f'Жалоба #{report_id}')}\n\n"
+        f"⚠ {title(f'Жалоба #{report_id}')}\n\n"
         f"{section('На пользователя')}\n"
         f"{bullet('Указано: ' + target)}\n"
         f"{bullet('ID: ' + target_id_text)}\n\n"
         f"{section('Причина')}\n"
         f"{reason}\n\n"
+        f"{divider()}\n"
         f"{section('Заявитель')}\n"
         f"{bullet('Имя: ' + reporter_name)}\n"
         f"{bullet('Username: ' + reporter_username)}\n"
@@ -1436,8 +1468,7 @@ async def report_confirm(
 
         await callback.message.edit_text(
             f"{title('Ошибка')}\n\n"
-            "Не удалось передать жалобу администрации. "
-            "Попробуйте позже.",
+            "Не удалось передать жалобу администрации.",
             reply_markup=main_kb(),
         )
 
@@ -1446,9 +1477,10 @@ async def report_confirm(
 
     await callback.message.edit_text(
         f"{title('Жалоба отправлена')}\n\n"
-        "Администрация получила обращение.\n\n"
-        "⚠️ Заявитель виден администрации.\n"
-        "Следующую жалобу можно будет отправить через 10 минут.",
+        f"{bullet('Администрация получила обращение.')}\n"
+        f"{bullet('Заявитель виден администрации.')}\n"
+        f"{bullet('Следующую жалобу можно отправить через 10 минут.')}\n\n"
+        f"{note('Спасибо за обращение.')}",
         reply_markup=main_kb(),
     )
 
@@ -1457,15 +1489,9 @@ async def report_confirm(
     )
 
 
-@dp.message(
-    ReportTargetState.waiting
-)
-@dp.message(
-    ReportReasonState.waiting
-)
-async def report_non_text(
-    message: Message,
-):
+@dp.message(ReportTargetState.waiting)
+@dp.message(ReportReasonState.waiting)
+async def report_non_text(message: Message):
     await message.answer(
         "Пожалуйста, отправьте ответ текстом.",
         reply_markup=cancel_kb(),
@@ -1515,17 +1541,15 @@ async def admin_reply_start(
     )
 
     await callback.message.answer(
-        f"💬 {title('Ответ пользователю')}\n\n"
-        "Напишите текст ответа.",
+        f"{title('Ответ пользователю')}\n\n"
+        f"{bullet('Напишите текст ответа.')}",
         reply_markup=cancel_kb(),
     )
 
     await callback.answer()
 
 
-@dp.callback_query(
-    F.data.startswith("a:replyuser:")
-)
+@dp.callback_query(F.data.startswith("a:replyuser:"))
 async def admin_reply_user_start(
     callback: CallbackQuery,
     state: FSMContext,
@@ -1564,7 +1588,7 @@ async def admin_reply_user_start(
     )
 
     await callback.message.answer(
-        f"💬 {title('Ответ пользователю')}\n\n"
+        f"{title('Ответ пользователю')}\n\n"
         "Напишите текст ответа.",
         reply_markup=cancel_kb(),
     )
@@ -1587,9 +1611,7 @@ async def admin_reply(
 
     await state.clear()
 
-    user_id = data.get(
-        "reply_to"
-    )
+    user_id = data.get("reply_to")
 
     if not user_id:
         await message.answer(
@@ -1600,14 +1622,14 @@ async def admin_reply(
     try:
         await bot.send_message(
             user_id,
-            f"💬 {title('Ответ администрации')}\n\n"
+            f"{title('Ответ администрации')}\n\n"
             f"{message.text}\n\n"
-            "୨ৎ Ответ отправлен через бота.",
+            f"{note('Ответ отправлен через бота.')}",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="📨  Ответить администрации",
+                            text="✉  Ответить администрации",
                             callback_data="u:send",
                         )
                     ]
@@ -1616,7 +1638,8 @@ async def admin_reply(
         )
 
         await message.answer(
-            "💬 Ответ отправлен.",
+            f"{title('Ответ отправлен')}\n\n"
+            f"{note('Сообщение доставлено пользователю.')}",
             reply_markup=admin_kb(),
         )
 
@@ -1633,9 +1656,7 @@ async def admin_reply(
 
 
 @dp.message(AdminReplyState.waiting)
-async def admin_reply_non_text(
-    message: Message,
-):
+async def admin_reply_non_text(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
 
@@ -1657,7 +1678,8 @@ def admin_home_text():
         f"{bullet(f'Сообщений: {message_count()}')}\n"
         f"{bullet(f'Заблокировано: {blocked_count()}')}\n"
         f"{bullet(f'Новых жалоб: {new_reports_count()}')}\n\n"
-        "Выберите раздел."
+        f"{divider()}\n"
+        f"{subtitle('Выберите раздел')}"
     )
 
 
@@ -1669,9 +1691,7 @@ async def admin_command(
     if message.from_user.id != ADMIN_ID:
         return
 
-    register_user(
-        message.from_user
-    )
+    register_user(message.from_user)
 
     await state.clear()
 
@@ -1682,9 +1702,7 @@ async def admin_command(
 
 
 @dp.callback_query(F.data == "a:home")
-async def admin_home(
-    callback: CallbackQuery,
-):
+async def admin_home(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer(
             "Нет доступа.",
@@ -1701,9 +1719,7 @@ async def admin_home(
 
 
 @dp.callback_query(F.data == "a:stats")
-async def admin_stats(
-    callback: CallbackQuery,
-):
+async def admin_stats(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer(
             "Нет доступа.",
@@ -1724,9 +1740,7 @@ async def admin_stats(
 
 
 @dp.callback_query(F.data == "a:messages")
-async def admin_messages(
-    callback: CallbackQuery,
-):
+async def admin_messages(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer(
             "Нет доступа.",
@@ -1737,17 +1751,19 @@ async def admin_messages(
     await callback.message.edit_text(
         f"{title('Сообщения')}\n\n"
         f"{bullet(f'Всего получено: {message_count()}')}\n\n"
-        "Новые сообщения приходят прямо в чат администрации.",
+        f"{note('Новые сообщения приходят прямо в чат администрации.')}",
         reply_markup=back_admin(),
     )
 
     await callback.answer()
 
 
+# =========================================================
+# USERS
+# =========================================================
+
 @dp.callback_query(F.data.startswith("a:users:"))
-async def admin_users(
-    callback: CallbackQuery,
-):
+async def admin_users(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer(
             "Нет доступа.",
@@ -1775,7 +1791,7 @@ async def admin_users(
         label = display_name(row)
 
         if row["blocked"]:
-            label = f"🚫  {label}"
+            label = f"⊘  {label}"
 
         buttons.append(
             [
@@ -1819,7 +1835,7 @@ async def admin_users(
     buttons.append(
         [
             InlineKeyboardButton(
-                text="୨ৎ  Назад",
+                text="‹  Назад",
                 callback_data="a:home",
             )
         ]
@@ -1856,7 +1872,7 @@ async def admin_search_start(
 
     await callback.message.answer(
         f"{title('Поиск пользователя')}\n\n"
-        "Введите имя, username или Telegram ID.",
+        f"{bullet('Введите имя, username или Telegram ID.')}",
         reply_markup=cancel_kb(),
     )
 
@@ -1882,7 +1898,8 @@ async def admin_search(
 
     if not rows:
         await message.answer(
-            "୨ৎ Пользователи не найдены.",
+            f"{title('Поиск')}\n\n"
+            "Пользователи не найдены.",
             reply_markup=admin_kb(),
         )
         return
@@ -1890,10 +1907,15 @@ async def admin_search(
     buttons = []
 
     for row in rows:
+        label = display_name(row)
+
+        if row["blocked"]:
+            label = f"⊘  {label}"
+
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text=display_name(row)[:40],
+                    text=label[:40],
                     callback_data=f"a:user:{row['user_id']}",
                 )
             ]
@@ -1909,9 +1931,7 @@ async def admin_search(
 
 
 @dp.message(AdminSearchState.waiting)
-async def admin_search_non_text(
-    message: Message,
-):
+async def admin_search_non_text(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
 
@@ -1922,9 +1942,7 @@ async def admin_search_non_text(
 
 
 @dp.callback_query(F.data.startswith("a:user:"))
-async def admin_user(
-    callback: CallbackQuery,
-):
+async def admin_user(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer(
             "Нет доступа.",
@@ -1966,9 +1984,11 @@ async def admin_user(
 
     await callback.message.edit_text(
         f"{title('Пользователь')}\n\n"
+        f"{section('Профиль')}\n"
         f"{bullet('Имя: ' + display_name(row))}\n"
         f"{bullet('Username: ' + username)}\n"
-        f"{bullet('Telegram ID: ' + str(row['user_id']))}\n"
+        f"{bullet('Telegram ID: ' + str(row['user_id']))}\n\n"
+        f"{section('Статистика')}\n"
         f"{bullet('Сообщений: ' + str(row['messages_count']))}\n"
         f"{bullet('Жалоб отправлено: ' + str(row['reports_count']))}\n"
         f"{bullet('Статус: ' + status)}\n\n"
@@ -1985,9 +2005,7 @@ async def admin_user(
 
 
 @dp.callback_query(F.data.startswith("a:toggle:"))
-async def admin_toggle(
-    callback: CallbackQuery,
-):
+async def admin_toggle(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer(
             "Нет доступа.",
@@ -2015,9 +2033,7 @@ async def admin_toggle(
         )
         return
 
-    new_value = not bool(
-        row["blocked"]
-    )
+    new_value = not bool(row["blocked"])
 
     set_blocked(
         user_id,
@@ -2061,9 +2077,7 @@ async def admin_toggle(
 
 
 @dp.callback_query(F.data.startswith("a:block:"))
-async def admin_block(
-    callback: CallbackQuery,
-):
+async def admin_block(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer(
             "Нет доступа.",
@@ -2101,9 +2115,7 @@ async def admin_block(
 
 
 @dp.callback_query(F.data == "a:blocked")
-async def admin_blocked(
-    callback: CallbackQuery,
-):
+async def admin_blocked(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer(
             "Нет доступа.",
@@ -2125,13 +2137,10 @@ async def admin_blocked(
 
     conn.close()
 
-    text = (
-        f"{title('Заблокированные')}\n\n"
-    )
+    text = f"{title('Заблокированные')}\n\n"
 
     if not rows:
-        text += "♡ Список пуст."
-
+        text += f"{note('Список пуст.')}"
     else:
         for row in rows:
             username = (
@@ -2141,7 +2150,7 @@ async def admin_blocked(
             )
 
             text += (
-                f"🚫 {display_name(row)}\n"
+                f"⊘ {display_name(row)}\n"
                 f"{bullet(username)}\n"
                 f"{bullet(str(row['user_id']))}\n\n"
             )
@@ -2159,9 +2168,7 @@ async def admin_blocked(
 # =========================================================
 
 @dp.callback_query(F.data == "a:reports")
-async def admin_reports(
-    callback: CallbackQuery,
-):
+async def admin_reports(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer(
             "Нет доступа.",
@@ -2174,7 +2181,7 @@ async def admin_reports(
     if not rows:
         await callback.message.edit_text(
             f"{title('Жалобы')}\n\n"
-            "♡ Новых жалоб нет.",
+            f"{note('Новых жалоб нет.')}",
             reply_markup=back_admin(),
         )
 
@@ -2183,14 +2190,11 @@ async def admin_reports(
 
     buttons = []
 
-    text = (
-        f"{title('Новые жалобы')}\n\n"
-    )
+    text = f"{title('Новые жалобы')}\n\n"
 
     for row in rows:
         text += (
-            f"⚠️ #{row['id']}  "
-            f"{row['target_text']}\n"
+            f"⚠ #{row['id']}  {row['target_text']}\n"
             f"{bullet(row['reason'][:100])}\n\n"
         )
 
@@ -2206,7 +2210,7 @@ async def admin_reports(
     buttons.append(
         [
             InlineKeyboardButton(
-                text="୨ৎ  Назад",
+                text="‹  Назад",
                 callback_data="a:home",
             )
         ]
@@ -2223,9 +2227,7 @@ async def admin_reports(
 
 
 @dp.callback_query(F.data.startswith("a:report:"))
-async def admin_report(
-    callback: CallbackQuery,
-):
+async def admin_report(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer(
             "Нет доступа.",
@@ -2244,9 +2246,7 @@ async def admin_report(
         )
         return
 
-    report = get_report(
-        report_id
-    )
+    report = get_report(report_id)
 
     if not report:
         await callback.answer(
@@ -2278,7 +2278,7 @@ async def admin_report(
     )
 
     await callback.message.edit_text(
-        f"⚠️ {title(f'Жалоба #{report_id}')}\n\n"
+        f"⚠ {title(f'Жалоба #{report_id}')}\n\n"
         f"{section('Статус')}\n"
         f"{bullet(status)}\n\n"
         f"{section('Пользователь')}\n"
@@ -2286,6 +2286,7 @@ async def admin_report(
         f"{bullet('ID: ' + target_id)}\n\n"
         f"{section('Причина')}\n"
         f"{report['reason']}\n\n"
+        f"{divider()}\n"
         f"{section('Заявитель')}\n"
         f"{bullet('Имя: ' + display_name(reporter))}\n"
         f"{bullet('Username: ' + reporter_username)}\n"
@@ -2299,12 +2300,8 @@ async def admin_report(
     await callback.answer()
 
 
-@dp.callback_query(
-    F.data.startswith("a:close_report:")
-)
-async def admin_close_report(
-    callback: CallbackQuery,
-):
+@dp.callback_query(F.data.startswith("a:close_report:"))
+async def admin_close_report(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer(
             "Нет доступа.",
@@ -2323,9 +2320,7 @@ async def admin_close_report(
         )
         return
 
-    close_report(
-        report_id
-    )
+    close_report(report_id)
 
     await callback.answer(
         "Жалоба закрыта.",
@@ -2335,7 +2330,7 @@ async def admin_close_report(
     await callback.message.edit_text(
         f"{title('Жалоба закрыта')}\n\n"
         f"{bullet('Номер: #' + str(report_id))}\n"
-        "୨ৎ Обращение отмечено как рассмотренное.",
+        f"{note('Обращение отмечено как рассмотренное.')}",
         reply_markup=back_admin(),
     )
 
@@ -2362,9 +2357,9 @@ async def admin_broadcast_start(
 
     await callback.message.answer(
         f"{title('Рассылка')}\n\n"
-        "Напишите текст, который нужно отправить "
-        "всем зарегистрированным пользователям.\n\n"
-        "⚠️ Используйте рассылку только для важных объявлений.",
+        f"{bullet('Напишите текст для всех зарегистрированных пользователей.')}\n"
+        f"{bullet('Заблокированные пользователи рассылку не получают.')}\n\n"
+        f"⚠ Используйте рассылку только для важных объявлений.",
         reply_markup=cancel_kb(),
     )
 
@@ -2422,14 +2417,12 @@ async def admin_broadcast(
         try:
             await bot.send_message(
                 user_id,
-                f"📣 {title('Сообщение от администрации')}\n\n"
+                f"{title('Сообщение от администрации')}\n\n"
                 f"{text}",
             )
 
             sent += 1
 
-            # Небольшая пауза, чтобы не создавать
-            # лишнюю нагрузку на Telegram API.
             await asyncio.sleep(0.05)
 
         except Exception:
@@ -2438,15 +2431,14 @@ async def admin_broadcast(
     await message.answer(
         f"{title('Рассылка завершена')}\n\n"
         f"{bullet('Отправлено: ' + str(sent))}\n"
-        f"{bullet('Не доставлено: ' + str(failed))}",
+        f"{bullet('Не доставлено: ' + str(failed))}\n\n"
+        f"{note('Рассылка завершена.')}",
         reply_markup=admin_kb(),
     )
 
 
 @dp.message(BroadcastState.waiting)
-async def admin_broadcast_non_text(
-    message: Message,
-):
+async def admin_broadcast_non_text(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
 
@@ -2461,9 +2453,7 @@ async def admin_broadcast_non_text(
 # =========================================================
 
 @dp.callback_query(F.data == "noop")
-async def noop(
-    callback: CallbackQuery,
-):
+async def noop(callback: CallbackQuery):
     await callback.answer()
 
 
@@ -2471,23 +2461,11 @@ async def noop(
 # HTTP SERVER FOR RENDER
 # =========================================================
 
-async def health(
-    request: web.Request,
-):
-    return web.Response(
-        text="OK"
-    )
+async def health(request: web.Request):
+    return web.Response(text="OK")
 
 
 async def start_http_server():
-    """
-    Render Web Service требует открытый HTTP-порт.
-
-    Telegram с ботом здесь НЕ работает через webhook.
-    Этот HTTP-сервер нужен только для того,
-    чтобы Render видел работающий Web Service.
-    """
-
     app = web.Application()
 
     app.router.add_get(
@@ -2500,9 +2478,7 @@ async def start_http_server():
         health,
     )
 
-    runner = web.AppRunner(
-        app
-    )
+    runner = web.AppRunner(app)
 
     await runner.setup()
 
@@ -2534,19 +2510,6 @@ async def start_http_server():
 # =========================================================
 
 async def polling_loop():
-    """
-    Telegram polling.
-
-    Перед запуском обязательно удаляем старый webhook.
-    Это решает ситуацию:
-
-        url: ""
-        pending_update_count: ...
-
-    После delete_webhook Telegram начинает отдавать
-    накопленные обновления через polling.
-    """
-
     logger.info(
         "Removing old Telegram webhook..."
     )
@@ -2597,7 +2560,6 @@ async def main():
         "Starting Anonymous Feedback Bot..."
     )
 
-    # База данных
     init_db()
     migrate_db()
 
@@ -2606,11 +2568,9 @@ async def main():
         DB_PATH,
     )
 
-    # HTTP для Render
     http_runner = await start_http_server()
 
     try:
-        # Telegram polling
         await polling_loop()
 
     finally:
