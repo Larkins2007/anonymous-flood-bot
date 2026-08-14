@@ -2,6 +2,6 @@ services:
   - type: web
     name: anonymous-flood-bot
     runtime: python
-    buildCommand: pip install -r requirements.txt
+    Build Command: pip install -r requirements.txt
     startCommand: python bot.py
     plan: free
