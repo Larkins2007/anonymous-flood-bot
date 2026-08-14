@@ -15,7 +15,6 @@ from aiogram.webhook.aiohttp_server import SimpleRequestHandler, setup_applicati
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "")
 ADMIN_ID = 1682289834
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "change-me")
 DB_PATH = os.getenv("DB_PATH", "users.db")
 REPORT_COOLDOWN_SECONDS = 600
 
@@ -1291,14 +1290,12 @@ async def startup(app):
 
     await bot.set_webhook(
         webhook_url,
-        secret_token=WEBHOOK_SECRET,
         allowed_updates=dp.resolve_used_update_types(),
     )
 
     logging.info("Webhook set: %s", webhook_url)
 
 async def shutdown(app):
-    await bot.delete_webhook(drop_pending_updates=False)
     await bot.session.close()
 
 def create_app():
@@ -1309,7 +1306,6 @@ def create_app():
     handler = SimpleRequestHandler(
         dispatcher=dp,
         bot=bot,
-        secret_token=WEBHOOK_SECRET,
     )
     handler.register(app, path="/webhook")
     setup_application(app, dp, bot=bot)
