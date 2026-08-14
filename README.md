@@ -1,46 +1,15 @@
-# Анонимная анонимка для Telegram — Render Web Service
+# Anonymous Feedback Bot
 
-Версия специально переделана под **Render Web Service Free**.
+Telegram bot for anonymous feedback.
 
-## Что умеет
+Users see their message as anonymous to other participants. The administrator receives the sender's Telegram name, username and ID and can reply or block the sender.
 
-- принимать анонимные текстовые сообщения;
-- отправлять их администратору без имени/username отправителя;
-- позволять админу ответить пользователю через бота;
-- блокировать пользователя;
-- ограничивать частоту отправки;
-- работать через Telegram webhook, поэтому подходит для Render Web Service.
+The bot stores users who press /start in SQLite.
 
-## Переменные Render
+Required Render variable:
+- BOT_TOKEN
 
-Добавь в Environment Variables:
+Optional:
+- WEBHOOK_SECRET
 
-- `BOT_TOKEN` — новый токен от BotFather;
-- `ADMIN_ID` — твой числовой Telegram ID;
-- `WEBHOOK_SECRET` — любая длинная случайная строка.
-
-Render автоматически предоставляет `RENDER_EXTERNAL_URL`, поэтому отдельный URL бота вводить не нужно.
-
-## Render
-
-Создай **Web Service**, подключи GitHub-репозиторий и используй:
-
-Build Command:
-`pip install -r requirements.txt`
-
-Start Command:
-`python bot.py`
-
-Instance Type:
-`Free`
-
-После запуска Render сам установит Telegram webhook на:
-`https://ТВОЙ-RENDER-АДРЕС/webhook`
-
-## Важно
-
-Free Web Service на Render может выключаться после 15 минут без входящего HTTP-трафика. Это ограничение самого Render. Для webhook-бота это означает, что после простоя первый запрос может разбудить сервис примерно за минуту; для тестового/небольшого бота это нормально.
-
-Состояние блокировок и временных ограничений хранится в памяти и может сброситься после перезапуска. Для постоянного хранения позже можно добавить базу данных.
-
-Никогда не публикуй BOT_TOKEN.
+Do not put the bot token into GitHub.
