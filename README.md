@@ -1,15 +1,22 @@
-# Anonymous Feedback Bot
+# Anonymous Feedback Bot V2
 
-Telegram bot for anonymous feedback.
+Добавлено:
+- единый эстетичный стиль без нестабильной псевдографики;
+- анонимная обратная связь;
+- администратор видит отправителя обратной связи;
+- анонимные ответы администрации;
+- список всех пользователей, нажавших /start;
+- поиск пользователей;
+- блокировка и разблокировка;
+- статистика;
+- жалобы с явным предупреждением, что заявитель виден администрации;
+- очередь жалоб;
+- рассылка администрации;
+- SQLite.
 
-Users see their message as anonymous to other participants. The administrator receives the sender's Telegram name, username and ID and can reply or block the sender.
+Render:
+- BOT_TOKEN хранится в Environment Variables.
+- ADMIN_ID уже задан в bot.py.
+- Не загружайте BOT_TOKEN в GitHub.
 
-The bot stores users who press /start in SQLite.
-
-Required Render variable:
-- BOT_TOKEN
-
-Optional:
-- WEBHOOK_SECRET
-
-Do not put the bot token into GitHub.
+SQLite на бесплатном Render не гарантирует долговременное хранение после замены/пересоздания сервиса. Для постоянного хранения лучше подключить PostgreSQL или persistent disk.
