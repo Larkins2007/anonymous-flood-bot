@@ -5,17 +5,23 @@ import logging
 from datetime import datetime, timezone
 
 from aiohttp import web
+
 from aiogram import Bot, Dispatcher, F
 from aiogram.filters import Command, CommandStart
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
+
 from aiogram.types import (
+    Message,
     CallbackQuery,
     InlineKeyboardButton,
     InlineKeyboardMarkup,
-    Message,
+    BotCommand,
+    BotCommandScopeDefault,
+    BotCommandScopeChat,
 )
+
 
 # =========================================================
 # CONFIG
@@ -29,8 +35,16 @@ DB_PATH = os.getenv("DB_PATH", "users.db")
 
 REPORT_COOLDOWN_SECONDS = 600
 
+MAX_MESSAGE_LENGTH = 4000
+MAX_REPORT_REASON_LENGTH = 2000
+
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
+
+
+# =========================================================
+# LOGGING
+# =========================================================
 
 logging.basicConfig(
     level=logging.INFO,
@@ -38,6 +52,11 @@ logging.basicConfig(
 )
 
 logger = logging.getLogger("anonymous-feedback-bot")
+
+
+# =========================================================
+# BOT
+# =========================================================
 
 bot = Bot(BOT_TOKEN)
 dp = Dispatcher(storage=MemoryStorage())
@@ -51,8 +70,8 @@ def title(text: str) -> str:
     return f"♡₊˚ {text} ˚₊♡"
 
 
-def section(text: str) -> str:
-    return f"୨୧ {text} ୨୧"
+def divider() -> str:
+    return "୨୧ ───────────── ୨୧"
 
 
 def bullet(text: str) -> str:
@@ -60,15 +79,60 @@ def bullet(text: str) -> str:
 
 
 def note(text: str) -> str:
-    return f"₊˚♡ {text} ♡˚₊"
+    return f"♡ {text}"
 
 
-def divider() -> str:
-    return "୨୧ ───────────── ୨୧"
+def section(text: str) -> str:
+    return f"୨୧ {text}"
 
 
-def warning(text: str) -> str:
-    return f"⚠ {text}"
+# =========================================================
+# MESSAGE CLEANUP
+# =========================================================
+
+async def safe_delete(message: Message | None):
+    """
+    Безопасно удаляет сообщение.
+    Ошибки удаления не ломают работу бота.
+    """
+    if not message:
+        return
+
+    try:
+        await message.delete()
+    except Exception:
+        pass
+
+
+async def replace_screen(
+    callback: CallbackQuery,
+    text: str,
+    reply_markup=None,
+):
+    """
+    Удаляет старый экран и создаёт новый.
+    """
+    await safe_delete(callback.message)
+
+    return await callback.message.answer(
+        text,
+        reply_markup=reply_markup,
+    )
+
+
+async def answer_new_screen(
+    message: Message,
+    text: str,
+    reply_markup=None,
+):
+    """
+    Отправляет новый экран после удаления
+    сообщения пользователя.
+    """
+    return await message.answer(
+        text,
+        reply_markup=reply_markup,
+    )
 
 
 # =========================================================
@@ -104,7 +168,7 @@ class BroadcastState(StatesGroup):
 # =========================================================
 
 def db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
+    conn = sqlite3.connect(DB_PATH)
     conn.row_factory = sqlite3.Row
     return conn
 
@@ -311,7 +375,7 @@ def report_cooldown_left(user_id):
             datetime.now(timezone.utc)
             - datetime.fromisoformat(stamp)
         ).total_seconds()
-    except (ValueError, TypeError):
+    except ValueError:
         return 0
 
     return max(
@@ -608,19 +672,19 @@ def main_kb():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="♡₊˚ Оставить сообщение ˚₊♡",
+                    text="♡ Оставить сообщение",
                     callback_data="u:send",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="୨୧ Как это работает ୨୧",
+                    text="୨୧ Как это работает",
                     callback_data="u:info",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="₊˚ Пожаловаться ˚₊",
+                    text="⚠ Пожаловаться",
                     callback_data="u:report",
                 )
             ],
@@ -633,7 +697,7 @@ def cancel_kb():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="‹₊˚ Отмена ˚₊",
+                    text="‹ Отмена",
                     callback_data="u:cancel",
                 )
             ]
@@ -646,13 +710,13 @@ def after_send_kb():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="♡ Ещё сообщение ♡",
+                    text="♡ Ещё сообщение",
                     callback_data="u:send",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="₊˚⌂ В меню ˚₊",
+                    text="⌂ В меню",
                     callback_data="u:home",
                 )
             ],
@@ -669,33 +733,33 @@ def admin_kb():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="୨୧ Пользователи ୨୧",
+                    text="♙ Пользователи",
                     callback_data="a:users:0",
                 ),
                 InlineKeyboardButton(
-                    text="♡ Сообщения ♡",
+                    text="♡ Сообщения",
                     callback_data="a:messages",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="₊˚ Жалобы ˚₊",
+                    text="⚠ Жалобы",
                     callback_data="a:reports",
                 ),
                 InlineKeyboardButton(
-                    text="୨୧ Статистика ୨୧",
+                    text="୨୧ Статистика",
                     callback_data="a:stats",
                 ),
             ],
             [
                 InlineKeyboardButton(
-                    text="♡ Заблокированные ♡",
+                    text="⊘ Заблокированные",
                     callback_data="a:blocked",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="₊˚ Рассылка ˚₊",
+                    text="➤ Рассылка",
                     callback_data="a:broadcast",
                 )
             ],
@@ -708,7 +772,7 @@ def back_admin():
         inline_keyboard=[
             [
                 InlineKeyboardButton(
-                    text="‹₊˚ В админку ˚₊",
+                    text="‹ В админку",
                     callback_data="a:home",
                 )
             ]
@@ -722,22 +786,22 @@ def user_admin_kb(user_id, blocked):
             [
                 InlineKeyboardButton(
                     text=(
-                        "♡ Разблокировать ♡"
+                        "♡ Разблокировать"
                         if blocked
-                        else "₊˚ Заблокировать ˚₊"
+                        else "⊘ Заблокировать"
                     ),
                     callback_data=f"a:toggle:{user_id}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="୨୧ Ответить ୨୧",
+                    text="↳ Ответить",
                     callback_data=f"a:replyuser:{user_id}",
                 )
             ],
             [
                 InlineKeyboardButton(
-                    text="‹₊˚ Назад ˚₊",
+                    text="‹ Назад",
                     callback_data="a:users:0",
                 )
             ],
@@ -745,14 +809,17 @@ def user_admin_kb(user_id, blocked):
     )
 
 
-def report_admin_kb(report_id, target_user_id=None):
+def report_admin_kb(
+    report_id,
+    target_user_id=None,
+):
     rows = []
 
     if target_user_id:
         rows.append(
             [
                 InlineKeyboardButton(
-                    text="₊˚ Заблокировать пользователя ˚₊",
+                    text="⊘ Заблокировать пользователя",
                     callback_data=f"a:block:{target_user_id}",
                 )
             ]
@@ -761,7 +828,7 @@ def report_admin_kb(report_id, target_user_id=None):
     rows.append(
         [
             InlineKeyboardButton(
-                text="♡ Закрыть жалобу ♡",
+                text="✓ Закрыть жалобу",
                 callback_data=f"a:close_report:{report_id}",
             )
         ]
@@ -770,7 +837,7 @@ def report_admin_kb(report_id, target_user_id=None):
     rows.append(
         [
             InlineKeyboardButton(
-                text="‹₊˚ К жалобам ˚₊",
+                text="‹ К жалобам",
                 callback_data="a:reports",
             )
         ]
@@ -787,14 +854,17 @@ def report_admin_kb(report_id, target_user_id=None):
 
 def home_text():
     return (
-        "♡₊˚ Анонимная обратная связь ˚₊♡\n\n"
-        "Здесь вы можете оставить своё мнение, "
-        "предложение, совет или поделиться своими предпочтениями.\n\n"
-        "♡ Другие участники не видят ваш профиль.\n\n"
-        "୨୧ ───────────── ୨୧\n"
+        f"{title('Анонимная обратная связь')}\n\n"
+        "Здесь вы можете оставить сообщение администрации.\n\n"
+        f"{bullet('Другие участники не видят ваш профиль.')}\n\n"
+        f"{divider()}\n"
         "♡ Выберите действие"
     )
 
+
+# =========================================================
+# START
+# =========================================================
 
 @dp.message(CommandStart())
 async def start(
@@ -806,17 +876,26 @@ async def start(
     register_user(message.from_user)
 
     if is_blocked(message.from_user.id):
+        await safe_delete(message)
+
         await message.answer(
             f"{title('Доступ ограничен')}\n\n"
-            f"{bullet('Отправка сообщений для вашего аккаунта отключена.')}"
+            f"{bullet('Для вашего аккаунта отправка сообщений отключена.')}"
         )
+
         return
+
+    await safe_delete(message)
 
     await message.answer(
         home_text(),
         reply_markup=main_kb(),
     )
 
+
+# =========================================================
+# USER HOME
+# =========================================================
 
 @dp.callback_query(F.data == "u:home")
 async def user_home(
@@ -825,9 +904,10 @@ async def user_home(
 ):
     await state.clear()
 
-    await callback.message.edit_text(
+    await replace_screen(
+        callback,
         home_text(),
-        reply_markup=main_kb(),
+        main_kb(),
     )
 
     await callback.answer()
@@ -839,33 +919,31 @@ async def user_home(
 
 @dp.callback_query(F.data == "u:info")
 async def user_info(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "♡₊˚ Как это работает ˚₊♡\n\n"
-        "Вы можете оставить обратную связь о флуде, "
-        "поделиться своим мнением, предложением, советом "
-        "или своими предпочтениями.\n\n"
-        "୨୧ ───────────── ୨୧\n"
-        "♡ Напишите сообщение через бота.\n"
-        "♡ Выберите нужное действие в меню.\n\n"
-        "୨୧ ───────────── ୨୧\n"
-        "♡ Спасибо за вашу обратную связь.",
-        reply_markup=InlineKeyboardMarkup(
+    await replace_screen(
+        callback,
+        f"{title('Как это работает')}\n\n"
+        f"{bullet('Вы можете оставить сообщение через этого бота.')}\n"
+        f"{bullet('Ваше обращение будет передано администрации.')}\n"
+        f"{bullet('При необходимости администрация сможет ответить вам.')}\n\n"
+        f"{divider()}\n"
+        f"♡ Выберите раздел",
+        InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="♡ Оставить сообщение ♡",
+                        text="♡ О сообщениях",
                         callback_data="u:send_info",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="₊˚ О жалобах ˚₊",
+                        text="⚠ О жалобах",
                         callback_data="u:report_info",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="‹₊˚ Назад ˚₊",
+                        text="‹ Назад",
                         callback_data="u:home",
                     )
                 ],
@@ -878,26 +956,25 @@ async def user_info(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "u:send_info")
 async def send_info(callback: CallbackQuery):
-    await callback.message.edit_text(
-        "♡₊˚ О сообщениях ˚₊♡\n\n"
-        "Здесь можно высказать своё мнение о флуде, "
-        "предложить идею, поделиться советом "
-        "или рассказать о своих предпочтениях.\n\n"
-        "୨୧ ───────────── ୨୧\n"
-        "♡ Напишите сообщение.\n"
-        "♡ После отправки оно будет передано администрации.\n\n"
-        "₊˚♡ Делитесь мыслями свободно. ♡˚₊",
-        reply_markup=InlineKeyboardMarkup(
+    await replace_screen(
+        callback,
+        f"{title('О сообщениях')}\n\n"
+        f"{bullet('Напишите сообщение через бота.')}\n"
+        f"{bullet('Выберите нужное действие и следуйте подсказкам.')}\n"
+        f"{bullet('После отправки вы получите уведомление.')}\n\n"
+        f"{divider()}\n"
+        f"♡ Сообщение можно отправить в любое время.",
+        InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="♡₊˚ Оставить сообщение ˚₊♡",
+                        text="♡ Оставить сообщение",
                         callback_data="u:send",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="‹₊˚ Назад ˚₊",
+                        text="‹ Назад",
                         callback_data="u:info",
                     )
                 ],
@@ -910,25 +987,27 @@ async def send_info(callback: CallbackQuery):
 
 @dp.callback_query(F.data == "u:report_info")
 async def report_info(callback: CallbackQuery):
-    await callback.message.edit_text(
+    await replace_screen(
+        callback,
         f"{title('О жалобах')}\n\n"
-        f"{bullet('Жалоба предназначена для сообщений о нарушениях или проблемах.')}\n"
-        f"{bullet('Один аккаунт может пожаловаться на одного пользователя только один раз.')}\n"
-        f"{bullet('Между жалобами действует пауза 10 минут.')}\n"
-        f"{bullet('На самого себя пожаловаться нельзя.')}\n\n"
+        f"{bullet('Укажите пользователя, на которого хотите пожаловаться.')}\n"
+        f"{bullet('После этого укажите причину обращения.')}\n"
+        f"{bullet('Перед отправкой можно проверить введённые данные.')}\n"
+        f"{bullet('На одного пользователя можно пожаловаться один раз.')}\n"
+        f"{bullet('Между жалобами действует пауза 10 минут.')}\n\n"
         f"{divider()}\n"
-        f"{note('Перед отправкой бот покажет жалобу и попросит подтверждение.')}",
-        reply_markup=InlineKeyboardMarkup(
+        f"♡ Пожалуйста, указывайте достоверную информацию.",
+        InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="₊˚ Подать жалобу ˚₊",
+                        text="⚠ Подать жалобу",
                         callback_data="u:report",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="‹₊˚ Назад ˚₊",
+                        text="‹ Назад",
                         callback_data="u:info",
                     )
                 ],
@@ -959,13 +1038,14 @@ async def user_send(
         FeedbackState.waiting
     )
 
-    await callback.message.edit_text(
+    await replace_screen(
+        callback,
         f"{title('Новое сообщение')}\n\n"
-        f"{bullet('Напишите текст следующим сообщением.')}\n"
+        f"{bullet('Напишите сообщение следующим сообщением.')}\n"
         f"{bullet('Максимальная длина — 4000 символов.')}\n\n"
         f"{divider()}\n"
-        f"{note('Здесь можно поделиться своим мнением или предложением.')}",
-        reply_markup=cancel_kb(),
+        "♡ Вы можете написать всё, что хотите сообщить.",
+        cancel_kb(),
     )
 
     await callback.answer()
@@ -978,9 +1058,10 @@ async def user_cancel(
 ):
     await state.clear()
 
-    await callback.message.edit_text(
+    await replace_screen(
+        callback,
         home_text(),
-        reply_markup=main_kb(),
+        main_kb(),
     )
 
     await callback.answer()
@@ -993,12 +1074,18 @@ async def command_cancel(
 ):
     await state.clear()
 
+    await safe_delete(message)
+
     await message.answer(
         f"{title('Отменено')}\n\n"
-        f"{note('Отправка отменена.')}",
+        f"{bullet('Текущее действие отменено.')}",
         reply_markup=main_kb(),
     )
 
+
+# =========================================================
+# FEEDBACK TEXT
+# =========================================================
 
 @dp.message(
     FeedbackState.waiting,
@@ -1013,33 +1100,42 @@ async def feedback(
     if is_blocked(message.from_user.id):
         await state.clear()
 
+        await safe_delete(message)
+
         await message.answer(
             f"{title('Доступ ограничен')}\n\n"
-            f"{bullet('Отправка сообщений для вашего аккаунта отключена.')}"
+            f"{bullet('Для вашего аккаунта отправка сообщений отключена.')}"
         )
+
         return
 
     text = message.text.strip()
 
     if not text:
+        await safe_delete(message)
+
         await message.answer(
-            f"{title('Пустое сообщение')}\n\n"
-            f"{note('Попробуйте написать сообщение ещё раз.')}",
+            f"{title('Новое сообщение')}\n\n"
+            f"{bullet('Сообщение не может быть пустым.')}\n\n"
+            "Попробуйте ещё раз.",
             reply_markup=cancel_kb(),
         )
+
         return
 
-    if len(text) > 4000:
+    if len(text) > MAX_MESSAGE_LENGTH:
+        await safe_delete(message)
+
         await message.answer(
-            f"{title('Слишком длинное сообщение')}\n\n"
-            f"{bullet('Максимальная длина — 4000 символов.')}",
+            f"{title('Новое сообщение')}\n\n"
+            f"{bullet('Сообщение слишком длинное.')}\n"
+            f"{bullet('Максимум — 4000 символов.')}",
             reply_markup=cancel_kb(),
         )
+
         return
 
-    increment_messages(
-        message.from_user.id
-    )
+    increment_messages(message.from_user.id)
 
     await state.clear()
 
@@ -1060,12 +1156,13 @@ async def feedback(
 
     admin_text = (
         f"{title('Новое сообщение')}\n\n"
-        f"{section('Текст')}\n{text}\n\n"
+        f"{section('Текст')}\n"
+        f"{text}\n\n"
         f"{divider()}\n"
         f"{section('Отправитель')}\n"
-        f"{bullet(f'Имя: {sender_name}')}\n"
-        f"{bullet(f'Username: {username}')}\n"
-        f"{bullet(f'ID: {message.from_user.id}')}"
+        f"{bullet('Имя: ' + sender_name)}\n"
+        f"{bullet('Username: ' + username)}\n"
+        f"{bullet('ID: ' + str(message.from_user.id))}"
     )
 
     try:
@@ -1076,11 +1173,11 @@ async def feedback(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="୨୧ Ответить ୨୧",
+                            text="↳ Ответить",
                             callback_data=f"reply:{message.from_user.id}",
                         ),
                         InlineKeyboardButton(
-                            text="₊˚ Заблокировать ˚₊",
+                            text="⊘ Заблокировать",
                             callback_data=f"a:block:{message.from_user.id}",
                         ),
                     ]
@@ -1093,34 +1190,42 @@ async def feedback(
             "Failed to send feedback to admin"
         )
 
+        await safe_delete(message)
+
         await message.answer(
             f"{title('Ошибка')}\n\n"
-            f"{bullet('Не удалось отправить сообщение.')}\n"
-            f"{note('Попробуйте немного позже.')}",
+            f"{bullet('Не удалось передать сообщение.')}\n"
+            f"{bullet('Попробуйте немного позже.')}",
             reply_markup=main_kb(),
         )
+
         return
+
+    await safe_delete(message)
 
     await message.answer(
         f"{title('Сообщение отправлено')}\n\n"
-        f"{bullet('Ваше сообщение передано.')}\n"
-        f"{bullet('При необходимости вы сможете получить ответ через бота.')}\n\n"
-        f"{note('Спасибо за вашу обратную связь.')}",
+        f"{bullet('Ваше сообщение успешно передано.')}\n"
+        f"{bullet('При необходимости вы получите ответ через бота.')}\n\n"
+        f"{divider()}\n"
+        f"♡ Спасибо за обратную связь.",
         reply_markup=after_send_kb(),
     )
 
 
 @dp.message(FeedbackState.waiting)
 async def feedback_non_text(message: Message):
+    await safe_delete(message)
+
     await message.answer(
-        f"{title('Нужен текст')}\n\n"
-        f"{note('Пожалуйста, отправьте сообщение текстом.')}",
+        f"{title('Новое сообщение')}\n\n"
+        f"{bullet('Пожалуйста, отправьте сообщение текстом.')}",
         reply_markup=cancel_kb(),
     )
 
 
 # =========================================================
-# REPORTS
+# REPORT START
 # =========================================================
 
 @dp.callback_query(F.data == "u:report")
@@ -1146,22 +1251,28 @@ async def report_start(
             f"Следующую жалобу можно отправить примерно через {minutes} мин.",
             show_alert=True,
         )
+
         return
 
     await state.set_state(
         ReportTargetState.waiting
     )
 
-    await callback.message.edit_text(
+    await replace_screen(
+        callback,
         f"{title('Жалоба на пользователя')}\n\n"
         f"{bullet('Укажите username или Telegram ID пользователя.')}\n\n"
         f"{divider()}\n"
-        f"{warning('Жалоба не является анонимной.')}",
-        reply_markup=cancel_kb(),
+        "♡ После этого бот попросит указать причину.",
+        cancel_kb(),
     )
 
     await callback.answer()
 
+
+# =========================================================
+# REPORT TARGET
+# =========================================================
 
 @dp.message(
     ReportTargetState.waiting,
@@ -1174,11 +1285,14 @@ async def report_target(
     value = message.text.strip()
 
     if len(value) < 2 or len(value) > 100:
+        await safe_delete(message)
+
         await message.answer(
-            f"{title('Некорректный пользователь')}\n\n"
-            f"{note('Укажите корректный username или Telegram ID.')}",
+            f"{title('Жалоба')}\n\n"
+            f"{bullet('Укажите корректный username или Telegram ID.')}",
             reply_markup=cancel_kb(),
         )
+
         return
 
     cleaned = value.lstrip("@")
@@ -1193,12 +1307,14 @@ async def report_target(
 
         if target_user_id == message.from_user.id:
             await state.clear()
+            await safe_delete(message)
 
             await message.answer(
                 f"{title('Жалоба')}\n\n"
                 f"{bullet('Нельзя пожаловаться на самого себя.')}",
                 reply_markup=main_kb(),
             )
+
             return
 
         if has_reported_target(
@@ -1207,12 +1323,14 @@ async def report_target(
             value,
         ):
             await state.clear()
+            await safe_delete(message)
 
             await message.answer(
                 f"{title('Жалоба уже отправлена')}\n\n"
                 f"{bullet('Вы уже отправляли жалобу на этого пользователя.')}",
                 reply_markup=main_kb(),
             )
+
             return
 
     await state.update_data(
@@ -1224,14 +1342,19 @@ async def report_target(
         ReportReasonState.waiting
     )
 
+    await safe_delete(message)
+
     await message.answer(
         f"{title('Причина жалобы')}\n\n"
-        f"{bullet('Кратко опишите, что произошло.')}\n"
-        f"{bullet('Максимум — 2000 символов.')}\n\n"
-        f"{note('После этого вы сможете проверить жалобу перед отправкой.')}",
+        f"{bullet('Кратко опишите причину обращения.')}\n"
+        f"{bullet('Максимум — 2000 символов.')}",
         reply_markup=cancel_kb(),
     )
 
+
+# =========================================================
+# REPORT REASON
+# =========================================================
 
 @dp.message(
     ReportReasonState.waiting,
@@ -1244,19 +1367,26 @@ async def report_reason(
     reason = message.text.strip()
 
     if len(reason) < 3:
+        await safe_delete(message)
+
         await message.answer(
-            f"{title('Слишком коротко')}\n\n"
-            f"{note('Опишите причину немного подробнее.')}",
+            f"{title('Причина жалобы')}\n\n"
+            f"{bullet('Опишите причину немного подробнее.')}",
             reply_markup=cancel_kb(),
         )
+
         return
 
-    if len(reason) > 2000:
+    if len(reason) > MAX_REPORT_REASON_LENGTH:
+        await safe_delete(message)
+
         await message.answer(
-            f"{title('Слишком длинно')}\n\n"
-            f"{bullet('Максимальная длина — 2000 символов.')}",
+            f"{title('Причина жалобы')}\n\n"
+            f"{bullet('Причина слишком длинная.')}\n"
+            f"{bullet('Максимум — 2000 символов.')}",
             reply_markup=cancel_kb(),
         )
+
         return
 
     data = await state.get_data()
@@ -1270,6 +1400,8 @@ async def report_reason(
         reason=reason
     )
 
+    await safe_delete(message)
+
     await message.answer(
         f"{title('Проверьте жалобу')}\n\n"
         f"{section('Пользователь')}\n"
@@ -1277,24 +1409,24 @@ async def report_reason(
         f"{section('Причина')}\n"
         f"{reason}\n\n"
         f"{divider()}\n"
-        f"{warning('Перед отправкой убедитесь, что всё указано верно.')}",
+        "♡ Если всё верно — подтвердите отправку.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="₊˚ Отправить жалобу ˚₊",
+                        text="⚠ Отправить жалобу",
                         callback_data="u:report_confirm",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="୨୧ Изменить причину ୨୧",
+                        text="↻ Изменить причину",
                         callback_data="u:report_edit",
                     )
                 ],
                 [
                     InlineKeyboardButton(
-                        text="‹₊˚ Отмена ˚₊",
+                        text="‹ Отмена",
                         callback_data="u:cancel",
                     )
                 ],
@@ -1321,14 +1453,19 @@ async def report_edit(
         ReportReasonState.waiting
     )
 
-    await callback.message.edit_text(
+    await replace_screen(
+        callback,
         f"{title('Причина жалобы')}\n\n"
-        f"{note('Напишите причину заново.')}",
-        reply_markup=cancel_kb(),
+        f"{bullet('Напишите причину заново.')}",
+        cancel_kb(),
     )
 
     await callback.answer()
 
+
+# =========================================================
+# REPORT CONFIRM
+# =========================================================
 
 @dp.callback_query(F.data == "u:report_confirm")
 async def report_confirm(
@@ -1342,6 +1479,7 @@ async def report_confirm(
             "Доступ ограничен.",
             show_alert=True,
         )
+
         return
 
     data = await state.get_data()
@@ -1357,6 +1495,7 @@ async def report_confirm(
             "Данные жалобы устарели.",
             show_alert=True,
         )
+
         return
 
     left = report_cooldown_left(
@@ -1368,25 +1507,29 @@ async def report_confirm(
 
         minutes = (left + 59) // 60
 
-        await callback.message.edit_text(
+        await replace_screen(
+            callback,
             f"{title('Слишком часто')}\n\n"
             f"{bullet(f'Следующую жалобу можно отправить примерно через {minutes} мин.')}",
-            reply_markup=main_kb(),
+            main_kb(),
         )
 
         await callback.answer()
+
         return
 
     if target_id == callback.from_user.id:
         await state.clear()
 
-        await callback.message.edit_text(
+        await replace_screen(
+            callback,
             f"{title('Жалоба')}\n\n"
             f"{bullet('Нельзя пожаловаться на самого себя.')}",
-            reply_markup=main_kb(),
+            main_kb(),
         )
 
         await callback.answer()
+
         return
 
     if has_reported_target(
@@ -1396,13 +1539,15 @@ async def report_confirm(
     ):
         await state.clear()
 
-        await callback.message.edit_text(
+        await replace_screen(
+            callback,
             f"{title('Жалоба уже отправлена')}\n\n"
             f"{bullet('Вы уже отправляли жалобу на этого пользователя.')}",
-            reply_markup=main_kb(),
+            main_kb(),
         )
 
         await callback.answer()
+
         return
 
     report_id = create_report(
@@ -1415,13 +1560,15 @@ async def report_confirm(
     if report_id is None:
         await state.clear()
 
-        await callback.message.edit_text(
+        await replace_screen(
+            callback,
             f"{title('Жалоба уже отправлена')}\n\n"
             f"{bullet('Вы уже отправляли жалобу на этого пользователя.')}",
-            reply_markup=main_kb(),
+            main_kb(),
         )
 
         await callback.answer()
+
         return
 
     increment_reports(
@@ -1451,8 +1598,8 @@ async def report_confirm(
     )
 
     admin_text = (
-        f"{title(f'Жалоба #{report_id}')}\n\n"
-        f"{section('На пользователя')}\n"
+        f"⚠ {title(f'Жалоба #{report_id}')}\n\n"
+        f"{section('Пользователь')}\n"
         f"{bullet('Указано: ' + target)}\n"
         f"{bullet('ID: ' + target_id_text)}\n\n"
         f"{section('Причина')}\n"
@@ -1479,22 +1626,25 @@ async def report_confirm(
             "Failed to send report to admin"
         )
 
-        await callback.message.edit_text(
+        await replace_screen(
+            callback,
             f"{title('Ошибка')}\n\n"
-            f"{bullet('Не удалось передать жалобу.')}\n"
-            f"{note('Попробуйте немного позже.')}",
-            reply_markup=main_kb(),
+            f"{bullet('Не удалось передать жалобу.')}",
+            main_kb(),
         )
 
         await callback.answer()
+
         return
 
-    await callback.message.edit_text(
+    await replace_screen(
+        callback,
         f"{title('Жалоба отправлена')}\n\n"
-        f"{bullet('Жалоба передана.')}\n"
+        f"{bullet('Ваше обращение передано.')}\n"
         f"{bullet('Следующую жалобу можно отправить через 10 минут.')}\n\n"
-        f"{note('Спасибо за обращение.')}",
-        reply_markup=main_kb(),
+        f"{divider()}\n"
+        f"♡ Спасибо за обращение.",
+        main_kb(),
     )
 
     await callback.answer(
@@ -1505,9 +1655,11 @@ async def report_confirm(
 @dp.message(ReportTargetState.waiting)
 @dp.message(ReportReasonState.waiting)
 async def report_non_text(message: Message):
+    await safe_delete(message)
+
     await message.answer(
-        f"{title('Нужен текст')}\n\n"
-        f"{note('Пожалуйста, отправьте ответ текстом.')}",
+        f"{title('Жалоба')}\n\n"
+        f"{bullet('Пожалуйста, отправьте ответ текстом.')}",
         reply_markup=cancel_kb(),
     )
 
@@ -1625,15 +1777,17 @@ async def admin_reply(
 
     await state.clear()
 
-    user_id = data.get(
-        "reply_to"
-    )
+    user_id = data.get("reply_to")
+
+    await safe_delete(message)
 
     if not user_id:
         await message.answer(
             f"{title('Ошибка')}\n\n"
-            f"{bullet('Получатель не найден.')}"
+            f"{bullet('Получатель не найден.')}",
+            reply_markup=admin_kb(),
         )
+
         return
 
     try:
@@ -1641,12 +1795,13 @@ async def admin_reply(
             user_id,
             f"{title('Ответ администрации')}\n\n"
             f"{message.text}\n\n"
-            f"{note('Ответ отправлен через бота.')}",
+            f"{divider()}\n"
+            f"♡ Вы можете ответить на это сообщение.",
             reply_markup=InlineKeyboardMarkup(
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="♡ Ответить ♡",
+                            text="♡ Ответить",
                             callback_data="u:send",
                         )
                     ]
@@ -1656,7 +1811,7 @@ async def admin_reply(
 
         await message.answer(
             f"{title('Ответ отправлен')}\n\n"
-            f"{note('Сообщение доставлено.')}",
+            f"{bullet('Сообщение доставлено пользователю.')}",
             reply_markup=admin_kb(),
         )
 
@@ -1666,8 +1821,9 @@ async def admin_reply(
         )
 
         await message.answer(
-            f"{title('Ошибка доставки')}\n\n"
-            f"{bullet('Не удалось доставить ответ.')}",
+            f"{title('Ошибка')}\n\n"
+            f"{bullet('Не удалось доставить ответ.')}\n"
+            f"{bullet('Возможно, пользователь заблокировал бота.')}",
             reply_markup=admin_kb(),
         )
 
@@ -1677,15 +1833,17 @@ async def admin_reply_non_text(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
 
+    await safe_delete(message)
+
     await message.answer(
-        f"{title('Нужен текст')}\n\n"
-        f"{note('Пожалуйста, отправьте ответ текстом.')}",
+        f"{title('Ответ пользователю')}\n\n"
+        f"{bullet('Пожалуйста, отправьте ответ текстом.')}",
         reply_markup=cancel_kb(),
     )
 
 
 # =========================================================
-# ADMIN PANEL
+# ADMIN HOME
 # =========================================================
 
 def admin_home_text():
@@ -1697,7 +1855,7 @@ def admin_home_text():
         f"{bullet(f'Заблокировано: {blocked_count()}')}\n"
         f"{bullet(f'Новых жалоб: {new_reports_count()}')}\n\n"
         f"{divider()}\n"
-        f"{note('Выберите нужный раздел.')}"
+        "♡ Выберите раздел"
     )
 
 
@@ -1712,6 +1870,8 @@ async def admin_command(
     register_user(message.from_user)
 
     await state.clear()
+
+    await safe_delete(message)
 
     await message.answer(
         admin_home_text(),
@@ -1728,13 +1888,18 @@ async def admin_home(callback: CallbackQuery):
         )
         return
 
-    await callback.message.edit_text(
+    await replace_screen(
+        callback,
         admin_home_text(),
-        reply_markup=admin_kb(),
+        admin_kb(),
     )
 
     await callback.answer()
 
+
+# =========================================================
+# ADMIN STATS
+# =========================================================
 
 @dp.callback_query(F.data == "a:stats")
 async def admin_stats(callback: CallbackQuery):
@@ -1745,19 +1910,22 @@ async def admin_stats(callback: CallbackQuery):
         )
         return
 
-    await callback.message.edit_text(
+    await replace_screen(
+        callback,
         f"{title('Статистика')}\n\n"
         f"{bullet(f'Пользователей: {user_count()}')}\n"
         f"{bullet(f'Получено сообщений: {message_count()}')}\n"
         f"{bullet(f'Заблокировано: {blocked_count()}')}\n"
-        f"{bullet(f'Новых жалоб: {new_reports_count()}')}\n\n"
-        f"{divider()}\n"
-        f"{note('Статистика обновляется автоматически.')}",
-        reply_markup=back_admin(),
+        f"{bullet(f'Новых жалоб: {new_reports_count()}')}",
+        back_admin(),
     )
 
     await callback.answer()
 
+
+# =========================================================
+# ADMIN MESSAGES
+# =========================================================
 
 @dp.callback_query(F.data == "a:messages")
 async def admin_messages(callback: CallbackQuery):
@@ -1768,12 +1936,13 @@ async def admin_messages(callback: CallbackQuery):
         )
         return
 
-    await callback.message.edit_text(
+    await replace_screen(
+        callback,
         f"{title('Сообщения')}\n\n"
         f"{bullet(f'Всего получено: {message_count()}')}\n\n"
         f"{divider()}\n"
-        f"{note('Новые сообщения приходят прямо в этот чат.')}",
-        reply_markup=back_admin(),
+        "♡ Новые сообщения приходят прямо в этот чат.",
+        back_admin(),
     )
 
     await callback.answer()
@@ -1847,7 +2016,7 @@ async def admin_users(callback: CallbackQuery):
     buttons.append(
         [
             InlineKeyboardButton(
-                text="⌕₊˚ Поиск ˚₊",
+                text="⌕ Поиск",
                 callback_data="a:search",
             )
         ]
@@ -1856,25 +2025,29 @@ async def admin_users(callback: CallbackQuery):
     buttons.append(
         [
             InlineKeyboardButton(
-                text="‹₊˚ Назад ˚₊",
+                text="‹ Назад",
                 callback_data="a:home",
             )
         ]
     )
 
-    await callback.message.edit_text(
+    await replace_screen(
+        callback,
         f"{title('Пользователи')}\n\n"
         f"{bullet(f'Всего: {user_count()}')}\n"
         f"{bullet(f'Страница: {page + 1}')}\n\n"
-        f"{divider()}\n"
-        f"{note('Выберите пользователя.')}",
-        reply_markup=InlineKeyboardMarkup(
+        "♡ Выберите пользователя.",
+        InlineKeyboardMarkup(
             inline_keyboard=buttons
         ),
     )
 
     await callback.answer()
 
+
+# =========================================================
+# ADMIN SEARCH
+# =========================================================
 
 @dp.callback_query(F.data == "a:search")
 async def admin_search_start(
@@ -1892,10 +2065,11 @@ async def admin_search_start(
         AdminSearchState.waiting
     )
 
-    await callback.message.answer(
+    await replace_screen(
+        callback,
         f"{title('Поиск пользователя')}\n\n"
         f"{bullet('Введите имя, username или Telegram ID.')}",
-        reply_markup=cancel_kb(),
+        cancel_kb(),
     )
 
     await callback.answer()
@@ -1918,12 +2092,15 @@ async def admin_search(
 
     await state.clear()
 
+    await safe_delete(message)
+
     if not rows:
         await message.answer(
             f"{title('Поиск')}\n\n"
-            f"{note('Пользователи не найдены.')}",
+            f"{bullet('Пользователи не найдены.')}",
             reply_markup=admin_kb(),
         )
+
         return
 
     buttons = []
@@ -1943,10 +2120,18 @@ async def admin_search(
             ]
         )
 
+    buttons.append(
+        [
+            InlineKeyboardButton(
+                text="‹ В админку",
+                callback_data="a:home",
+            )
+        ]
+    )
+
     await message.answer(
         f"{title('Результаты поиска')}\n\n"
-        f"{bullet(f'Найдено: {len(rows)}')}\n\n"
-        f"{divider()}",
+        f"{bullet(f'Найдено: {len(rows)}')}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=buttons
         ),
@@ -1954,18 +2139,22 @@ async def admin_search(
 
 
 @dp.message(AdminSearchState.waiting)
-async def admin_search_non_text(
-    message: Message,
-):
+async def admin_search_non_text(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
 
+    await safe_delete(message)
+
     await message.answer(
-        f"{title('Нужен текст')}\n\n"
-        f"{note('Введите имя, username или Telegram ID.')}",
+        f"{title('Поиск пользователя')}\n\n"
+        f"{bullet('Введите имя, username или Telegram ID.')}",
         reply_markup=cancel_kb(),
     )
 
+
+# =========================================================
+# ADMIN USER
+# =========================================================
 
 @dp.callback_query(F.data.startswith("a:user:"))
 async def admin_user(callback: CallbackQuery):
@@ -2008,7 +2197,7 @@ async def admin_user(callback: CallbackQuery):
         else "активен"
     )
 
-    await callback.message.edit_text(
+    text = (
         f"{title('Пользователь')}\n\n"
         f"{section('Профиль')}\n"
         f"{bullet('Имя: ' + display_name(row))}\n"
@@ -2020,8 +2209,13 @@ async def admin_user(callback: CallbackQuery):
         f"{bullet('Статус: ' + status)}\n\n"
         f"{section('Активность')}\n"
         f"{bullet('Первый запуск: ' + row['first_seen'][:19].replace('T', ' ') + ' UTC')}\n"
-        f"{bullet('Последняя активность: ' + row['last_seen'][:19].replace('T', ' ') + ' UTC')}",
-        reply_markup=user_admin_kb(
+        f"{bullet('Последняя активность: ' + row['last_seen'][:19].replace('T', ' ') + ' UTC')}"
+    )
+
+    await replace_screen(
+        callback,
+        text,
+        user_admin_kb(
             user_id,
             bool(row["blocked"]),
         ),
@@ -2029,6 +2223,10 @@ async def admin_user(callback: CallbackQuery):
 
     await callback.answer()
 
+
+# =========================================================
+# ADMIN TOGGLE
+# =========================================================
 
 @dp.callback_query(F.data.startswith("a:toggle:"))
 async def admin_toggle(callback: CallbackQuery):
@@ -2091,18 +2289,20 @@ async def admin_toggle(callback: CallbackQuery):
 
     await callback.message.edit_text(
         f"{title('Пользователь')}\n\n"
-        f"{section('Профиль')}\n"
         f"{bullet('Имя: ' + display_name(row))}\n"
         f"{bullet('Username: ' + username)}\n"
-        f"{bullet('ID: ' + str(row['user_id']))}\n\n"
-        f"{section('Статус')}\n"
-        f"{bullet(status)}",
+        f"{bullet('ID: ' + str(row['user_id']))}\n"
+        f"{bullet('Статус: ' + status)}",
         reply_markup=user_admin_kb(
             user_id,
             bool(row["blocked"]),
         ),
     )
 
+
+# =========================================================
+# ADMIN BLOCK
+# =========================================================
 
 @dp.callback_query(F.data.startswith("a:block:"))
 async def admin_block(callback: CallbackQuery):
@@ -2142,6 +2342,10 @@ async def admin_block(callback: CallbackQuery):
     )
 
 
+# =========================================================
+# BLOCKED USERS
+# =========================================================
+
 @dp.callback_query(F.data == "a:blocked")
 async def admin_blocked(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
@@ -2168,8 +2372,7 @@ async def admin_blocked(callback: CallbackQuery):
     text = f"{title('Заблокированные')}\n\n"
 
     if not rows:
-        text += note("Список пуст.")
-
+        text += f"{note('Список пуст.')}"
     else:
         for row in rows:
             username = (
@@ -2184,9 +2387,10 @@ async def admin_blocked(callback: CallbackQuery):
                 f"{bullet(str(row['user_id']))}\n\n"
             )
 
-    await callback.message.edit_text(
+    await replace_screen(
+        callback,
         text,
-        reply_markup=back_admin(),
+        back_admin(),
     )
 
     await callback.answer()
@@ -2208,13 +2412,15 @@ async def admin_reports(callback: CallbackQuery):
     rows = recent_reports()
 
     if not rows:
-        await callback.message.edit_text(
+        await replace_screen(
+            callback,
             f"{title('Жалобы')}\n\n"
             f"{note('Новых жалоб нет.')}",
-            reply_markup=back_admin(),
+            back_admin(),
         )
 
         await callback.answer()
+
         return
 
     buttons = []
@@ -2223,14 +2429,14 @@ async def admin_reports(callback: CallbackQuery):
 
     for row in rows:
         text += (
-            f"₊˚ #{row['id']}  {row['target_text']}\n"
+            f"⚠ #{row['id']}  {row['target_text']}\n"
             f"{bullet(row['reason'][:100])}\n\n"
         )
 
         buttons.append(
             [
                 InlineKeyboardButton(
-                    text=f"୨୧ Открыть жалобу #{row['id']} ୨୧",
+                    text=f"Открыть жалобу #{row['id']}",
                     callback_data=f"a:report:{row['id']}",
                 )
             ]
@@ -2239,21 +2445,26 @@ async def admin_reports(callback: CallbackQuery):
     buttons.append(
         [
             InlineKeyboardButton(
-                text="‹₊˚ Назад ˚₊",
+                text="‹ Назад",
                 callback_data="a:home",
             )
         ]
     )
 
-    await callback.message.edit_text(
+    await replace_screen(
+        callback,
         text,
-        reply_markup=InlineKeyboardMarkup(
+        InlineKeyboardMarkup(
             inline_keyboard=buttons
         ),
     )
 
     await callback.answer()
 
+
+# =========================================================
+# ADMIN REPORT
+# =========================================================
 
 @dp.callback_query(F.data.startswith("a:report:"))
 async def admin_report(callback: CallbackQuery):
@@ -2306,8 +2517,8 @@ async def admin_report(callback: CallbackQuery):
         else "закрыта"
     )
 
-    await callback.message.edit_text(
-        f"{title(f'Жалоба #{report_id}')}\n\n"
+    text = (
+        f"⚠ {title(f'Жалоба #{report_id}')}\n\n"
         f"{section('Статус')}\n"
         f"{bullet(status)}\n\n"
         f"{section('Пользователь')}\n"
@@ -2319,8 +2530,13 @@ async def admin_report(callback: CallbackQuery):
         f"{section('Заявитель')}\n"
         f"{bullet('Имя: ' + display_name(reporter))}\n"
         f"{bullet('Username: ' + reporter_username)}\n"
-        f"{bullet('ID: ' + str(report['reporter_id']))}",
-        reply_markup=report_admin_kb(
+        f"{bullet('ID: ' + str(report['reporter_id']))}"
+    )
+
+    await replace_screen(
+        callback,
+        text,
+        report_admin_kb(
             report_id,
             report["target_user_id"],
         ),
@@ -2329,12 +2545,12 @@ async def admin_report(callback: CallbackQuery):
     await callback.answer()
 
 
-@dp.callback_query(
-    F.data.startswith("a:close_report:")
-)
-async def admin_close_report(
-    callback: CallbackQuery,
-):
+# =========================================================
+# CLOSE REPORT
+# =========================================================
+
+@dp.callback_query(F.data.startswith("a:close_report:"))
+async def admin_close_report(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
         await callback.answer(
             "Нет доступа.",
@@ -2360,11 +2576,13 @@ async def admin_close_report(
         show_alert=True,
     )
 
-    await callback.message.edit_text(
+    await replace_screen(
+        callback,
         f"{title('Жалоба закрыта')}\n\n"
         f"{bullet('Номер: #' + str(report_id))}\n\n"
-        f"{note('Обращение отмечено как рассмотренное.')}",
-        reply_markup=back_admin(),
+        f"{divider()}\n"
+        f"♡ Обращение отмечено как рассмотренное.",
+        back_admin(),
     )
 
 
@@ -2388,13 +2606,14 @@ async def admin_broadcast_start(
         BroadcastState.waiting
     )
 
-    await callback.message.answer(
+    await replace_screen(
+        callback,
         f"{title('Рассылка')}\n\n"
-        f"{bullet('Напишите текст для всех зарегистрированных пользователей.')}\n"
+        f"{bullet('Напишите текст для зарегистрированных пользователей.')}\n"
         f"{bullet('Заблокированные пользователи рассылку не получают.')}\n\n"
         f"{divider()}\n"
-        f"{note('Используйте рассылку только для важных объявлений.')}",
-        reply_markup=cancel_kb(),
+        "♡ Используйте рассылку для важных объявлений.",
+        cancel_kb(),
     )
 
     await callback.answer()
@@ -2414,22 +2633,31 @@ async def admin_broadcast(
     text = message.text.strip()
 
     if not text:
+        await safe_delete(message)
+
         await message.answer(
-            f"{title('Пустая рассылка')}\n\n"
-            f"{note('Текст рассылки не может быть пустым.')}",
+            f"{title('Рассылка')}\n\n"
+            f"{bullet('Текст не может быть пустым.')}",
             reply_markup=cancel_kb(),
         )
+
         return
 
-    if len(text) > 4000:
+    if len(text) > MAX_MESSAGE_LENGTH:
+        await safe_delete(message)
+
         await message.answer(
-            f"{title('Слишком длинный текст')}\n\n"
-            f"{bullet('Максимальная длина — 4000 символов.')}",
+            f"{title('Рассылка')}\n\n"
+            f"{bullet('Текст слишком длинный.')}\n"
+            f"{bullet('Максимум — 4000 символов.')}",
             reply_markup=cancel_kb(),
         )
+
         return
 
     await state.clear()
+
+    await safe_delete(message)
 
     conn = db()
 
@@ -2469,21 +2697,21 @@ async def admin_broadcast(
         f"{bullet('Отправлено: ' + str(sent))}\n"
         f"{bullet('Не доставлено: ' + str(failed))}\n\n"
         f"{divider()}\n"
-        f"{note('Рассылка завершена.')}",
+        "♡ Рассылка завершена.",
         reply_markup=admin_kb(),
     )
 
 
 @dp.message(BroadcastState.waiting)
-async def admin_broadcast_non_text(
-    message: Message,
-):
+async def admin_broadcast_non_text(message: Message):
     if message.from_user.id != ADMIN_ID:
         return
 
+    await safe_delete(message)
+
     await message.answer(
-        f"{title('Нужен текст')}\n\n"
-        f"{note('Пожалуйста, отправьте текст рассылки.')}",
+        f"{title('Рассылка')}\n\n"
+        f"{bullet('Пожалуйста, отправьте текст рассылки.')}",
         reply_markup=cancel_kb(),
     )
 
@@ -2498,7 +2726,68 @@ async def noop(callback: CallbackQuery):
 
 
 # =========================================================
-# RENDER HTTP SERVER
+# COMMANDS
+# =========================================================
+
+async def setup_commands():
+    """
+    Устанавливаем команды прямо из кода.
+
+    Обычные пользователи:
+        /start
+        /cancel
+
+    Администратор:
+        /start
+        /cancel
+        /admin
+    """
+
+    user_commands = [
+        BotCommand(
+            command="start",
+            description="Открыть меню",
+        ),
+        BotCommand(
+            command="cancel",
+            description="Отменить действие",
+        ),
+    ]
+
+    admin_commands = [
+        BotCommand(
+            command="start",
+            description="Открыть меню",
+        ),
+        BotCommand(
+            command="cancel",
+            description="Отменить действие",
+        ),
+        BotCommand(
+            command="admin",
+            description="Панель администратора",
+        ),
+    ]
+
+    await bot.set_my_commands(
+        user_commands,
+        scope=BotCommandScopeDefault(),
+    )
+
+    await bot.set_my_commands(
+        admin_commands,
+        scope=BotCommandScopeChat(
+            chat_id=ADMIN_ID,
+        ),
+    )
+
+    logger.info(
+        "Bot commands configured."
+    )
+
+
+# =========================================================
+# HTTP SERVER FOR RENDER
 # =========================================================
 
 async def health(request: web.Request):
@@ -2608,6 +2897,13 @@ async def main():
         DB_PATH,
     )
 
+    try:
+        await setup_commands()
+    except Exception:
+        logger.exception(
+            "Failed to configure bot commands"
+        )
+
     http_runner = await start_http_server()
 
     try:
@@ -2632,6 +2928,10 @@ async def main():
                 "Bot session cleanup error"
             )
 
+
+# =========================================================
+# ENTRY POINT
+# =========================================================
 
 if __name__ == "__main__":
     try:
