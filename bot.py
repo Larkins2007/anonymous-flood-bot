@@ -22,8 +22,11 @@ from aiogram.types import (
 # =========================================================
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
+
 ADMIN_ID = 1682289834
+
 DB_PATH = os.getenv("DB_PATH", "users.db")
+
 REPORT_COOLDOWN_SECONDS = 600
 
 if not BOT_TOKEN:
@@ -42,7 +45,6 @@ dp = Dispatcher(storage=MemoryStorage())
 
 # =========================================================
 # DESIGN
-# Unified style: ♡₊˚ ... ˚₊♡
 # =========================================================
 
 def title(text: str) -> str:
@@ -113,6 +115,7 @@ def now():
 
 def init_db():
     conn = db()
+
     conn.executescript(
         """
         CREATE TABLE IF NOT EXISTS users (
@@ -148,27 +151,35 @@ def init_db():
         );
         """
     )
+
     conn.commit()
     conn.close()
 
 
 def migrate_db():
     conn = db()
+
     cols = {
         row["name"]
-        for row in conn.execute("PRAGMA table_info(users)").fetchall()
+        for row in conn.execute(
+            "PRAGMA table_info(users)"
+        ).fetchall()
     }
 
     if "reports_count" not in cols:
         conn.execute(
-            "ALTER TABLE users "
-            "ADD COLUMN reports_count INTEGER NOT NULL DEFAULT 0"
+            """
+            ALTER TABLE users
+            ADD COLUMN reports_count INTEGER NOT NULL DEFAULT 0
+            """
         )
 
     if "blocked" not in cols:
         conn.execute(
-            "ALTER TABLE users "
-            "ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0"
+            """
+            ALTER TABLE users
+            ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0
+            """
         )
 
     conn.commit()
@@ -177,7 +188,9 @@ def migrate_db():
 
 def register_user(user):
     stamp = now()
+
     conn = db()
+
     conn.execute(
         """
         INSERT INTO users (
@@ -189,6 +202,7 @@ def register_user(user):
             last_seen
         )
         VALUES (?, ?, ?, ?, ?, ?)
+
         ON CONFLICT(user_id) DO UPDATE SET
             first_name = excluded.first_name,
             last_name = excluded.last_name,
@@ -204,17 +218,21 @@ def register_user(user):
             stamp,
         ),
     )
+
     conn.commit()
     conn.close()
 
 
 def get_user(user_id):
     conn = db()
+
     row = conn.execute(
         "SELECT * FROM users WHERE user_id = ?",
         (user_id,),
     ).fetchone()
+
     conn.close()
+
     return row
 
 
@@ -225,32 +243,47 @@ def is_blocked(user_id):
 
 def set_blocked(user_id, value):
     conn = db()
+
     conn.execute(
-        "UPDATE users SET blocked = ? WHERE user_id = ?",
+        """
+        UPDATE users
+        SET blocked = ?
+        WHERE user_id = ?
+        """,
         (1 if value else 0, user_id),
     )
+
     conn.commit()
     conn.close()
 
 
 def increment_messages(user_id):
     conn = db()
+
     conn.execute(
-        "UPDATE users "
-        "SET messages_count = messages_count + 1 "
-        "WHERE user_id = ?",
+        """
+        UPDATE users
+        SET messages_count = messages_count + 1
+        WHERE user_id = ?
+        """,
         (user_id,),
     )
+
     conn.execute(
-        "INSERT INTO sent_messages (user_id, sent_at) VALUES (?, ?)",
+        """
+        INSERT INTO sent_messages (user_id, sent_at)
+        VALUES (?, ?)
+        """,
         (user_id, now()),
     )
+
     conn.commit()
     conn.close()
 
 
 def last_report_timestamp(user_id):
     conn = db()
+
     row = conn.execute(
         """
         SELECT created_at
@@ -261,12 +294,15 @@ def last_report_timestamp(user_id):
         """,
         (user_id,),
     ).fetchone()
+
     conn.close()
+
     return row["created_at"] if row else None
 
 
 def report_cooldown_left(user_id):
     stamp = last_report_timestamp(user_id)
+
     if not stamp:
         return 0
 
@@ -278,22 +314,33 @@ def report_cooldown_left(user_id):
     except (ValueError, TypeError):
         return 0
 
-    return max(0, int(REPORT_COOLDOWN_SECONDS - elapsed))
+    return max(
+        0,
+        int(REPORT_COOLDOWN_SECONDS - elapsed),
+    )
 
 
 def increment_reports(user_id):
     conn = db()
+
     conn.execute(
-        "UPDATE users "
-        "SET reports_count = reports_count + 1 "
-        "WHERE user_id = ?",
+        """
+        UPDATE users
+        SET reports_count = reports_count + 1
+        WHERE user_id = ?
+        """,
         (user_id,),
     )
+
     conn.commit()
     conn.close()
 
 
-def has_reported_target(reporter_id, target_user_id, target_text=None):
+def has_reported_target(
+    reporter_id,
+    target_user_id,
+    target_text=None,
+):
     conn = db()
 
     if target_user_id is not None:
@@ -301,11 +348,16 @@ def has_reported_target(reporter_id, target_user_id, target_text=None):
             """
             SELECT 1
             FROM reports
-            WHERE reporter_id = ? AND target_user_id = ?
+            WHERE reporter_id = ?
+              AND target_user_id = ?
             LIMIT 1
             """,
-            (reporter_id, target_user_id),
+            (
+                reporter_id,
+                target_user_id,
+            ),
         ).fetchone()
+
     else:
         normalized = (
             (target_text or "")
@@ -313,6 +365,7 @@ def has_reported_target(reporter_id, target_user_id, target_text=None):
             .lstrip("@")
             .lower()
         )
+
         row = conn.execute(
             """
             SELECT 1
@@ -321,14 +374,23 @@ def has_reported_target(reporter_id, target_user_id, target_text=None):
               AND lower(ltrim(target_text, '@')) = ?
             LIMIT 1
             """,
-            (reporter_id, normalized),
+            (
+                reporter_id,
+                normalized,
+            ),
         ).fetchone()
 
     conn.close()
+
     return row is not None
 
 
-def create_report(reporter_id, target_text, target_user_id, reason):
+def create_report(
+    reporter_id,
+    target_text,
+    target_user_id,
+    reason,
+):
     conn = db()
 
     try:
@@ -351,8 +413,11 @@ def create_report(reporter_id, target_text, target_user_id, reason):
                 now(),
             ),
         )
+
         report_id = cur.lastrowid
+
         conn.commit()
+
         return report_id
 
     except sqlite3.IntegrityError:
@@ -365,60 +430,92 @@ def create_report(reporter_id, target_text, target_user_id, reason):
 
 def get_report(report_id):
     conn = db()
+
     row = conn.execute(
         "SELECT * FROM reports WHERE id = ?",
         (report_id,),
     ).fetchone()
+
     conn.close()
+
     return row
 
 
 def close_report(report_id):
     conn = db()
+
     conn.execute(
-        "UPDATE reports SET status = 'closed' WHERE id = ?",
+        """
+        UPDATE reports
+        SET status = 'closed'
+        WHERE id = ?
+        """,
         (report_id,),
     )
+
     conn.commit()
     conn.close()
 
 
 def user_count():
     conn = db()
-    value = conn.execute("SELECT COUNT(*) FROM users").fetchone()[0]
+
+    value = conn.execute(
+        "SELECT COUNT(*) FROM users"
+    ).fetchone()[0]
+
     conn.close()
+
     return value
 
 
 def blocked_count():
     conn = db()
+
     value = conn.execute(
-        "SELECT COUNT(*) FROM users WHERE blocked = 1"
+        """
+        SELECT COUNT(*)
+        FROM users
+        WHERE blocked = 1
+        """
     ).fetchone()[0]
+
     conn.close()
+
     return value
 
 
 def message_count():
     conn = db()
+
     value = conn.execute(
         "SELECT COUNT(*) FROM sent_messages"
     ).fetchone()[0]
+
     conn.close()
+
     return value
 
 
 def new_reports_count():
     conn = db()
+
     value = conn.execute(
-        "SELECT COUNT(*) FROM reports WHERE status = 'new'"
+        """
+        SELECT COUNT(*)
+        FROM reports
+        WHERE status = 'new'
+        """
     ).fetchone()[0]
+
     conn.close()
+
     return value
 
 
 def list_users(limit=10, offset=0):
     conn = db()
+
     rows = conn.execute(
         """
         SELECT *
@@ -426,15 +523,22 @@ def list_users(limit=10, offset=0):
         ORDER BY last_seen DESC
         LIMIT ? OFFSET ?
         """,
-        (limit, offset),
+        (
+            limit,
+            offset,
+        ),
     ).fetchall()
+
     conn.close()
+
     return rows
 
 
 def search_users(query, limit=15):
     conn = db()
+
     q = f"%{query}%"
+
     rows = conn.execute(
         """
         SELECT *
@@ -446,14 +550,23 @@ def search_users(query, limit=15):
         ORDER BY last_seen DESC
         LIMIT ?
         """,
-        (q, q, q, q, limit),
+        (
+            q,
+            q,
+            q,
+            q,
+            limit,
+        ),
     ).fetchall()
+
     conn.close()
+
     return rows
 
 
 def recent_reports(limit=20):
     conn = db()
+
     rows = conn.execute(
         """
         SELECT *
@@ -464,7 +577,9 @@ def recent_reports(limit=20):
         """,
         (limit,),
     ).fetchall()
+
     conn.close()
+
     return rows
 
 
@@ -474,7 +589,10 @@ def display_name(row):
 
     value = " ".join(
         x
-        for x in (row["first_name"], row["last_name"])
+        for x in (
+            row["first_name"],
+            row["last_name"],
+        )
         if x
     ).strip()
 
@@ -658,7 +776,9 @@ def report_admin_kb(report_id, target_user_id=None):
         ]
     )
 
-    return InlineKeyboardMarkup(inline_keyboard=rows)
+    return InlineKeyboardMarkup(
+        inline_keyboard=rows
+    )
 
 
 # =========================================================
@@ -668,36 +788,48 @@ def report_admin_kb(report_id, target_user_id=None):
 def home_text():
     return (
         "♡₊˚ Анонимная обратная связь ˚₊♡\n\n"
-        "Здесь вы можете оставить сообщение администрации.\n\n"
-        "♡ Другие участники не видят ваш профиль.\n"
-        "♡ Администратор может ответить вам через бота.\n\n"
+        "Здесь вы можете оставить своё мнение, "
+        "предложение, совет или поделиться своими предпочтениями.\n\n"
+        "♡ Другие участники не видят ваш профиль.\n\n"
         "୨୧ ───────────── ୨୧\n"
         "♡ Выберите действие"
     )
 
 
 @dp.message(CommandStart())
-async def start(message: Message, state: FSMContext):
+async def start(
+    message: Message,
+    state: FSMContext,
+):
     await state.clear()
+
     register_user(message.from_user)
 
     if is_blocked(message.from_user.id):
         await message.answer(
             f"{title('Доступ ограничен')}\n\n"
-            f"{bullet('Для вашего аккаунта отправка сообщений отключена.')}"
+            f"{bullet('Отправка сообщений для вашего аккаунта отключена.')}"
         )
         return
 
-    await message.answer(home_text(), reply_markup=main_kb())
+    await message.answer(
+        home_text(),
+        reply_markup=main_kb(),
+    )
 
 
 @dp.callback_query(F.data == "u:home")
-async def user_home(callback: CallbackQuery, state: FSMContext):
+async def user_home(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
     await state.clear()
+
     await callback.message.edit_text(
         home_text(),
         reply_markup=main_kb(),
     )
+
     await callback.answer()
 
 
@@ -708,20 +840,20 @@ async def user_home(callback: CallbackQuery, state: FSMContext):
 @dp.callback_query(F.data == "u:info")
 async def user_info(callback: CallbackQuery):
     await callback.message.edit_text(
-        f"{title('Как это работает')}\n\n"
-        f"{section('Сообщения')}\n"
-        f"{bullet('Вы отправляете текст через этого бота.')}\n"
-        f"{bullet('Другие участники не видят ваш профиль.')}\n"
-        f"{bullet('Администрация получает сообщение вместе с данными отправителя.')}\n\n"
-        f"{section('Ответы')}\n"
-        f"{bullet('Администратор может ответить вам прямо через бота.')}\n\n"
-        f"{divider()}\n"
-        f"{note('Спасибо за обратную связь.')}",
+        "♡₊˚ Как это работает ˚₊♡\n\n"
+        "Вы можете оставить обратную связь о флуде, "
+        "поделиться своим мнением, предложением, советом "
+        "или своими предпочтениями.\n\n"
+        "୨୧ ───────────── ୨୧\n"
+        "♡ Напишите сообщение через бота.\n"
+        "♡ Выберите нужное действие в меню.\n\n"
+        "୨୧ ───────────── ୨୧\n"
+        "♡ Спасибо за вашу обратную связь.",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
                     InlineKeyboardButton(
-                        text="♡ О сообщениях ♡",
+                        text="♡ Оставить сообщение ♡",
                         callback_data="u:send_info",
                     )
                 ],
@@ -740,19 +872,21 @@ async def user_info(callback: CallbackQuery):
             ]
         ),
     )
+
     await callback.answer()
 
 
 @dp.callback_query(F.data == "u:send_info")
 async def send_info(callback: CallbackQuery):
     await callback.message.edit_text(
-        f"{title('О сообщениях')}\n\n"
-        f"{bullet('Напишите сообщение через бота.')}\n"
-        f"{bullet('Обычным пользователям ваш профиль не показывается.')}\n"
-        f"{bullet('Администрация получает данные отправителя.')}\n"
-        f"{bullet('При необходимости администрация может ответить вам.')}\n\n"
-        f"{divider()}\n"
-        f"{note('Сообщение можно отправить в любое время.')}",
+        "♡₊˚ О сообщениях ˚₊♡\n\n"
+        "Здесь можно высказать своё мнение о флуде, "
+        "предложить идею, поделиться советом "
+        "или рассказать о своих предпочтениях.\n\n"
+        "୨୧ ───────────── ୨୧\n"
+        "♡ Напишите сообщение.\n"
+        "♡ После отправки оно будет передано администрации.\n\n"
+        "₊˚♡ Делитесь мыслями свободно. ♡˚₊",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -770,6 +904,7 @@ async def send_info(callback: CallbackQuery):
             ]
         ),
     )
+
     await callback.answer()
 
 
@@ -777,8 +912,7 @@ async def send_info(callback: CallbackQuery):
 async def report_info(callback: CallbackQuery):
     await callback.message.edit_text(
         f"{title('О жалобах')}\n\n"
-        f"{bullet('Жалоба не является анонимной.')}\n"
-        f"{bullet('Администрация видит аккаунт заявителя.')}\n"
+        f"{bullet('Жалоба предназначена для сообщений о нарушениях или проблемах.')}\n"
         f"{bullet('Один аккаунт может пожаловаться на одного пользователя только один раз.')}\n"
         f"{bullet('Между жалобами действует пауза 10 минут.')}\n"
         f"{bullet('На самого себя пожаловаться нельзя.')}\n\n"
@@ -801,45 +935,64 @@ async def report_info(callback: CallbackQuery):
             ]
         ),
     )
+
     await callback.answer()
 
 
 # =========================================================
-# FEEDBACK
+# SEND FEEDBACK
 # =========================================================
 
 @dp.callback_query(F.data == "u:send")
-async def user_send(callback: CallbackQuery, state: FSMContext):
+async def user_send(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
     if is_blocked(callback.from_user.id):
-        await callback.answer("Доступ ограничен.", show_alert=True)
+        await callback.answer(
+            "Доступ ограничен.",
+            show_alert=True,
+        )
         return
 
-    await state.set_state(FeedbackState.waiting)
+    await state.set_state(
+        FeedbackState.waiting
+    )
 
     await callback.message.edit_text(
         f"{title('Новое сообщение')}\n\n"
         f"{bullet('Напишите текст следующим сообщением.')}\n"
         f"{bullet('Максимальная длина — 4000 символов.')}\n\n"
         f"{divider()}\n"
-        f"{note('Ваше сообщение будет передано администрации.')}",
+        f"{note('Здесь можно поделиться своим мнением или предложением.')}",
         reply_markup=cancel_kb(),
     )
+
     await callback.answer()
 
 
 @dp.callback_query(F.data == "u:cancel")
-async def user_cancel(callback: CallbackQuery, state: FSMContext):
+async def user_cancel(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
     await state.clear()
+
     await callback.message.edit_text(
         home_text(),
         reply_markup=main_kb(),
     )
+
     await callback.answer()
 
 
 @dp.message(Command("cancel"))
-async def command_cancel(message: Message, state: FSMContext):
+async def command_cancel(
+    message: Message,
+    state: FSMContext,
+):
     await state.clear()
+
     await message.answer(
         f"{title('Отменено')}\n\n"
         f"{note('Отправка отменена.')}",
@@ -847,15 +1000,22 @@ async def command_cancel(message: Message, state: FSMContext):
     )
 
 
-@dp.message(FeedbackState.waiting, F.text)
-async def feedback(message: Message, state: FSMContext):
+@dp.message(
+    FeedbackState.waiting,
+    F.text,
+)
+async def feedback(
+    message: Message,
+    state: FSMContext,
+):
     register_user(message.from_user)
 
     if is_blocked(message.from_user.id):
         await state.clear()
+
         await message.answer(
             f"{title('Доступ ограничен')}\n\n"
-            f"{bullet('Для вашего аккаунта отправка сообщений отключена.')}"
+            f"{bullet('Отправка сообщений для вашего аккаунта отключена.')}"
         )
         return
 
@@ -877,7 +1037,10 @@ async def feedback(message: Message, state: FSMContext):
         )
         return
 
-    increment_messages(message.from_user.id)
+    increment_messages(
+        message.from_user.id
+    )
+
     await state.clear()
 
     sender_name = " ".join(
@@ -924,11 +1087,15 @@ async def feedback(message: Message, state: FSMContext):
                 ]
             ),
         )
+
     except Exception:
-        logger.exception("Failed to send feedback to admin")
+        logger.exception(
+            "Failed to send feedback to admin"
+        )
+
         await message.answer(
             f"{title('Ошибка')}\n\n"
-            f"{bullet('Не удалось передать сообщение администрации.')}\n"
+            f"{bullet('Не удалось отправить сообщение.')}\n"
             f"{note('Попробуйте немного позже.')}",
             reply_markup=main_kb(),
         )
@@ -936,9 +1103,9 @@ async def feedback(message: Message, state: FSMContext):
 
     await message.answer(
         f"{title('Сообщение отправлено')}\n\n"
-        f"{bullet('Ваше сообщение передано администрации.')}\n"
-        f"{bullet('При необходимости администрация сможет ответить вам.')}\n\n"
-        f"{note('Спасибо за обратную связь.')}",
+        f"{bullet('Ваше сообщение передано.')}\n"
+        f"{bullet('При необходимости вы сможете получить ответ через бота.')}\n\n"
+        f"{note('Спасибо за вашу обратную связь.')}",
         reply_markup=after_send_kb(),
     )
 
@@ -957,37 +1124,53 @@ async def feedback_non_text(message: Message):
 # =========================================================
 
 @dp.callback_query(F.data == "u:report")
-async def report_start(callback: CallbackQuery, state: FSMContext):
+async def report_start(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
     if is_blocked(callback.from_user.id):
-        await callback.answer("Доступ ограничен.", show_alert=True)
+        await callback.answer(
+            "Доступ ограничен.",
+            show_alert=True,
+        )
         return
 
-    left = report_cooldown_left(callback.from_user.id)
+    left = report_cooldown_left(
+        callback.from_user.id
+    )
 
     if left:
         minutes = (left + 59) // 60
+
         await callback.answer(
             f"Следующую жалобу можно отправить примерно через {minutes} мин.",
             show_alert=True,
         )
         return
 
-    await state.set_state(ReportTargetState.waiting)
+    await state.set_state(
+        ReportTargetState.waiting
+    )
 
     await callback.message.edit_text(
         f"{title('Жалоба на пользователя')}\n\n"
         f"{bullet('Укажите username или Telegram ID пользователя.')}\n\n"
         f"{divider()}\n"
-        f"{section('Важно')}\n"
-        f"{bullet('Жалоба НЕ является анонимной.')}\n"
-        f"{bullet('Администрация увидит ваш аккаунт как заявителя.')}",
+        f"{warning('Жалоба не является анонимной.')}",
         reply_markup=cancel_kb(),
     )
+
     await callback.answer()
 
 
-@dp.message(ReportTargetState.waiting, F.text)
-async def report_target(message: Message, state: FSMContext):
+@dp.message(
+    ReportTargetState.waiting,
+    F.text,
+)
+async def report_target(
+    message: Message,
+    state: FSMContext,
+):
     value = message.text.strip()
 
     if len(value) < 2 or len(value) > 100:
@@ -999,11 +1182,18 @@ async def report_target(message: Message, state: FSMContext):
         return
 
     cleaned = value.lstrip("@")
-    target_user_id = int(cleaned) if cleaned.isdigit() else None
+
+    target_user_id = (
+        int(cleaned)
+        if cleaned.isdigit()
+        else None
+    )
 
     if target_user_id is not None:
+
         if target_user_id == message.from_user.id:
             await state.clear()
+
             await message.answer(
                 f"{title('Жалоба')}\n\n"
                 f"{bullet('Нельзя пожаловаться на самого себя.')}",
@@ -1017,6 +1207,7 @@ async def report_target(message: Message, state: FSMContext):
             value,
         ):
             await state.clear()
+
             await message.answer(
                 f"{title('Жалоба уже отправлена')}\n\n"
                 f"{bullet('Вы уже отправляли жалобу на этого пользователя.')}",
@@ -1028,7 +1219,10 @@ async def report_target(message: Message, state: FSMContext):
         target_text=value,
         target_user_id=target_user_id,
     )
-    await state.set_state(ReportReasonState.waiting)
+
+    await state.set_state(
+        ReportReasonState.waiting
+    )
 
     await message.answer(
         f"{title('Причина жалобы')}\n\n"
@@ -1039,8 +1233,14 @@ async def report_target(message: Message, state: FSMContext):
     )
 
 
-@dp.message(ReportReasonState.waiting, F.text)
-async def report_reason(message: Message, state: FSMContext):
+@dp.message(
+    ReportReasonState.waiting,
+    F.text,
+)
+async def report_reason(
+    message: Message,
+    state: FSMContext,
+):
     reason = message.text.strip()
 
     if len(reason) < 3:
@@ -1060,8 +1260,15 @@ async def report_reason(message: Message, state: FSMContext):
         return
 
     data = await state.get_data()
-    target = data.get("target_text", "")
-    await state.update_data(reason=reason)
+
+    target = data.get(
+        "target_text",
+        "",
+    )
+
+    await state.update_data(
+        reason=reason
+    )
 
     await message.answer(
         f"{title('Проверьте жалобу')}\n\n"
@@ -1070,8 +1277,7 @@ async def report_reason(message: Message, state: FSMContext):
         f"{section('Причина')}\n"
         f"{reason}\n\n"
         f"{divider()}\n"
-        f"{warning('Заявитель виден администрации.')}\n\n"
-        f"{note('Если всё верно — подтвердите отправку.')}",
+        f"{warning('Перед отправкой убедитесь, что всё указано верно.')}",
         reply_markup=InlineKeyboardMarkup(
             inline_keyboard=[
                 [
@@ -1098,7 +1304,10 @@ async def report_reason(message: Message, state: FSMContext):
 
 
 @dp.callback_query(F.data == "u:report_edit")
-async def report_edit(callback: CallbackQuery, state: FSMContext):
+async def report_edit(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
     data = await state.get_data()
 
     if not data.get("target_text"):
@@ -1108,56 +1317,75 @@ async def report_edit(callback: CallbackQuery, state: FSMContext):
         )
         return
 
-    await state.set_state(ReportReasonState.waiting)
+    await state.set_state(
+        ReportReasonState.waiting
+    )
 
     await callback.message.edit_text(
         f"{title('Причина жалобы')}\n\n"
         f"{note('Напишите причину заново.')}",
         reply_markup=cancel_kb(),
     )
+
     await callback.answer()
 
 
 @dp.callback_query(F.data == "u:report_confirm")
-async def report_confirm(callback: CallbackQuery, state: FSMContext):
+async def report_confirm(
+    callback: CallbackQuery,
+    state: FSMContext,
+):
     if is_blocked(callback.from_user.id):
         await state.clear()
-        await callback.answer("Доступ ограничен.", show_alert=True)
+
+        await callback.answer(
+            "Доступ ограничен.",
+            show_alert=True,
+        )
         return
 
     data = await state.get_data()
+
     target = data.get("target_text")
     reason = data.get("reason")
     target_id = data.get("target_user_id")
 
     if not target or not reason:
         await state.clear()
+
         await callback.answer(
             "Данные жалобы устарели.",
             show_alert=True,
         )
         return
 
-    left = report_cooldown_left(callback.from_user.id)
+    left = report_cooldown_left(
+        callback.from_user.id
+    )
 
     if left:
         await state.clear()
+
         minutes = (left + 59) // 60
+
         await callback.message.edit_text(
             f"{title('Слишком часто')}\n\n"
             f"{bullet(f'Следующую жалобу можно отправить примерно через {minutes} мин.')}",
             reply_markup=main_kb(),
         )
+
         await callback.answer()
         return
 
     if target_id == callback.from_user.id:
         await state.clear()
+
         await callback.message.edit_text(
             f"{title('Жалоба')}\n\n"
             f"{bullet('Нельзя пожаловаться на самого себя.')}",
             reply_markup=main_kb(),
         )
+
         await callback.answer()
         return
 
@@ -1167,11 +1395,13 @@ async def report_confirm(callback: CallbackQuery, state: FSMContext):
         target,
     ):
         await state.clear()
+
         await callback.message.edit_text(
             f"{title('Жалоба уже отправлена')}\n\n"
             f"{bullet('Вы уже отправляли жалобу на этого пользователя.')}",
             reply_markup=main_kb(),
         )
+
         await callback.answer()
         return
 
@@ -1184,19 +1414,29 @@ async def report_confirm(callback: CallbackQuery, state: FSMContext):
 
     if report_id is None:
         await state.clear()
+
         await callback.message.edit_text(
             f"{title('Жалоба уже отправлена')}\n\n"
             f"{bullet('Вы уже отправляли жалобу на этого пользователя.')}",
             reply_markup=main_kb(),
         )
+
         await callback.answer()
         return
 
-    increment_reports(callback.from_user.id)
+    increment_reports(
+        callback.from_user.id
+    )
+
     await state.clear()
 
-    reporter = get_user(callback.from_user.id)
-    reporter_name = display_name(reporter)
+    reporter = get_user(
+        callback.from_user.id
+    )
+
+    reporter_name = display_name(
+        reporter
+    )
 
     reporter_username = (
         f"@{reporter['username']}"
@@ -1204,7 +1444,11 @@ async def report_confirm(callback: CallbackQuery, state: FSMContext):
         else "нет username"
     )
 
-    target_id_text = str(target_id) if target_id else "не указан"
+    target_id_text = (
+        str(target_id)
+        if target_id
+        else "не указан"
+    )
 
     admin_text = (
         f"{title(f'Жалоба #{report_id}')}\n\n"
@@ -1229,25 +1473,33 @@ async def report_confirm(callback: CallbackQuery, state: FSMContext):
                 target_id,
             ),
         )
+
     except Exception:
-        logger.exception("Failed to send report to admin")
+        logger.exception(
+            "Failed to send report to admin"
+        )
+
         await callback.message.edit_text(
             f"{title('Ошибка')}\n\n"
-            f"{bullet('Не удалось передать жалобу администрации.')}",
+            f"{bullet('Не удалось передать жалобу.')}\n"
+            f"{note('Попробуйте немного позже.')}",
             reply_markup=main_kb(),
         )
+
         await callback.answer()
         return
 
     await callback.message.edit_text(
         f"{title('Жалоба отправлена')}\n\n"
-        f"{bullet('Администрация получила обращение.')}\n"
-        f"{bullet('Заявитель виден администрации.')}\n"
+        f"{bullet('Жалоба передана.')}\n"
         f"{bullet('Следующую жалобу можно отправить через 10 минут.')}\n\n"
         f"{note('Спасибо за обращение.')}",
         reply_markup=main_kb(),
     )
-    await callback.answer("Жалоба отправлена")
+
+    await callback.answer(
+        "Жалоба отправлена"
+    )
 
 
 @dp.message(ReportTargetState.waiting)
@@ -1270,11 +1522,16 @@ async def admin_reply_start(
     state: FSMContext,
 ):
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True,
+        )
         return
 
     try:
-        user_id = int(callback.data.split(":")[1])
+        user_id = int(
+            callback.data.split(":")[1]
+        )
     except (ValueError, IndexError):
         await callback.answer(
             "Некорректный пользователь.",
@@ -1289,14 +1546,20 @@ async def admin_reply_start(
         )
         return
 
-    await state.update_data(reply_to=user_id)
-    await state.set_state(AdminReplyState.waiting)
+    await state.update_data(
+        reply_to=user_id
+    )
+
+    await state.set_state(
+        AdminReplyState.waiting
+    )
 
     await callback.message.answer(
         f"{title('Ответ пользователю')}\n\n"
         f"{bullet('Напишите текст ответа.')}",
         reply_markup=cancel_kb(),
     )
+
     await callback.answer()
 
 
@@ -1306,11 +1569,16 @@ async def admin_reply_user_start(
     state: FSMContext,
 ):
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True,
+        )
         return
 
     try:
-        user_id = int(callback.data.split(":")[2])
+        user_id = int(
+            callback.data.split(":")[2]
+        )
     except (ValueError, IndexError):
         await callback.answer(
             "Некорректный пользователь.",
@@ -1325,26 +1593,41 @@ async def admin_reply_user_start(
         )
         return
 
-    await state.update_data(reply_to=user_id)
-    await state.set_state(AdminReplyState.waiting)
+    await state.update_data(
+        reply_to=user_id
+    )
+
+    await state.set_state(
+        AdminReplyState.waiting
+    )
 
     await callback.message.answer(
         f"{title('Ответ пользователю')}\n\n"
         f"{bullet('Напишите текст ответа.')}",
         reply_markup=cancel_kb(),
     )
+
     await callback.answer()
 
 
-@dp.message(AdminReplyState.waiting, F.text)
-async def admin_reply(message: Message, state: FSMContext):
+@dp.message(
+    AdminReplyState.waiting,
+    F.text,
+)
+async def admin_reply(
+    message: Message,
+    state: FSMContext,
+):
     if message.from_user.id != ADMIN_ID:
         return
 
     data = await state.get_data()
+
     await state.clear()
 
-    user_id = data.get("reply_to")
+    user_id = data.get(
+        "reply_to"
+    )
 
     if not user_id:
         await message.answer(
@@ -1363,7 +1646,7 @@ async def admin_reply(message: Message, state: FSMContext):
                 inline_keyboard=[
                     [
                         InlineKeyboardButton(
-                            text="♡ Ответить администрации ♡",
+                            text="♡ Ответить ♡",
                             callback_data="u:send",
                         )
                     ]
@@ -1373,16 +1656,18 @@ async def admin_reply(message: Message, state: FSMContext):
 
         await message.answer(
             f"{title('Ответ отправлен')}\n\n"
-            f"{note('Сообщение доставлено пользователю.')}",
+            f"{note('Сообщение доставлено.')}",
             reply_markup=admin_kb(),
         )
 
     except Exception:
-        logger.exception("Failed to send admin reply")
+        logger.exception(
+            "Failed to send admin reply"
+        )
+
         await message.answer(
             f"{title('Ошибка доставки')}\n\n"
-            f"{bullet('Не удалось доставить ответ.')}\n"
-            f"{note('Возможно, пользователь заблокировал бота.')}",
+            f"{bullet('Не удалось доставить ответ.')}",
             reply_markup=admin_kb(),
         )
 
@@ -1412,16 +1697,20 @@ def admin_home_text():
         f"{bullet(f'Заблокировано: {blocked_count()}')}\n"
         f"{bullet(f'Новых жалоб: {new_reports_count()}')}\n\n"
         f"{divider()}\n"
-        f"{subtitle('Выберите раздел')}"
+        f"{note('Выберите нужный раздел.')}"
     )
 
 
 @dp.message(Command("admin"))
-async def admin_command(message: Message, state: FSMContext):
+async def admin_command(
+    message: Message,
+    state: FSMContext,
+):
     if message.from_user.id != ADMIN_ID:
         return
 
     register_user(message.from_user)
+
     await state.clear()
 
     await message.answer(
@@ -1443,6 +1732,7 @@ async def admin_home(callback: CallbackQuery):
         admin_home_text(),
         reply_markup=admin_kb(),
     )
+
     await callback.answer()
 
 
@@ -1465,6 +1755,7 @@ async def admin_stats(callback: CallbackQuery):
         f"{note('Статистика обновляется автоматически.')}",
         reply_markup=back_admin(),
     )
+
     await callback.answer()
 
 
@@ -1481,9 +1772,10 @@ async def admin_messages(callback: CallbackQuery):
         f"{title('Сообщения')}\n\n"
         f"{bullet(f'Всего получено: {message_count()}')}\n\n"
         f"{divider()}\n"
-        f"{note('Новые сообщения приходят прямо в чат администрации.')}",
+        f"{note('Новые сообщения приходят прямо в этот чат.')}",
         reply_markup=back_admin(),
     )
+
     await callback.answer()
 
 
@@ -1494,20 +1786,31 @@ async def admin_messages(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("a:users:"))
 async def admin_users(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True,
+        )
         return
 
     try:
-        page = int(callback.data.split(":")[2])
+        page = int(
+            callback.data.split(":")[2]
+        )
     except (ValueError, IndexError):
         page = 0
 
     page = max(page, 0)
-    rows = list_users(10, page * 10)
+
+    rows = list_users(
+        10,
+        page * 10,
+    )
+
     buttons = []
 
     for row in rows:
         label = display_name(row)
+
         if row["blocked"]:
             label = f"⊘ {label}"
 
@@ -1569,6 +1872,7 @@ async def admin_users(callback: CallbackQuery):
             inline_keyboard=buttons
         ),
     )
+
     await callback.answer()
 
 
@@ -1578,20 +1882,29 @@ async def admin_search_start(
     state: FSMContext,
 ):
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True,
+        )
         return
 
-    await state.set_state(AdminSearchState.waiting)
+    await state.set_state(
+        AdminSearchState.waiting
+    )
 
     await callback.message.answer(
         f"{title('Поиск пользователя')}\n\n"
         f"{bullet('Введите имя, username или Telegram ID.')}",
         reply_markup=cancel_kb(),
     )
+
     await callback.answer()
 
 
-@dp.message(AdminSearchState.waiting, F.text)
+@dp.message(
+    AdminSearchState.waiting,
+    F.text,
+)
 async def admin_search(
     message: Message,
     state: FSMContext,
@@ -1599,7 +1912,10 @@ async def admin_search(
     if message.from_user.id != ADMIN_ID:
         return
 
-    rows = search_users(message.text.strip())
+    query = message.text.strip()
+
+    rows = search_users(query)
+
     await state.clear()
 
     if not rows:
@@ -1614,6 +1930,7 @@ async def admin_search(
 
     for row in rows:
         label = display_name(row)
+
         if row["blocked"]:
             label = f"⊘ {label}"
 
@@ -1637,7 +1954,9 @@ async def admin_search(
 
 
 @dp.message(AdminSearchState.waiting)
-async def admin_search_non_text(message: Message):
+async def admin_search_non_text(
+    message: Message,
+):
     if message.from_user.id != ADMIN_ID:
         return
 
@@ -1651,13 +1970,21 @@ async def admin_search_non_text(message: Message):
 @dp.callback_query(F.data.startswith("a:user:"))
 async def admin_user(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True,
+        )
         return
 
     try:
-        user_id = int(callback.data.split(":")[2])
+        user_id = int(
+            callback.data.split(":")[2]
+        )
     except (ValueError, IndexError):
-        await callback.answer("Некорректный ID.", show_alert=True)
+        await callback.answer(
+            "Некорректный ID.",
+            show_alert=True,
+        )
         return
 
     row = get_user(user_id)
@@ -1675,7 +2002,11 @@ async def admin_user(callback: CallbackQuery):
         else "нет username"
     )
 
-    status = "заблокирован" if row["blocked"] else "активен"
+    status = (
+        "заблокирован"
+        if row["blocked"]
+        else "активен"
+    )
 
     await callback.message.edit_text(
         f"{title('Пользователь')}\n\n"
@@ -1695,19 +2026,28 @@ async def admin_user(callback: CallbackQuery):
             bool(row["blocked"]),
         ),
     )
+
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("a:toggle:"))
 async def admin_toggle(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True,
+        )
         return
 
     try:
-        user_id = int(callback.data.split(":")[2])
+        user_id = int(
+            callback.data.split(":")[2]
+        )
     except (ValueError, IndexError):
-        await callback.answer("Некорректный ID.", show_alert=True)
+        await callback.answer(
+            "Некорректный ID.",
+            show_alert=True,
+        )
         return
 
     row = get_user(user_id)
@@ -1720,22 +2060,34 @@ async def admin_toggle(callback: CallbackQuery):
         return
 
     new_value = not bool(row["blocked"])
-    set_blocked(user_id, new_value)
+
+    set_blocked(
+        user_id,
+        new_value,
+    )
 
     await callback.answer(
-        "Пользователь заблокирован."
-        if new_value
-        else "Пользователь разблокирован.",
+        (
+            "Пользователь заблокирован."
+            if new_value
+            else "Пользователь разблокирован."
+        ),
         show_alert=True,
     )
 
     row = get_user(user_id)
+
     username = (
         f"@{row['username']}"
         if row["username"]
         else "нет username"
     )
-    status = "заблокирован" if row["blocked"] else "активен"
+
+    status = (
+        "заблокирован"
+        if row["blocked"]
+        else "активен"
+    )
 
     await callback.message.edit_text(
         f"{title('Пользователь')}\n\n"
@@ -1755,13 +2107,21 @@ async def admin_toggle(callback: CallbackQuery):
 @dp.callback_query(F.data.startswith("a:block:"))
 async def admin_block(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True,
+        )
         return
 
     try:
-        user_id = int(callback.data.split(":")[2])
+        user_id = int(
+            callback.data.split(":")[2]
+        )
     except (ValueError, IndexError):
-        await callback.answer("Некорректный ID.", show_alert=True)
+        await callback.answer(
+            "Некорректный ID.",
+            show_alert=True,
+        )
         return
 
     if not get_user(user_id):
@@ -1771,7 +2131,11 @@ async def admin_block(callback: CallbackQuery):
         )
         return
 
-    set_blocked(user_id, True)
+    set_blocked(
+        user_id,
+        True,
+    )
+
     await callback.answer(
         "Пользователь заблокирован.",
         show_alert=True,
@@ -1781,7 +2145,10 @@ async def admin_block(callback: CallbackQuery):
 @dp.callback_query(F.data == "a:blocked")
 async def admin_blocked(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True,
+        )
         return
 
     conn = db()
@@ -1802,6 +2169,7 @@ async def admin_blocked(callback: CallbackQuery):
 
     if not rows:
         text += note("Список пуст.")
+
     else:
         for row in rows:
             username = (
@@ -1820,6 +2188,7 @@ async def admin_blocked(callback: CallbackQuery):
         text,
         reply_markup=back_admin(),
     )
+
     await callback.answer()
 
 
@@ -1830,7 +2199,10 @@ async def admin_blocked(callback: CallbackQuery):
 @dp.callback_query(F.data == "a:reports")
 async def admin_reports(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True,
+        )
         return
 
     rows = recent_reports()
@@ -1841,10 +2213,12 @@ async def admin_reports(callback: CallbackQuery):
             f"{note('Новых жалоб нет.')}",
             reply_markup=back_admin(),
         )
+
         await callback.answer()
         return
 
     buttons = []
+
     text = f"{title('Новые жалобы')}\n\n"
 
     for row in rows:
@@ -1877,17 +2251,23 @@ async def admin_reports(callback: CallbackQuery):
             inline_keyboard=buttons
         ),
     )
+
     await callback.answer()
 
 
 @dp.callback_query(F.data.startswith("a:report:"))
 async def admin_report(callback: CallbackQuery):
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True,
+        )
         return
 
     try:
-        report_id = int(callback.data.split(":")[2])
+        report_id = int(
+            callback.data.split(":")[2]
+        )
     except (ValueError, IndexError):
         await callback.answer(
             "Некорректный номер жалобы.",
@@ -1904,7 +2284,9 @@ async def admin_report(callback: CallbackQuery):
         )
         return
 
-    reporter = get_user(report["reporter_id"])
+    reporter = get_user(
+        report["reporter_id"]
+    )
 
     reporter_username = (
         f"@{reporter['username']}"
@@ -1918,7 +2300,11 @@ async def admin_report(callback: CallbackQuery):
         else "не указан"
     )
 
-    status = "новая" if report["status"] == "new" else "закрыта"
+    status = (
+        "новая"
+        if report["status"] == "new"
+        else "закрыта"
+    )
 
     await callback.message.edit_text(
         f"{title(f'Жалоба #{report_id}')}\n\n"
@@ -1939,17 +2325,27 @@ async def admin_report(callback: CallbackQuery):
             report["target_user_id"],
         ),
     )
+
     await callback.answer()
 
 
-@dp.callback_query(F.data.startswith("a:close_report:"))
-async def admin_close_report(callback: CallbackQuery):
+@dp.callback_query(
+    F.data.startswith("a:close_report:")
+)
+async def admin_close_report(
+    callback: CallbackQuery,
+):
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True,
+        )
         return
 
     try:
-        report_id = int(callback.data.split(":")[2])
+        report_id = int(
+            callback.data.split(":")[2]
+        )
     except (ValueError, IndexError):
         await callback.answer(
             "Некорректный номер.",
@@ -1982,10 +2378,15 @@ async def admin_broadcast_start(
     state: FSMContext,
 ):
     if callback.from_user.id != ADMIN_ID:
-        await callback.answer("Нет доступа.", show_alert=True)
+        await callback.answer(
+            "Нет доступа.",
+            show_alert=True,
+        )
         return
 
-    await state.set_state(BroadcastState.waiting)
+    await state.set_state(
+        BroadcastState.waiting
+    )
 
     await callback.message.answer(
         f"{title('Рассылка')}\n\n"
@@ -1995,10 +2396,14 @@ async def admin_broadcast_start(
         f"{note('Используйте рассылку только для важных объявлений.')}",
         reply_markup=cancel_kb(),
     )
+
     await callback.answer()
 
 
-@dp.message(BroadcastState.waiting, F.text)
+@dp.message(
+    BroadcastState.waiting,
+    F.text,
+)
 async def admin_broadcast(
     message: Message,
     state: FSMContext,
@@ -2027,12 +2432,18 @@ async def admin_broadcast(
     await state.clear()
 
     conn = db()
+
     ids = [
         row["user_id"]
         for row in conn.execute(
-            "SELECT user_id FROM users WHERE blocked = 0"
+            """
+            SELECT user_id
+            FROM users
+            WHERE blocked = 0
+            """
         ).fetchall()
     ]
+
     conn.close()
 
     sent = 0
@@ -2045,11 +2456,13 @@ async def admin_broadcast(
                 f"{title('Сообщение от администрации')}\n\n"
                 f"{text}",
             )
+
             sent += 1
+
+            await asyncio.sleep(0.05)
+
         except Exception:
             failed += 1
-
-        await asyncio.sleep(0.05)
 
     await message.answer(
         f"{title('Рассылка завершена')}\n\n"
@@ -2062,7 +2475,9 @@ async def admin_broadcast(
 
 
 @dp.message(BroadcastState.waiting)
-async def admin_broadcast_non_text(message: Message):
+async def admin_broadcast_non_text(
+    message: Message,
+):
     if message.from_user.id != ADMIN_ID:
         return
 
@@ -2092,13 +2507,27 @@ async def health(request: web.Request):
 
 async def start_http_server():
     app = web.Application()
-    app.router.add_get("/", health)
-    app.router.add_get("/health", health)
+
+    app.router.add_get(
+        "/",
+        health,
+    )
+
+    app.router.add_get(
+        "/health",
+        health,
+    )
 
     runner = web.AppRunner(app)
+
     await runner.setup()
 
-    port = int(os.getenv("PORT", "10000"))
+    port = int(
+        os.getenv(
+            "PORT",
+            "10000",
+        )
+    )
 
     site = web.TCPSite(
         runner,
@@ -2121,17 +2550,27 @@ async def start_http_server():
 # =========================================================
 
 async def polling_loop():
-    logger.info("Removing old Telegram webhook...")
+    logger.info(
+        "Removing old Telegram webhook..."
+    )
 
     try:
         await bot.delete_webhook(
             drop_pending_updates=False
         )
-        logger.info("Old webhook removed.")
-    except Exception:
-        logger.exception("Failed to remove old webhook")
 
-    logger.info("Starting Telegram polling...")
+        logger.info(
+            "Old webhook removed."
+        )
+
+    except Exception:
+        logger.exception(
+            "Failed to remove old webhook"
+        )
+
+    logger.info(
+        "Starting Telegram polling..."
+    )
 
     while True:
         try:
@@ -2148,6 +2587,7 @@ async def polling_loop():
             logger.exception(
                 "Polling crashed. Restarting in 5 seconds..."
             )
+
             await asyncio.sleep(5)
 
 
@@ -2156,7 +2596,9 @@ async def polling_loop():
 # =========================================================
 
 async def main():
-    logger.info("Starting Anonymous Feedback Bot...")
+    logger.info(
+        "Starting Anonymous Feedback Bot..."
+    )
 
     init_db()
     migrate_db()
@@ -2172,21 +2614,32 @@ async def main():
         await polling_loop()
 
     finally:
-        logger.info("Stopping bot...")
+        logger.info(
+            "Stopping bot..."
+        )
 
         try:
             await http_runner.cleanup()
         except Exception:
-            logger.exception("HTTP cleanup error")
+            logger.exception(
+                "HTTP cleanup error"
+            )
 
         try:
             await bot.session.close()
         except Exception:
-            logger.exception("Bot session cleanup error")
+            logger.exception(
+                "Bot session cleanup error"
+            )
 
 
 if __name__ == "__main__":
     try:
-        asyncio.run(main())
+        asyncio.run(
+            main()
+        )
+
     except KeyboardInterrupt:
-        logger.info("Bot stopped by user.")
+        logger.info(
+            "Bot stopped by user."
+        )
