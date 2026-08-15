@@ -784,36 +784,6 @@ def home_text():
         f"{title('Анонимная обратная связь')}\n\n"
         "Здесь вы можете оставить сообщение администрации.\n\n"
         f"{bullet('Ваш профиль не показывается другим пользователям.')}\n"
-        f"{bullet('Администрация получает сообщение вместе с данными отправителя.')}\n"
-        f"{bullet('Администратор может ответить вам через бота.')}\n\n"
-        f"{divider()}\n"
-        f"{subtitle('Выберите действие')}"
-    )
-
-
-@dp.message(CommandStart())
-async def start(
-    message: Message,
-    state: FSMContext,
-):
-    await state.clear()
-
-    register_user(message.from_user)
-
-    if is_blocked(message.from_user.id):
-        await message.answer(
-            f"{title('Доступ ограничен')}\n\n"
-            f"{bullet('Для вашего аккаунта отправка сообщений отключена.')}"
-        )
-        return
-
-    await message.answer(
-        home_text(),
-        reply_markup=main_kb(),
-    )
-
-
-@dp.callback_query(F.data == "u:home")
 async def user_home(
     callback: CallbackQuery,
     state: FSMContext,
