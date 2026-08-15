@@ -9,6 +9,7 @@ import traceback
 from contextlib import suppress
 from datetime import datetime, timezone
 from typing import Optional
+from logging.handlers import RotatingFileHandler
 
 from aiohttp import web
 
@@ -55,9 +56,9 @@ MAX_MESSAGE_LENGTH = 4000
 MAX_REPORT_REASON_LENGTH = 2000
 TELEGRAM_TEXT_LIMIT = 4096
 
-# Conservative pacing for broadcast.
-BROADCAST_DELAY_SECONDS = 0.10
-BROADCAST_MAX_RETRIES = 3
+# Conservative pacing for broadcast (raised to reduce rate-limit issues).
+BROADCAST_DELAY_SECONDS = float(os.getenv("BROADCAST_DELAY_SECONDS", "0.3"))
+BROADCAST_MAX_RETRIES = int(os.getenv("BROADCAST_MAX_RETRIES", "3"))
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
@@ -67,10 +68,24 @@ if not BOT_TOKEN:
 # LOGGING
 # =========================================================
 
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)s | %(name)s | %(message)s",
-)
+LOG_LEVEL = os.getenv("LOG_LEVEL", "INFO").upper()
+LOG_FILE = os.getenv("LOG_FILE", "bot.log")
+
+# Configure root logger with both console and rotating file handlers.
+_root_logger = logging.getLogger()
+_root_logger.setLevel(getattr(logging, LOG_LEVEL, logging.INFO))
+_formatter = logging.Formatter("%(asctime)s | %(levelname)s | %(name)s | %(message)s")
+
+_console = logging.StreamHandler(sys.stdout)
+_console.setFormatter(_formatter)
+_root_logger.addHandler(_console)
+
+try:
+    _file_handler = RotatingFileHandler(LOG_FILE, maxBytes=10 * 1024 * 1024, backupCount=5)
+    _file_handler.setFormatter(_formatter)
+    _root_logger.addHandler(_file_handler)
+except Exception:
+    _root_logger.exception("Could not create rotating file handler; continuing without file logging")
 
 logger = logging.getLogger("anonymous-feedback-bot")
 
@@ -93,12 +108,6 @@ def aio_exc_handler(loop, context):
             logger.critical("Event loop exception detail:", exc_info=exc)
     except Exception:
         traceback.print_exc()
-
-try:
-    loop = asyncio.get_event_loop()
-    loop.set_exception_handler(aio_exc_handler)
-except Exception:
-    logger.debug("Could not set asyncio exception handler at import time")
 
 
 # =========================================================
@@ -1158,7 +1167,7 @@ async def send_broadcast_to_user(user_id: int, text: str):
 # KEYBOARDS
 # =========================================================
 
-# (unchanged keyboard functions omitted for brevity in this commit)
+# (keyboard functions unchanged)
 
 
 def main_kb():
@@ -1185,4 +1194,117 @@ def main_kb():
         ]
     )
 
-# ... rest of file unchanged from current version
+# ... rest of file unchanged
+
+
+# =========================================================
+# STARTUP / POLLING
+# =========================================================
+
+
+async def validate_bot():
+    me = await bot.get_me()
+    logger.info(
+        "Telegram bot connected | id=%s | username=@%s",
+        me.id,
+        me.username or "unknown",
+    )
+
+
+async def remove_old_webhook():
+    try:
+        await bot.delete_webhook(drop_pending_updates=False)
+        logger.info("Old Telegram webhook removed.")
+    except TelegramUnauthorizedError:
+        logger.critical(
+            "BOT_TOKEN is invalid. Telegram rejected the bot token while removing webhook."
+        )
+        raise
+    except Exception:
+        logger.exception("Could not remove old webhook")
+        raise
+
+
+async def polling_loop():
+    logger.info("Starting polling...")
+    await dp.start_polling(
+        bot,
+        allowed_updates=dp.resolve_used_update_types(),
+        handle_signals=True,
+    )
+
+
+# =========================================================
+# MAIN
+# =========================================================
+
+
+async def main():
+    logger.info("Starting Anonymous Feedback Bot...")
+
+    # Reinstall asyncio exception handler on startup (ensures it's active on the running loop).
+    try:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(aio_exc_handler)
+    except Exception:
+        logger.debug("Could not set asyncio exception handler in main")
+
+    await init_db()
+    await validate_bot()
+    await remove_old_webhook()
+
+    try:
+        await setup_commands()
+    except TelegramUnauthorizedError:
+        logger.critical("BOT_TOKEN is invalid while configuring commands.")
+        raise
+    except Exception:
+        logger.exception("Could not configure commands")
+
+    http_runner = await start_http_server()
+
+    # Resilient polling loop with exponential backoff for transient errors.
+    backoff = 1
+    try:
+        while True:
+            try:
+                await polling_loop()
+                # start_polling returns when polling stops (clean shutdown). Exit loop.
+                break
+            except (TelegramUnauthorizedError, TelegramConflictError):
+                logger.critical("Polling stopped due to unrecoverable Telegram error. Exiting.")
+                raise
+            except asyncio.CancelledError:
+                logger.info("Polling cancelled.")
+                raise
+            except Exception:
+                logger.exception("Polling crashed; will restart after %s seconds", backoff)
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 300)
+    finally:
+        logger.info("Stopping bot...")
+
+        with suppress(Exception):
+            await dp.stop_polling()
+
+        try:
+            await http_runner.cleanup()
+        except Exception:
+            logger.exception("HTTP cleanup error")
+
+        try:
+            await bot.session.close()
+        except Exception:
+            logger.exception("Bot session cleanup error")
+
+
+# =========================================================
+# ENTRY POINT
+# =========================================================
+
+
+if __name__ == "__main__":
+    try:
+        asyncio.run(main())
+    except KeyboardInterrupt:
+        logger.info("Bot stopped.")
