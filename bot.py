@@ -9,7 +9,7 @@ import sys
 import threading
 import traceback
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from logging.handlers import RotatingFileHandler
 from typing import Optional
 
@@ -35,8 +35,11 @@ from aiogram.types import (
     BotCommandScopeChat,
     BotCommandScopeDefault,
     CallbackQuery,
+    ChatMemberUpdated,
+    ChatPermissions,
     ErrorEvent,
     InlineKeyboardButton,
+    MessageEntity,
     InlineKeyboardMarkup,
     Message,
 )
@@ -59,6 +62,17 @@ MAX_REPORT_REASON_LENGTH = 2000
 TELEGRAM_TEXT_LIMIT = 3500
 BROADCAST_DELAY_SECONDS = float(os.getenv("BROADCAST_DELAY_SECONDS", "0.20"))
 BROADCAST_MAX_RETRIES = int(os.getenv("BROADCAST_MAX_RETRIES", "3"))
+
+
+# =========================================================
+# FLOOD / GROUP MODERATION CONFIG
+# =========================================================
+
+ADMIN_MENTION = os.getenv("ADMIN_MENTION", "@Belochki_Rulyat")
+GROUP_WELCOME_TIMEOUT = int(os.getenv("GROUP_WELCOME_TIMEOUT", "0"))
+DEFAULT_OCCUPIED_MARKER = os.getenv("DEFAULT_OCCUPIED_MARKER", "💛")
+ROLE_ASSIGNMENT_WINDOW_SECONDS = int(os.getenv("ROLE_ASSIGNMENT_WINDOW_SECONDS", "600"))
+
 
 
 if not BOT_TOKEN:
@@ -389,6 +403,74 @@ def migrate_db():
         conn.commit()
 
     db_transaction(migrate)
+
+
+
+def init_group_db():
+    """Create/migrate the group-moderation tables without touching legacy data."""
+    def op(conn):
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS managed_group (
+                group_chat_id INTEGER PRIMARY KEY,
+                info_channel_id INTEGER,
+                bound_at TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS group_members (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                first_name TEXT NOT NULL DEFAULT '',
+                last_name TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL DEFAULT '',
+                role_key TEXT,
+                role_name TEXT,
+                tag TEXT,
+                confirmed INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                joined_at TEXT NOT NULL,
+                confirmed_at TEXT,
+                left_at TEXT,
+                welcome_message_id INTEGER,
+                tag_set_by_bot INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (chat_id, user_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_group_members_active_role
+                ON group_members(chat_id, active, role_key);
+            CREATE INDEX IF NOT EXISTS idx_group_members_username
+                ON group_members(chat_id, username);
+            CREATE INDEX IF NOT EXISTS idx_group_members_joined
+                ON group_members(chat_id, joined_at);
+
+            CREATE TABLE IF NOT EXISTS role_state (
+                chat_id INTEGER NOT NULL,
+                role_key TEXT NOT NULL,
+                role_name TEXT NOT NULL,
+                user_id INTEGER,
+                legacy_marker TEXT NOT NULL DEFAULT '',
+                legacy_custom_emoji_id TEXT,
+                bot_managed INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (chat_id, role_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_role_state_user
+                ON role_state(chat_id, user_id);
+
+            CREATE TABLE IF NOT EXISTS roster_sources (
+                chat_id INTEGER NOT NULL,
+                slot TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                source_text TEXT NOT NULL DEFAULT '',
+                source_custom_emoji TEXT NOT NULL DEFAULT '{}',
+                captured_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, slot)
+            );
+            """
+        )
+        conn.commit()
+    db_transaction(op)
 
 
 def register_user(user):
@@ -3723,6 +3805,805 @@ async def enqueue_pending_notifications():
             await DELIVERY_QUEUE.put({"notification_id": row["id"]})
 
 
+
+# =========================================================
+# GROUP / FLOOD MODERATION
+# =========================================================
+
+from group_logic import ROLE_BY_KEY, ROLE_CATALOG, make_tag, normalize_role, parse_kall, role_for, utf16_slice
+
+JOIN_ACTIVE_STATUSES = {"member", "restricted"}
+LEAVE_STATUSES = {"left", "kicked"}
+
+
+def group_db_op(callback, *args):
+    return db_transaction(callback, *args)
+
+
+def bind_group(chat, title_value=""):
+    def op(conn):
+        conn.execute(
+            """
+            INSERT INTO managed_group(group_chat_id, info_channel_id, bound_at, title)
+            VALUES (?, COALESCE((SELECT info_channel_id FROM managed_group WHERE group_chat_id=?), NULL), ?, ?)
+            ON CONFLICT(group_chat_id) DO UPDATE SET
+                title=excluded.title
+            """,
+            (chat.id, chat.id, now(), title_value or ""),
+        )
+        conn.commit()
+    group_db_op(op)
+
+
+def bind_info_channel_db(chat_id):
+    def op(conn):
+        row = conn.execute("SELECT group_chat_id FROM managed_group ORDER BY bound_at DESC LIMIT 1").fetchone()
+        if row:
+            group_id = row["group_chat_id"]
+            conn.execute("UPDATE managed_group SET info_channel_id=? WHERE group_chat_id=?", (chat_id, group_id))
+            if group_id != chat_id:
+                # Migrate any legacy role_state accidentally captured before the group was linked.
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO role_state(chat_id,role_key,role_name,user_id,legacy_marker,legacy_custom_emoji_id,bot_managed)
+                    SELECT ?,role_key,role_name,user_id,legacy_marker,legacy_custom_emoji_id,bot_managed
+                    FROM role_state WHERE chat_id=?
+                    """,
+                    (group_id, chat_id),
+                )
+        else:
+            # Temporary link; the first /bind_group will update its info channel later.
+            conn.execute(
+                "INSERT OR IGNORE INTO managed_group(group_chat_id, info_channel_id, bound_at, title) VALUES (?, ?, ?, ?)",
+                (0, chat_id, now(), ""),
+            )
+        conn.commit()
+        return row["group_chat_id"] if row else None
+    return group_db_op(op)
+
+
+def get_managed_group():
+    def op(conn):
+        row = conn.execute("SELECT * FROM managed_group WHERE group_chat_id != 0 ORDER BY bound_at DESC LIMIT 1").fetchone()
+        return row
+    return group_db_op(op)
+
+
+def get_managed_info_for_group(group_chat_id):
+    return group_db_op(lambda conn: conn.execute("SELECT * FROM managed_group WHERE group_chat_id=?", (group_chat_id,)).fetchone())
+
+
+def upsert_group_member(chat_id, user, *, active=True, role_key=None, role_name=None, tag=None, confirmed=False, welcome_message_id=None, tag_set_by_bot=False):
+    def op(conn):
+        existing = conn.execute("SELECT * FROM group_members WHERE chat_id=? AND user_id=?", (chat_id, user.id)).fetchone()
+        conn.execute(
+            """
+            INSERT INTO group_members(
+                chat_id,user_id,first_name,last_name,username,role_key,role_name,tag,
+                confirmed,active,joined_at,confirmed_at,left_at,welcome_message_id,tag_set_by_bot
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+            ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                first_name=excluded.first_name,
+                last_name=excluded.last_name,
+                username=excluded.username,
+                role_key=COALESCE(excluded.role_key, group_members.role_key),
+                role_name=COALESCE(excluded.role_name, group_members.role_name),
+                tag=COALESCE(excluded.tag, group_members.tag),
+                active=excluded.active,
+                confirmed=excluded.confirmed,
+                left_at=NULL,
+                welcome_message_id=COALESCE(excluded.welcome_message_id, group_members.welcome_message_id),
+                tag_set_by_bot=excluded.tag_set_by_bot
+            """,
+            (
+                chat_id, user.id, user.first_name or "", user.last_name or "", user.username or "",
+                role_key, role_name, tag, 1 if confirmed else 0, 1 if active else 0,
+                now(), welcome_message_id, 1 if tag_set_by_bot else 0,
+            ),
+        )
+        conn.commit()
+    group_db_op(op)
+
+
+def mark_member_left(chat_id, user_id):
+    def op(conn):
+        row = conn.execute("SELECT role_key, role_name, tag FROM group_members WHERE chat_id=? AND user_id=?", (chat_id,user_id)).fetchone()
+        conn.execute(
+            "UPDATE group_members SET active=0, left_at=?, confirmed=0 WHERE chat_id=? AND user_id=?",
+            (now(),chat_id,user_id),
+        )
+        if row and row["role_key"]:
+            conn.execute(
+                "UPDATE role_state SET user_id=NULL, bot_managed=0 WHERE chat_id=? AND role_key=? AND user_id=?",
+                (chat_id,row["role_key"],user_id),
+            )
+        conn.commit()
+        return dict(row) if row else None
+    return group_db_op(op)
+
+
+def confirm_member(chat_id, user_id):
+    def op(conn):
+        conn.execute(
+            "UPDATE group_members SET confirmed=1, confirmed_at=? WHERE chat_id=? AND user_id=?",
+            (now(),chat_id,user_id),
+        )
+        conn.commit()
+    group_db_op(op)
+
+
+def get_member(chat_id, user_id):
+    return group_db_op(lambda conn: conn.execute("SELECT * FROM group_members WHERE chat_id=? AND user_id=?", (chat_id,user_id)).fetchone())
+
+
+def find_group_member(chat_id, username):
+    key = normalize_target_text(username)
+    return group_db_op(lambda conn: conn.execute(
+        "SELECT * FROM group_members WHERE chat_id=? AND lower(username)=? AND active=1 LIMIT 1", (chat_id,key)
+    ).fetchone())
+
+
+def latest_pending_member(chat_id):
+    def op(conn):
+        rows = conn.execute(
+            """
+            SELECT * FROM group_members
+            WHERE chat_id=? AND active=1 AND confirmed=0
+              AND joined_at >= ?
+            ORDER BY joined_at DESC LIMIT 2
+            """,
+            (chat_id, (datetime.now(timezone.utc) - timedelta(seconds=ROLE_ASSIGNMENT_WINDOW_SECONDS)).isoformat()),
+        ).fetchall()
+        return rows[0] if len(rows) == 1 else None
+    return group_db_op(op)
+
+
+def role_is_occupied(chat_id, role_key, *, exclude_user_id=None):
+    def op(conn):
+        row = conn.execute(
+            "SELECT * FROM role_state WHERE chat_id=? AND role_key=?", (chat_id,role_key)
+        ).fetchone()
+        if row and row["user_id"] is not None and row["user_id"] != exclude_user_id:
+            return True
+        if row and row["legacy_marker"] and not row["bot_managed"] and row["user_id"] is None:
+            return True
+        return False
+    return group_db_op(op)
+
+
+def assign_role_db(chat_id, user, role):
+    role_key = normalize_role(role["name"])
+    tag = make_tag(role["english"])
+    def op(conn):
+        state = conn.execute("SELECT * FROM role_state WHERE chat_id=? AND role_key=?", (chat_id,role_key)).fetchone()
+        if state and state["user_id"] not in (None, user.id):
+            raise ValueError("ROLE_OCCUPIED")
+        old = conn.execute("SELECT role_key FROM group_members WHERE chat_id=? AND user_id=? AND active=1", (chat_id,user.id)).fetchone()
+        if old and old["role_key"] and old["role_key"] != role_key:
+            conn.execute("UPDATE role_state SET user_id=NULL, bot_managed=0 WHERE chat_id=? AND role_key=? AND user_id=?", (chat_id,old["role_key"],user.id))
+        conn.execute(
+            """
+            INSERT INTO role_state(chat_id,role_key,role_name,user_id,legacy_marker,legacy_custom_emoji_id,bot_managed)
+            VALUES(?,?,?,?,?, ?,1)
+            ON CONFLICT(chat_id,role_key) DO UPDATE SET user_id=excluded.user_id, role_name=excluded.role_name, bot_managed=1
+            """,
+            (chat_id, role_key, role["name"], user.id, state["legacy_marker"] if state else "", state["legacy_custom_emoji_id"] if state else None),
+        )
+        conn.execute(
+            """
+            INSERT INTO group_members(chat_id,user_id,first_name,last_name,username,role_key,role_name,tag,confirmed,active,joined_at,tag_set_by_bot)
+            VALUES(?,?,?,?,?,?,?,?,1,1,?,1)
+            ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                first_name=excluded.first_name,last_name=excluded.last_name,username=excluded.username,
+                role_key=excluded.role_key,role_name=excluded.role_name,tag=excluded.tag,active=1,tag_set_by_bot=1
+            """,
+            (chat_id,user.id,user.first_name or "",user.last_name or "",user.username or "",role_key,role["name"],tag,now()),
+        )
+        conn.commit()
+        return tag, role_key
+    return group_db_op(op)
+
+
+
+def split_role_line(line):
+    """Return (role, marker) for roster lines like 'Диона -💛' or 'Сяо - 💛'."""
+    raw = line or ""
+    for ru, en, region in ROLE_CATALOG:
+        pattern = rf"^\s*{re.escape(ru)}\s*-\s*(.*)$"
+        m = re.match(pattern, raw, flags=re.IGNORECASE)
+        if m:
+            return role_for(ru), m.group(1).strip()
+    return None, None
+
+def store_roster_source(chat_id, slot, message):
+    custom = []
+    source_text = message.text or ""
+    line_starts = [0]
+    acc = 0
+    for line in source_text.splitlines(True):
+        acc += len(line.encode("utf-16-le")) // 2
+        line_starts.append(acc)
+    for ent in message.entities or []:
+        if getattr(ent, "type", None) == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
+            char = utf16_slice(source_text, ent.offset, ent.length)
+            line_index = 0
+            for idx in range(len(line_starts) - 1):
+                if line_starts[idx] <= ent.offset < line_starts[idx + 1]:
+                    line_index = idx
+                    break
+            local_offset = ent.offset - line_starts[line_index]
+            custom.append({
+                "line": line_index,
+                "offset": local_offset,
+                "char": char,
+                "custom_emoji_id": ent.custom_emoji_id,
+                "length": ent.length,
+            })
+    def op(conn):
+        conn.execute(
+            """
+            INSERT INTO roster_sources(chat_id,slot,message_id,source_text,source_custom_emoji,captured_at)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(chat_id,slot) DO UPDATE SET
+                message_id=excluded.message_id,source_text=excluded.source_text,
+                source_custom_emoji=excluded.source_custom_emoji,captured_at=excluded.captured_at
+            """,
+            (chat_id,slot,message.message_id,message.text or "",json.dumps(custom,ensure_ascii=False),now()),
+        )
+        linked = conn.execute(
+            "SELECT group_chat_id FROM managed_group WHERE info_channel_id=? ORDER BY bound_at DESC LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        state_chat_id = linked["group_chat_id"] if linked and linked["group_chat_id"] else chat_id
+        # Initialize role_state legacy markers for roles not yet managed by bot.
+        lines = (message.text or "").splitlines()
+        custom_values = list(custom)
+        for line in lines:
+            role, marker = split_role_line(line)
+            if not role:
+                continue
+            existing = conn.execute("SELECT * FROM role_state WHERE chat_id=? AND role_key=?", (state_chat_id,normalize_role(role["name"]))).fetchone()
+            if not existing:
+                emoji_id = None
+                for item in custom_values:
+                    if item.get("char") == marker:
+                        emoji_id = item.get("custom_emoji_id")
+                        break
+                conn.execute(
+                    "INSERT INTO role_state(chat_id,role_key,role_name,user_id,legacy_marker,legacy_custom_emoji_id,bot_managed) VALUES(?,?,?,?,?,?,0)",
+                    (state_chat_id,normalize_role(role["name"]),role["name"],None,marker,emoji_id),
+                )
+        conn.commit()
+    group_db_op(op)
+
+
+def roster_rows_for(chat_id):
+    return group_db_op(lambda conn: conn.execute("SELECT * FROM role_state WHERE chat_id=?", (chat_id,)).fetchall())
+
+
+def roster_sources(chat_id):
+    return group_db_op(lambda conn: conn.execute("SELECT * FROM roster_sources WHERE chat_id=? ORDER BY slot", (chat_id,)).fetchall())
+
+
+def _custom_emoji_entity(offset_utf16, char, custom_emoji_id):
+    try:
+        length = len(char.encode("utf-16-le")) // 2
+    except Exception:
+        length = len(char)
+    return MessageEntity(
+        type="custom_emoji",
+        offset=offset_utf16,
+        length=length,
+        custom_emoji_id=custom_emoji_id,
+    )
+
+
+def render_roster_with_entities(text, role_states, source_custom_emoji=None):
+    """Render the roster while preserving/reapplying captured Telegram custom-emoji IDs."""
+    state_by_key = {row["role_key"]: row for row in role_states}
+    source_entities = source_custom_emoji or []
+    lines = []
+    entities = []
+    line_infos = []
+    default_custom = None
+    for row in role_states:
+        if row["legacy_marker"] == DEFAULT_OCCUPIED_MARKER and row["legacy_custom_emoji_id"]:
+            default_custom = row["legacy_custom_emoji_id"]
+            break
+    if default_custom is None:
+        for item in source_entities:
+            if item.get("char") == DEFAULT_OCCUPIED_MARKER and item.get("custom_emoji_id"):
+                default_custom = item["custom_emoji_id"]
+                break
+
+    for idx, line in enumerate((text or "").splitlines()):
+        role = None
+        marker = ""
+        custom_marker_id = None
+        left = None
+        role, original_marker = split_role_line(line)
+        if role:
+            left = role["name"]
+        if role:
+            st = state_by_key.get(normalize_role(role["name"]))
+            if st:
+                if st["user_id"] is not None:
+                    marker = st["legacy_marker"] or DEFAULT_OCCUPIED_MARKER
+                    custom_marker_id = st["legacy_custom_emoji_id"] or default_custom
+                elif st["legacy_marker"] and not st["bot_managed"]:
+                    marker = st["legacy_marker"]
+                    custom_marker_id = st["legacy_custom_emoji_id"]
+            rendered_line = f"{left} - {marker}".rstrip()
+        else:
+            rendered_line = line
+        line_infos.append((idx, line, rendered_line, role, marker, custom_marker_id))
+        lines.append(rendered_line)
+
+    # Calculate UTF-16 start offsets for rendered lines.
+    rendered_starts = []
+    acc = 0
+    for line in lines:
+        rendered_starts.append(acc)
+        acc += len(line.encode("utf-16-le")) // 2 + 1
+
+    # Reapply every captured custom emoji. Marker entities are moved to the new marker position.
+    for item in source_entities:
+        try:
+            idx = int(item.get("line", 0))
+            if idx >= len(line_infos):
+                continue
+            _old_idx, old_line, new_line, role, marker, custom_marker_id = line_infos[idx]
+            entity_id = item.get("custom_emoji_id")
+            char = item.get("char", "")
+            if role and marker and custom_marker_id and char.strip() in {"💛", "🧡", "💚"}:
+                pos = new_line.rfind(marker)
+                if pos >= 0:
+                    offset = rendered_starts[idx] + len(new_line[:pos].encode("utf-16-le")) // 2
+                    entities.append(_custom_emoji_entity(offset, marker, custom_marker_id))
+                    continue
+            local = int(item.get("offset", 0))
+            new_len = int(item.get("length", 1))
+            # Keep non-marker custom emoji at the same line-local position when possible.
+            if local + new_len <= len(old_line.encode("utf-16-le")) // 2:
+                # Convert UTF-16 local offset to Python string position approximately by decoding prefix bytes.
+                prefix_bytes = old_line.encode("utf-16-le")[:local * 2]
+                prefix = prefix_bytes.decode("utf-16-le", errors="ignore")
+                candidate = rendered_starts[idx] + len(prefix.encode("utf-16-le")) // 2
+                visible = utf16_slice(new_line, len(prefix.encode("utf-16-le")) // 2, new_len)
+                if visible:
+                    entities.append(_custom_emoji_entity(candidate, visible, entity_id))
+        except Exception:
+            logger.exception("Failed to rebuild custom emoji entity")
+
+    # Deduplicate exact entities.
+    unique = []
+    seen = set()
+    for ent in entities:
+        key = (ent.offset, ent.length, ent.custom_emoji_id)
+        if key not in seen:
+            seen.add(key)
+            unique.append(ent)
+    return "\n".join(lines), unique
+
+
+async def update_group_roster(chat_id):
+    cfg = get_managed_info_for_group(chat_id)
+    if not cfg or not cfg["info_channel_id"]:
+        return
+    sources = roster_sources(cfg["info_channel_id"])
+    states = roster_rows_for(chat_id)
+    for src in sources:
+        rendered, entities = render_roster_with_entities(src["source_text"], states, json.loads(src["source_custom_emoji"] or "[]"))
+        try:
+            await bot.edit_message_text(
+                chat_id=cfg["info_channel_id"],
+                message_id=src["message_id"],
+                text=rendered,
+                entities=entities or None,
+            )
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.warning(
+                    "Roster update failed | channel=%s | message=%s | %s",
+                    cfg["info_channel_id"],
+                    src["message_id"],
+                    exc,
+                )
+        except Exception:
+            logger.exception("Unexpected roster update error")
+
+
+def find_target_from_kall(message):
+    argument = parse_kall(message.text or "")
+    if not argument:
+        return None, None
+    reply = message.reply_to_message
+    if reply and reply.from_user:
+        role = role_for(argument)
+        return reply.from_user, role
+    parts = argument.split()
+    # @username role...
+    if parts and parts[0].startswith("@"):
+        user = get_user_by_username(parts[0])
+        role = role_for(" ".join(parts[1:]))
+        if user and role:
+            class U:
+                pass
+            u = U(); u.id = user["user_id"]; u.first_name = user["first_name"]; u.last_name = user["last_name"]; u.username = user["username"]
+            return u, role
+    # role @username
+    if parts and parts[-1].startswith("@"):
+        user = get_user_by_username(parts[-1])
+        role = role_for(" ".join(parts[:-1]))
+        if user and role:
+            class U:
+                pass
+            u = U(); u.id = user["user_id"]; u.first_name = user["first_name"]; u.last_name = user["last_name"]; u.username = user["username"]
+            return u, role
+    role = role_for(argument)
+    if role:
+        pending = latest_pending_member(message.chat.id)
+        if pending:
+            class U:
+                pass
+            u = U(); u.id = pending["user_id"]; u.first_name = pending["first_name"]; u.last_name = pending["last_name"]; u.username = pending["username"]
+            return u, role
+    return None, None
+
+
+def set_group_member_tag_db(chat_id, user_id, actual_tag):
+    def op(conn):
+        conn.execute("UPDATE group_members SET tag=? WHERE chat_id=? AND user_id=?", (actual_tag,chat_id,user_id))
+        conn.commit()
+    group_db_op(op)
+
+
+async def apply_member_tag(chat_id, user_id, desired_tag):
+    try:
+        ok = await bot.set_chat_member_tag(chat_id, user_id, tag=desired_tag)
+        return bool(ok), desired_tag
+    except TelegramBadRequest as exc:
+        logger.warning("Could not set requested tag '%s' for %s: %s; trying safe fallback", desired_tag, user_id, exc)
+        safe = desired_tag.replace("❦", "")[:16]
+        if safe != desired_tag:
+            try:
+                ok = await bot.set_chat_member_tag(chat_id, user_id, tag=safe)
+                return bool(ok), safe
+            except Exception:
+                logger.exception("Safe fallback tag also failed | chat=%s | user=%s", chat_id, user_id)
+        return False, None
+
+
+async def send_or_edit_welcome(chat_id, user_id):
+    row = get_member(chat_id, user_id)
+    if not row:
+        return
+    display = (row["username"] and "@" + row["username"]) or row["first_name"] or "участник"
+    if row["role_name"] and row["tag"]:
+        role_text = f"{row['tag']}\n{row['role_name']} ({role_for(row['role_name'])['english'] if role_for(row['role_name']) else ''})"
+        button_text = "✅ Подтвердить"
+    else:
+        role_text = "⏳ Роль ещё не назначена администрацией.\n\nПосле назначения роли бот автоматически обновит это сообщение и установит Telegram-тег."
+        button_text = "⏳ Ожидается роль"
+    text = (
+        f"{title('Добро пожаловать')}\n\n"
+        f"Привет, {display}! 🤍\n\n"
+        f"Входя в чат, вы обязуетесь соблюдать правила сообщества, уважать других участников и не нарушать комфорт общения.\n\n"
+        f"{section('Ваша роль')}\n{role_text}\n\n"
+        f"{divider()}\n"
+        f"Нажмите кнопку подтверждения после ознакомления с правилами."
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=button_text, callback_data=f"fm:confirm:{chat_id}:{user_id}")]])
+    if row["welcome_message_id"]:
+        try:
+            await bot.edit_message_text(chat_id=chat_id,message_id=row["welcome_message_id"],text=text,reply_markup=markup)
+            return
+        except Exception:
+            pass
+    sent = await bot.send_message(chat_id, text, reply_markup=markup)
+    def op(conn):
+        conn.execute("UPDATE group_members SET welcome_message_id=? WHERE chat_id=? AND user_id=?", (sent.message_id,chat_id,user_id)); conn.commit()
+    group_db_op(op)
+
+
+@dp.chat_member()
+async def group_member_update(event: ChatMemberUpdated):
+    global last_polling_activity
+    last_polling_activity = datetime.now(timezone.utc)
+    old_status = event.old_chat_member.status
+    new_status = event.new_chat_member.status
+    user = event.new_chat_member.user
+    chat_id = event.chat.id
+
+    if old_status in LEAVE_STATUSES and new_status in JOIN_ACTIVE_STATUSES:
+        register_user(user)
+        bind_group(event.chat, event.chat.title or "")
+        existing = get_member(chat_id, user.id)
+        # Reactivate member row; previous role is restored only if it is free.
+        prior_role = existing["role_key"] if existing and existing["role_key"] else None
+        prior_role_meta = role_for(prior_role) if prior_role else None
+        upsert_group_member(chat_id, user, active=True, role_key=None, role_name=None, tag=None, confirmed=False, welcome_message_id=None, tag_set_by_bot=False)
+        restored = False
+        if prior_role_meta and not role_is_occupied(chat_id, prior_role_meta["name"]):
+            try:
+                tag = make_tag(prior_role_meta["english"])
+                ok, actual = await apply_member_tag(chat_id,user.id,tag)
+                if ok:
+                    assign_role_db(chat_id,user,prior_role_meta)
+                    set_group_member_tag_db(chat_id, user.id, actual)
+                    restored = True
+            except Exception:
+                logger.exception("Could not restore previous role | chat=%s | user=%s", chat_id,user.id)
+        # Restrict until confirmation. The role assignment command can happen immediately afterwards.
+        try:
+            await bot.restrict_chat_member(
+                chat_id, user.id,
+                permissions=ChatPermissions(
+                    can_send_messages=False,
+                    can_send_audios=False,
+                    can_send_documents=False,
+                    can_send_photos=False,
+                    can_send_videos=False,
+                    can_send_video_notes=False,
+                    can_send_voice_notes=False,
+                    can_send_polls=False,
+                    can_send_other_messages=False,
+                    can_add_web_page_previews=False,
+                    can_change_info=False,
+                    can_invite_users=False,
+                    can_pin_messages=False,
+                    can_manage_topics=False,
+                ),
+                use_independent_chat_permissions=True,
+            )
+        except Exception:
+            logger.exception("Could not restrict new member | chat=%s | user=%s", chat_id,user.id)
+        await send_or_edit_welcome(chat_id,user.id)
+        if restored:
+            await update_group_roster(chat_id)
+        return
+
+    if old_status not in LEAVE_STATUSES and new_status in LEAVE_STATUSES:
+        old = mark_member_left(chat_id,user.id)
+        role_text = (old or {}).get("tag") or (old or {}).get("role_name") or "роль не назначена"
+        username = f"@{user.username}" if user.username else user.first_name or str(user.id)
+        try:
+            await bot.send_message(ADMIN_ID, f"{ADMIN_MENTION}\n\n🚪 Участник вышел из чата\n\n{username}\nID: {user.id}\nРоль: {role_text}")
+        except Exception:
+            logger.exception("Could not notify admin about member leaving | user=%s",user.id)
+        await update_group_roster(chat_id)
+
+
+@dp.callback_query(F.data.startswith("fm:confirm:"))
+async def group_confirm(callback: CallbackQuery):
+    try:
+        _, _, chat_raw, user_raw = (callback.data or "").split(":", 3)
+        chat_id = int(chat_raw); target_user_id = int(user_raw)
+    except Exception:
+        await callback.answer("Некорректное подтверждение.", show_alert=True); return
+    if callback.from_user.id != target_user_id:
+        await callback.answer("Эта кнопка предназначена для другого участника.", show_alert=True); return
+    row = get_member(chat_id,target_user_id)
+    if not row or not row["active"]:
+        await callback.answer("Вы уже не являетесь участником этого чата.", show_alert=True); return
+    if not row["role_key"]:
+        await callback.answer("Сначала дождитесь назначения роли администратором.", show_alert=True); return
+    try:
+        await bot.restrict_chat_member(
+            chat_id,target_user_id,
+            permissions=ChatPermissions(
+                can_send_messages=True,can_send_audios=True,can_send_documents=True,can_send_photos=True,
+                can_send_videos=True,can_send_video_notes=True,can_send_voice_notes=True,can_send_polls=True,
+                can_send_other_messages=True,can_add_web_page_previews=True,can_change_info=False,
+                can_invite_users=True,can_pin_messages=False,can_manage_topics=False,
+            ),
+            use_independent_chat_permissions=True,
+        )
+        confirm_member(chat_id,target_user_id)
+        markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Подтверждено", callback_data=f"fm:confirmed:{chat_id}:{target_user_id}")]])
+        await callback.message.edit_reply_markup(reply_markup=markup)
+        await callback.answer("Правила подтверждены.")
+    except Exception:
+        logger.exception("Could not confirm group member | chat=%s | user=%s",chat_id,target_user_id)
+        await callback.answer("Не удалось завершить подтверждение. Попробуйте ещё раз.", show_alert=True)
+
+
+@dp.message(F.text.regexp(r"^\s*калл\b"))
+async def group_role_command(message: Message):
+    if message.chat.type not in {"group","supergroup"}:
+        return
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    user, role = find_target_from_kall(message)
+    if not role or not user:
+        await message.reply("Не нашёл пользователя или роль.\n\nПример: калл Чжун Ли\nИли ответьте на сообщение участника: калл Чжун Ли\nИли: калл @username Чжун Ли")
+        return
+    try:
+        if role_is_occupied(message.chat.id, normalize_role(role["name"]), exclude_user_id=user.id):
+            await message.reply(f"Роль «{role['name']}» уже занята.")
+            return
+        tag = make_tag(role["english"])
+        ok, actual = await apply_member_tag(message.chat.id,user.id,tag)
+        if not ok:
+            await message.reply(f"Не удалось установить тег для {display_username_for_group(user)}. Проверьте право Manage Tags.")
+            return
+        assign_role_db(message.chat.id,user,role)
+        set_group_member_tag_db(message.chat.id, user.id, actual)
+        await send_or_edit_welcome(message.chat.id,user.id)
+        await update_group_roster(message.chat.id)
+        await message.reply(f"✅ Назначено\n{display_username_for_group(user)}\nРоль: {role['name']}\nТег: {actual}")
+    except ValueError as exc:
+        if str(exc) == "ROLE_OCCUPIED":
+            await message.reply(f"Роль «{role['name']}» уже занята.")
+        else:
+            raise
+    except Exception:
+        logger.exception("Group role assignment failed")
+        await message.reply("Не удалось назначить роль. Подробность записана в лог.")
+
+
+def display_username_for_group(user):
+    return f"@{user.username}" if getattr(user,"username",None) else getattr(user,"first_name",str(user.id))
+
+
+@dp.message(Command("bind_group"))
+async def bind_group_cmd(message: Message):
+    if message.chat.type not in {"group","supergroup"} or not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    bind_group(message.chat, message.chat.title or "")
+    await message.reply(f"✅ Группа привязана.\nChat ID: {message.chat.id}")
+
+
+@dp.message(Command("bind_info"))
+async def bind_info_from_group(message: Message):
+    if message.chat.type not in {"group","supergroup"} or not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    await message.reply("Для инфоканала используйте /bind_info прямо в самом канале.")
+
+
+@dp.channel_post(Command("bind_info"))
+async def bind_info_channel(message: Message):
+    # For channel posts, verify that the configured owner is an administrator of this channel.
+    try:
+        admins = await bot.get_chat_administrators(message.chat.id)
+        if not any(a.user.id == ADMIN_ID for a in admins):
+            return
+    except Exception:
+        logger.exception("Could not verify info-channel admin")
+        return
+    group = bind_info_channel_db(message.chat.id)
+    await message.answer("✅ Инфоканал привязан." if hasattr(message,"answer") else None)
+
+
+@dp.message(Command("id"))
+async def ids_group(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    reply_id = message.reply_to_message.message_id if message.reply_to_message else "—"
+    await message.reply(f"🆔 Chat ID: {message.chat.id}\nMessage ID (если ответ): {reply_id}\nВаш ID: {message.from_user.id}")
+
+
+async def capture_list_from_message(message: Message, slot: str, source: Message):
+    if source.chat.type != "channel":
+        await message.reply("Нужно отвечать командой на сообщение именно в инфоканале.")
+        return
+    store_roster_source(source.chat.id, slot, source)
+    await message.reply(f"✅ Список {slot} сохранён.\nMessage ID: {source.message_id}\nCustom emoji сущностей: {len([e for e in (source.entities or []) if getattr(e,'type',None)=='custom_emoji'])}")
+
+
+@dp.channel_post(Command("capture_list"))
+async def capture_list_channel(message: Message):
+    try:
+        admins = await bot.get_chat_administrators(message.chat.id)
+        if not any(a.user.id == ADMIN_ID for a in admins):
+            return
+    except Exception:
+        logger.exception("Could not verify channel admin for capture_list")
+        return
+    if not message.reply_to_message:
+        await message.answer("Ответьте /capture_list 40 или /capture_list 41 на нужное сообщение списка.")
+        return
+    parts = (message.text or "").split()
+    slot = parts[1] if len(parts) > 1 else "40"
+    await capture_list_from_message(message,slot,message.reply_to_message)
+
+
+@dp.message(Command("capture_list"))
+async def capture_list_group(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    if not message.reply_to_message:
+        await message.reply("Ответьте этой командой на сообщение, которое нужно сохранить.")
+        return
+    if message.reply_to_message.chat.type != "channel":
+        await message.reply("Сообщение-источник должно находиться в инфоканале.")
+        return
+    await capture_list_from_message(message,(message.text or "/capture_list 40").split()[1],message.reply_to_message)
+
+
+@dp.message(Command("sync_list"))
+async def sync_list_cmd(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    group = get_managed_group()
+    if not group:
+        await message.reply("Сначала привяжите тестовую группу через /bind_group.")
+        return
+    await update_group_roster(group["group_chat_id"])
+    await message.reply("✅ Список синхронизирован.")
+
+
+@dp.message(Command("roles"))
+async def role_list_cmd(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    await message.reply(f"Зарегистрировано ролей: {len(ROLE_CATALOG)}\nПример: калл Чжун Ли\nТег: {make_tag('Zhongli')}")
+
+
+@dp.message(Command("pending"))
+async def pending_cmd(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID or message.chat.type not in {"group","supergroup"}:
+        return
+    rows = group_db_op(lambda conn: conn.execute("SELECT * FROM group_members WHERE chat_id=? AND active=1 AND confirmed=0 ORDER BY joined_at DESC LIMIT 20",(message.chat.id,)).fetchall())
+    if not rows:
+        await message.reply("Ожидающих подтверждения нет.")
+        return
+    lines = []
+    for row in rows:
+        who = "@" + row["username"] if row["username"] else row["first_name"] or str(row["user_id"])
+        lines.append(f"• {who} | {row['user_id']} | {row['role_name'] or 'роль не назначена'}")
+    await message.reply("\n".join(lines))
+
+
+@dp.message(Command("release"))
+async def release_role_cmd(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID or message.chat.type not in {"group","supergroup"}:
+        return
+    argument = (message.text or "").split(maxsplit=1)
+    if len(argument) < 2:
+        await message.reply("Пример: /release Навия")
+        return
+    role = role_for(argument[1])
+    if not role:
+        await message.reply("Такой роли нет в каталоге.")
+        return
+    key = normalize_role(role["name"])
+    def op(conn):
+        conn.execute("UPDATE role_state SET user_id=NULL, bot_managed=0, legacy_marker='' WHERE chat_id=? AND role_key=?", (message.chat.id,key))
+        conn.execute("UPDATE group_members SET role_key=NULL, role_name=NULL, tag=NULL, tag_set_by_bot=0 WHERE chat_id=? AND role_key=? AND active=1", (message.chat.id,key))
+        conn.commit()
+    group_db_op(op)
+    await update_group_roster(message.chat.id)
+    await message.reply(f"✅ Роль «{role['name']}» освобождена.")
+
+
+
+@dp.message(Command("member"))
+async def member_info_cmd(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID or message.chat.type not in {"group","supergroup"}:
+        return
+    target = message.reply_to_message.from_user if message.reply_to_message and message.reply_to_message.from_user else None
+    if not target:
+        parts = (message.text or "").split()
+        if len(parts) == 2 and parts[1].startswith("@"):
+            row = find_group_member(message.chat.id, parts[1])
+        else:
+            row = None
+    else:
+        row = get_member(message.chat.id, target.id)
+    if not row:
+        await message.reply("Участник не найден в журнале.")
+        return
+    await message.reply(
+        f"👤 {('@'+row['username']) if row['username'] else row['first_name']}\n"
+        f"ID: {row['user_id']}\n"
+        f"Роль: {row['role_name'] or '—'}\n"
+        f"Тег: {row['tag'] or '—'}\n"
+        f"Подтверждение: {'да' if row['confirmed'] else 'нет'}\n"
+        f"Активен: {'да' if row['active'] else 'нет'}"
+    )
+
+
 # =========================================================
 # COMMANDS
 # =========================================================
@@ -3753,6 +4634,8 @@ async def setup_commands():
             command="admin",
             description="Панель администратора",
         ),
+        BotCommand(command="id", description="Показать ID чата/сообщения"),
+        BotCommand(command="roles", description="Список ролей"),
     ]
 
     await bot.set_my_commands(
@@ -3919,6 +4802,7 @@ async def main():
 
     init_db()
     migrate_db()
+    init_group_db()
 
     DELIVERY_QUEUE = asyncio.Queue()
     BROADCAST_QUEUE = asyncio.Queue()

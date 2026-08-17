@@ -70,7 +70,7 @@ does not invent custom emoji IDs.
 ```bash
 pip install -r requirements.txt
 cp .env.example .env
-python moderation_bot.py
+python bot.py
 ```
 
 Before running, set the real `BOT_TOKEN`, `GROUP_CHAT_ID`, `INFO_CHANNEL_ID`,
