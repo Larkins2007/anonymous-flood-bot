@@ -490,6 +490,19 @@ def init_group_db():
             CREATE INDEX IF NOT EXISTS idx_group_members_joined
                 ON group_members(chat_id, joined_at);
 
+            CREATE TABLE IF NOT EXISTS participant_roster (
+                chat_id INTEGER NOT NULL,
+                username TEXT NOT NULL,
+                user_id INTEGER,
+                first_seen TEXT NOT NULL,
+                last_seen TEXT NOT NULL,
+                source TEXT NOT NULL DEFAULT 'seed',
+                PRIMARY KEY(chat_id, username)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_participant_roster_user
+                ON participant_roster(chat_id, user_id);
+
             CREATE TABLE IF NOT EXISTS role_state (
                 chat_id INTEGER NOT NULL,
                 role_key TEXT NOT NULL,
@@ -624,6 +637,51 @@ def init_group_db():
     db_transaction(op)
 
 
+
+INITIAL_PARTICIPANT_USERNAMES = ['TymKait', 'Snickers_oblachko_uwu', 'Istilllove_you', 'Nowstaru0', 'RisenDemon0928', 'hernaave', 'gogokitty', 'Dain_your_sleif', 'Chuuya_Nakahar', 'ekaterinze01', 'whd_hno', 'wiaxic', 'ahbty_75', 'Mommy_mua', 'Ggggyro', 'icenwi1l', 'mew_mewmew_mew', 'stheyess', 'munsin', 'Gingr_S', 'lapushok_0', 'Catic238', 'Shinshila_906', 'Aleksa_Dragon', 'Graciial', 'sleppem', 'Huipletikk', 'youpieyupie88', 'sihikamori', 'giwigiwigi', 'zachem_te', 'The_goldmoor_vale', 'pu_pu_puuu', 'BbnotS_3', 'kitm1z', 'dilucoox', 'cherry_cat_meow', 'Satanfathers', 'LingWenkinney', 're1nnieл']
+
+def seed_participant_roster():
+    now_ts = now()
+    def op(conn):
+        for username in INITIAL_PARTICIPANT_USERNAMES:
+            if not username:
+                continue
+            conn.execute(
+                """INSERT INTO participant_roster(chat_id,username,user_id,first_seen,last_seen,source)
+                   VALUES(?,?,NULL,?,?,?)
+                   ON CONFLICT(chat_id,username) DO NOTHING""",
+                (PRIMARY_CHAT_ID, username, now_ts, now_ts, "manual_seed")
+            )
+        conn.commit()
+    group_db_op(op)
+
+def note_roster_user(chat_id, user):
+    username = (getattr(user, "username", None) or "").strip().lstrip("@").casefold()
+    if not username:
+        return
+    now_ts = now()
+    def op(conn):
+        conn.execute(
+            """INSERT INTO participant_roster(chat_id,username,user_id,first_seen,last_seen,source)
+               VALUES(?,?,?,?,?,?)
+               ON CONFLICT(chat_id,username) DO UPDATE SET
+                   user_id=excluded.user_id, last_seen=excluded.last_seen
+            """,
+            (chat_id, username, int(user.id), now_ts, now_ts, "observed")
+        )
+        conn.commit()
+    group_db_op(op)
+
+def role_snapshot_rows(chat_id):
+    return group_db_op(lambda conn: conn.execute(
+        """SELECT r.username, r.user_id, COALESCE(m.role_name,'') AS role_name,
+                  COALESCE(m.tag,'') AS tag, COALESCE(m.active,0) AS active
+           FROM participant_roster r
+           LEFT JOIN group_members m ON m.chat_id=r.chat_id AND m.user_id=r.user_id
+           WHERE r.chat_id=?
+           ORDER BY r.username COLLATE NOCASE""",
+        (chat_id,)
+    ).fetchall())
 
 def seed_role_catalog():
     def op(conn):
@@ -4720,6 +4778,7 @@ async def group_member_update(event: ChatMemberUpdated):
         register_user(user)
         existing = get_member(chat_id, user.id)
         was_active = bool(existing and existing["active"])
+        note_roster_user(chat_id, user)
         upsert_group_member(
             chat_id, user, active=True,
             role_key=existing["role_key"] if was_active else None,
@@ -4846,6 +4905,7 @@ async def group_passive_member_sync(message: Message):
         ))
         ensure_default_schedule(message.chat.id)
         register_user(message.from_user)
+        note_roster_user(message.chat.id, message.from_user)
         existing = get_member(message.chat.id, message.from_user.id)
         if not existing or (existing and existing["active"]):
             await sync_member_tag(message.chat.id, message.from_user.id, user=message.from_user, refresh_roster=False)
@@ -5127,7 +5187,7 @@ BUILTIN_COMMANDS = {
     "help", "mafia", "mafia_leave",
     "syncroles", "game_poll",
     "manage_commands", "addcommand", "delcommand", "commands",
-    "bindrole", "setrole", "adoptroles",
+    "bindrole", "setrole",
 }
 
 
@@ -5313,8 +5373,7 @@ async def help_cmd(message: Message):
         text += (
             "\n𝗔𝗗𝗠𝗜𝗡\n"
             "/setrole — назначить роль участнику\n"
-            "/syncroles — сверить роли с Telegram\n"
-            "/adoptroles — принять существующие Telegram-теги под управление бота\n"
+            "/syncroles — сверить и сохранить реальные Telegram-теги участников\n"
             "/game_poll — запустить опрос на игру\n"
                     )
     if message.chat.type=="private" and message.from_user and message.from_user.id==ADMIN_ID:
@@ -5348,50 +5407,6 @@ async def roles_audit_cmd(message: Message):
     await message.reply("\n".join(lines))
 
 
-@dp.message(Command("adoptroles"))
-async def adoptroles_cmd(message: Message):
-    if not require_primary_group(message):
-        return
-    if not is_group_admin_user(message):
-        await message.reply("𝗔𝗖𝗖𝗘𝗦𝗦\n\nУ вас нет прав для этой команды.")
-        return
-    chat_id = PRIMARY_CHAT_ID
-    rows = group_db_op(lambda conn: conn.execute(
-        "SELECT user_id FROM group_members WHERE chat_id=? AND active=1", (chat_id,)
-    ).fetchall())
-    user_ids = {int(r["user_id"]) for r in rows}
-    try:
-        admins = await bot.get_chat_administrators(chat_id)
-        user_ids.update(int(m.user.id) for m in admins if getattr(m, "user", None))
-    except Exception:
-        logger.exception("Could not read administrators during role adoption | chat=%s", chat_id)
-
-    result = await adopt_external_roles(chat_id, user_ids)
-    adopted = result["adopted"]
-    lines = [
-        "𝗥𝗢𝗟𝗘 𝗔𝗗𝗢𝗣𝗧",
-        "",
-        f"Новых ролей принял бот: {len(adopted)}",
-        f"Уже подписаны ботом: {result['skipped_bot']}",
-        f"Без тега: {result['skipped_no_tag']}",
-        f"Неизвестный тег: {result['skipped_unknown']}",
-        f"Администраторы пропущены: {result['skipped_admin']}",
-        f"Конфликты ролей: {result['conflicts']}",
-        f"Ошибки: {result['errors']}",
-    ]
-    await message.reply("\n".join(lines))
-
-    # Send the requested concise ownership list to the owner in private chat.
-    if adopted:
-        dm_lines = ["𝗥𝗢𝗟𝗘 𝗔𝗗𝗢𝗣𝗧", ""]
-        dm_lines.extend(f"Роль участника — {role} — {who}" for role, who in adopted)
-        with suppress(Exception):
-            await bot.send_message(ADMIN_ID, "\n".join(dm_lines))
-    else:
-        with suppress(Exception):
-            await bot.send_message(ADMIN_ID, "𝗥𝗢𝗟𝗘 𝗔𝗗𝗢𝗣𝗧\n\nНовых внешних ролей для принятия не найдено.")
-
-
 @dp.message(Command("syncroles"))
 async def sync_roles_cmd(message: Message):
     if not require_primary_group(message):
@@ -5399,34 +5414,77 @@ async def sync_roles_cmd(message: Message):
     if not is_group_admin_user(message):
         await message.reply("𝗔𝗖𝗖𝗘𝗦𝗦\n\nУ вас нет прав для этой команды.")
         return
-    chat_id=PRIMARY_CHAT_ID
-    known_ids=set()
-    rows=group_db_op(lambda conn: conn.execute("SELECT user_id FROM group_members WHERE chat_id=? AND active=1",(chat_id,)).fetchall())
-    known_ids.update(int(r["user_id"]) for r in rows)
-    try:
-        admins=await bot.get_chat_administrators(chat_id)
-        known_ids.update(int(m.user.id) for m in admins if getattr(m,"user",None))
-    except Exception:
-        logger.exception("Could not read administrators during role sync | chat=%s",chat_id)
-    checked=recognized=without_role=errors=0
+    chat_id = PRIMARY_CHAT_ID
+    # The roster is persistent. We use all known user_ids; the manually seeded
+    # usernames are kept for future automatic resolution when those users speak/join.
+    rows = group_db_op(lambda conn: conn.execute(
+        "SELECT user_id FROM participant_roster WHERE chat_id=? AND user_id IS NOT NULL", (chat_id,)
+    ).fetchall())
+    known_ids = {int(r["user_id"]) for r in rows}
+    gm_rows = group_db_op(lambda conn: conn.execute(
+        "SELECT user_id FROM group_members WHERE chat_id=?", (chat_id,)
+    ).fetchall())
+    known_ids.update(int(r["user_id"]) for r in gm_rows)
+
+    checked = recognized = without_role = adopted = skipped_bot = errors = 0
     for user_id in sorted(known_ids):
         try:
-            role=await sync_member_tag(chat_id,user_id,force=True)
-            checked+=1
-            if role: recognized+=1
-            else: without_role+=1
+            row = get_member(chat_id, user_id)
+            if row and int(row["tag_set_by_bot"] or 0):
+                skipped_bot += 1
+            # Always ask Telegram for the current real tag.
+            member = await bot.get_chat_member(chat_id, user_id)
+            if not _chat_member_is_active(member):
+                mark_member_left(chat_id, user_id)
+                continue
+            checked += 1
+            role = role_for_tag(getattr(member, "tag", None) or "")
+            if role:
+                recognized += 1
+                # If this tag was not established by our bot, adopt it once.
+                current = get_member(chat_id, user_id)
+                if not current or not int(current["tag_set_by_bot"] or 0):
+                    actual_tag = (getattr(member, "tag", None) or "").strip()
+                    if actual_tag and getattr(member, "status", "") not in {"administrator", "creator"}:
+                        try:
+                            await bot.set_chat_member_tag(chat_id, user_id, tag="")
+                            await bot.set_chat_member_tag(chat_id, user_id, tag=actual_tag)
+                            adopted += 1
+                            assign_role_db_atomic(chat_id, member.user, role)
+                            finalize_role_assignment(chat_id, user_id, normalize_role(role["name"]), actual_tag)
+                        except Exception:
+                            logger.exception("Could not adopt tag | chat=%s user=%s", chat_id, user_id)
+                    else:
+                        await sync_member_tag(chat_id, user_id, user=member.user, force=True)
+                else:
+                    await sync_member_tag(chat_id, user_id, force=True)
+            else:
+                without_role += 1
+                await sync_member_tag(chat_id, user_id, force=True)
         except Exception:
-            errors+=1
-            logger.exception("Role sync failed | chat=%s user=%s",chat_id,user_id)
-    await message.reply("𝗥𝗢𝗟𝗘 𝗦𝗬𝗡𝗖\n\n"
-        f"Проверено участников: {checked}\n"
+            errors += 1
+            logger.exception("Role sync failed | chat=%s user=%s", chat_id, user_id)
+
+    snapshot = role_snapshot_rows(chat_id)
+    snapshot_lines = ["𝗥𝗢𝗟𝗘 𝗦𝗬𝗡𝗖", ""]
+    for row in snapshot:
+        uname = f"@{row['username']}" if row["username"] else (str(row["user_id"]) if row["user_id"] else "не определён")
+        role_name = row["role_name"] or "роль не распознана"
+        snapshot_lines.append(f"Роль участника — {role_name} — {uname}")
+    with suppress(Exception):
+        await bot.send_message(ADMIN_ID, "\n".join(snapshot_lines)[:3900])
+
+    unresolved = [r["username"] for r in snapshot if not r["user_id"]]
+    await message.reply(
+        "𝗥𝗢𝗟𝗘 𝗦𝗬𝗡𝗖\n\n"
+        f"Проверено Telegram-участников: {checked}\n"
         f"Ролей распознано: {recognized}\n"
+        f"Новых тегов принято под управление: {adopted}\n"
+        f"Уже контролируются ботом: {skipped_bot}\n"
         f"Без распознанной роли: {without_role}\n"
-        f"Ошибок проверки: {errors}\n\n"
-        "Бот заново запросил актуальный Telegram-тег каждого известного участника, "
-        "сопоставил его с каталогом 148 ролей и сохранил результат.\n"
-        "Telegram Bot API не предоставляет универсальный список всех участников группы, "
-        "поэтому невидимые боту старые аккаунты нельзя перебрать одним запросом.")
+        f"Ошибок проверки: {errors}\n"
+        f"Ожидают первого наблюдения: {len(unresolved)}"
+    )
 
 
 async def member_info_cmd(message: Message):
@@ -6460,8 +6518,7 @@ async def setup_commands():
         *base_user,
         BotCommand(command="game_poll", description="Опрос на игру"),
         BotCommand(command="setrole", description="Назначить роль"),
-        BotCommand(command="syncroles", description="Сверить роли"),
-        BotCommand(command="adoptroles", description="Принять существующие теги"),
+        BotCommand(command="syncroles", description="Сверить и сохранить роли"),
     ]
     private = [
         BotCommand(command="manage_commands", description="Управление командами"),
@@ -6503,8 +6560,8 @@ async def setup_commands():
     if PRIMARY_CHAT_ID:
         # Everyone in the primary chat sees base user commands.
         await bot.set_my_commands(user_commands, scope=BotCommandScopeChat(chat_id=PRIMARY_CHAT_ID))
-        # Administrators additionally see /setrole, /syncroles and /game_poll.
-        await bot.set_my_commands(admin_commands, scope=BotCommandScopeChatAdministrators(chat_id=PRIMARY_CHAT_ID))
+        # Keep the full useful menu visible in the primary chat; handlers enforce admin-only actions.
+        await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=PRIMARY_CHAT_ID))
     else:
         # Safe fallback for first deployment before PRIMARY_CHAT_ID is configured.
         await bot.set_my_commands(user_commands, scope=BotCommandScopeAllGroupChats())
