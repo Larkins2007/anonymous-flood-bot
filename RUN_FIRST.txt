@@ -1,0 +1,8 @@
+1. Copy .env.example to .env.
+2. Put your BOT_TOKEN and numeric ADMIN_ID in .env.
+3. Put the TEST group and TEST info channel IDs in .env.
+4. Run: python moderation_bot.py
+5. In the test group use /id.
+6. In the info channel reply to roster #1: /capture_list 40
+7. In the info channel reply to roster #2: /capture_list 41
+8. Then test joining + `калл Навия` + confirmation.

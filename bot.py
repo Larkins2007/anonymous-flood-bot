@@ -9,7 +9,7 @@ import sys
 import threading
 import traceback
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from logging.handlers import RotatingFileHandler
 from typing import Optional
 
@@ -35,8 +35,11 @@ from aiogram.types import (
     BotCommandScopeChat,
     BotCommandScopeDefault,
     CallbackQuery,
+    ChatMemberUpdated,
+    ChatPermissions,
     ErrorEvent,
     InlineKeyboardButton,
+    MessageEntity,
     InlineKeyboardMarkup,
     Message,
 )
@@ -59,6 +62,17 @@ MAX_REPORT_REASON_LENGTH = 2000
 TELEGRAM_TEXT_LIMIT = 3500
 BROADCAST_DELAY_SECONDS = float(os.getenv("BROADCAST_DELAY_SECONDS", "0.20"))
 BROADCAST_MAX_RETRIES = int(os.getenv("BROADCAST_MAX_RETRIES", "3"))
+
+
+# =========================================================
+# FLOOD / GROUP MODERATION CONFIG
+# =========================================================
+
+ADMIN_MENTION = os.getenv("ADMIN_MENTION", "@Belochki_Rulyat")
+GROUP_WELCOME_TIMEOUT = int(os.getenv("GROUP_WELCOME_TIMEOUT", "0"))
+DEFAULT_OCCUPIED_MARKER = os.getenv("DEFAULT_OCCUPIED_MARKER", "💛")
+ROLE_ASSIGNMENT_WINDOW_SECONDS = int(os.getenv("ROLE_ASSIGNMENT_WINDOW_SECONDS", "600"))
+
 
 
 if not BOT_TOKEN:
@@ -127,6 +141,8 @@ last_polling_activity = None
 fatal_error = None
 FATAL_EVENT = None
 NOTIFICATION_LOCKS = {}
+MEMBER_TAG_SYNC_CACHE = {}
+MEMBER_TAG_SYNC_TTL_SECONDS = int(os.getenv("MEMBER_TAG_SYNC_TTL_SECONDS", "45"))
 
 @dp.errors()
 async def global_error_handler(event: ErrorEvent):
@@ -389,6 +405,144 @@ def migrate_db():
         conn.commit()
 
     db_transaction(migrate)
+
+
+
+def init_group_db():
+    """Create/migrate the group-moderation tables without touching legacy data."""
+    def op(conn):
+        conn.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS managed_group (
+                group_chat_id INTEGER PRIMARY KEY,
+                info_channel_id INTEGER,
+                bound_at TEXT NOT NULL,
+                title TEXT NOT NULL DEFAULT ''
+            );
+
+            CREATE TABLE IF NOT EXISTS group_members (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                first_name TEXT NOT NULL DEFAULT '',
+                last_name TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL DEFAULT '',
+                role_key TEXT,
+                role_name TEXT,
+                tag TEXT,
+                confirmed INTEGER NOT NULL DEFAULT 0,
+                active INTEGER NOT NULL DEFAULT 1,
+                joined_at TEXT NOT NULL,
+                confirmed_at TEXT,
+                left_at TEXT,
+                welcome_message_id INTEGER,
+                tag_set_by_bot INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (chat_id, user_id)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_group_members_active_role
+                ON group_members(chat_id, active, role_key);
+            CREATE INDEX IF NOT EXISTS idx_group_members_username
+                ON group_members(chat_id, username);
+            CREATE INDEX IF NOT EXISTS idx_group_members_joined
+                ON group_members(chat_id, joined_at);
+
+            CREATE TABLE IF NOT EXISTS role_state (
+                chat_id INTEGER NOT NULL,
+                role_key TEXT NOT NULL,
+                role_name TEXT NOT NULL,
+                user_id INTEGER,
+                status TEXT NOT NULL DEFAULT 'free',
+                legacy_marker TEXT NOT NULL DEFAULT '',
+                legacy_custom_emoji_id TEXT,
+                bot_managed INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY (chat_id, role_key)
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_role_state_user
+                ON role_state(chat_id, user_id);
+            CREATE INDEX IF NOT EXISTS idx_role_state_status
+                ON role_state(chat_id, status);
+
+            CREATE TABLE IF NOT EXISTS mafia_bans (
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                banned_by INTEGER NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS mafia_games (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                creator_id INTEGER NOT NULL,
+                status TEXT NOT NULL DEFAULT 'WAITING',
+                created_at TEXT NOT NULL,
+                started_at TEXT,
+                finished_at TEXT
+            );
+
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_mafia_open_game
+                ON mafia_games(chat_id)
+                WHERE status IN ('WAITING', 'RUNNING');
+
+            CREATE TABLE IF NOT EXISTS mafia_players (
+                game_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                first_name TEXT NOT NULL DEFAULT '',
+                username TEXT NOT NULL DEFAULT '',
+                role TEXT,
+                joined_at TEXT NOT NULL,
+                PRIMARY KEY (game_id, user_id)
+            );
+
+            CREATE TABLE IF NOT EXISTS roster_sources (
+                chat_id INTEGER NOT NULL,
+                slot TEXT NOT NULL,
+                message_id INTEGER NOT NULL,
+                source_text TEXT NOT NULL DEFAULT '',
+                source_custom_emoji TEXT NOT NULL DEFAULT '{}',
+                captured_at TEXT NOT NULL,
+                PRIMARY KEY (chat_id, slot)
+            );
+            """
+        )
+        conn.commit()
+    db_transaction(op)
+
+
+
+def migrate_group_state():
+    def op(conn):
+        cols = {row["name"] for row in conn.execute("PRAGMA table_info(role_state)").fetchall()}
+        if "status" not in cols:
+            conn.execute("ALTER TABLE role_state ADD COLUMN status TEXT NOT NULL DEFAULT 'free'")
+        rows = conn.execute("SELECT chat_id, role_key, role_name, user_id, status, legacy_marker, bot_managed FROM role_state").fetchall()
+        for row in rows:
+            status = row["status"] or STATUS_FREE
+            if row["user_id"] is not None:
+                status = STATUS_TAKEN
+            elif row["legacy_marker"] in ("💛", "🧡", "💚"):
+                status = {"💛": STATUS_TAKEN, "🧡": STATUS_WANTED, "💚": STATUS_RESERVED}[row["legacy_marker"]]
+            elif status not in {STATUS_FREE, STATUS_TAKEN, STATUS_WANTED, STATUS_RESERVED}:
+                status = STATUS_FREE
+            conn.execute("UPDATE role_state SET status=? WHERE chat_id=? AND role_key=?", (status, row["chat_id"], row["role_key"]))
+
+        # Seed all 148 roles for the temporary test chat on first run.
+        for role in ROLE_CATALOG:
+            name, english, _region = role
+            key = normalize_role(name)
+            existing = conn.execute("SELECT 1 FROM role_state WHERE chat_id=? AND role_key=?", (TEST_ROSTER_CHANNEL_ID, key)).fetchone()
+            if not existing:
+                status = INITIAL_STATUS_BY_KEY.get(key, STATUS_FREE)
+                marker = STATUS_MARKER.get(status, "")
+                emoji_id = CUSTOM_EMOJI_IDS.get(status)
+                conn.execute(
+                    "INSERT INTO role_state(chat_id,role_key,role_name,user_id,status,legacy_marker,legacy_custom_emoji_id,bot_managed) VALUES(?,?,?,?,?,?,?,0)",
+                    (TEST_ROSTER_CHANNEL_ID, key, name, None, status, marker, emoji_id),
+                )
+        conn.commit()
+    group_db_op(op)
 
 
 def register_user(user):
@@ -3723,53 +3877,1396 @@ async def enqueue_pending_notifications():
             await DELIVERY_QUEUE.put({"notification_id": row["id"]})
 
 
+
+# =========================================================
+# GROUP / FLOOD MODERATION
+# =========================================================
+
+# Embedded role catalog and role logic.  The previous version depended on a
+# separate group_logic.py which was not present in the uploaded project.
+# Keeping it here makes this file self-contained.
+
+TEST_ROSTER_CHANNEL_ID = int(os.getenv("TEST_ROSTER_CHANNEL_ID", "-1003962715940"))
+TEST_ROSTER_MESSAGES = {1: 44, 2: 45}
+
+STATUS_TAKEN = "taken"
+STATUS_WANTED = "wanted"
+STATUS_RESERVED = "reserved"
+STATUS_FREE = "free"
+STATUS_MARKER = {
+    STATUS_TAKEN: "💛",
+    STATUS_WANTED: "🧡",
+    STATUS_RESERVED: "💚",
+}
+CUSTOM_EMOJI_IDS = {
+    STATUS_TAKEN: "5366258639294181517",
+    STATUS_WANTED: "5368545640659826312",
+    STATUS_RESERVED: "5386465730277421816",
+}
+
+# Exact roster supplied by the user.  148 entries, grouped exactly as the
+# two test roster messages are structured.
+_ROLE_GROUPS = [
+    ("✦ 🤍🤍𝑴𝒐𝒏𝒅𝒔𝒕𝒂𝒅𝒕🤍🤍✦", [
+        ("Альбедо", "Albedo"), ("Барбара", "Barbara"), ("Беннет", "Bennett"),
+        ("Варка", "Varka"), ("Венти", "Venti"), ("Далия", "Dahlia"),
+        ("Джинн", "Jean"), ("Дилюк", "Diluc"), ("Диона", "Diona"),
+        ("Дурин", "Durin"), ("Кли", "Klee"), ("Кэйя", "Kaeya"),
+        ("Лиза", "Lisa"), ("Лоэн", "Lohen"), ("Мика", "Mika"),
+        ("Мона", "Mona"), ("Ноэлль", "Noelle"), ("Прюн", "Prune"),
+        ("Рейзор", "Razor"), ("Розария", "Rosaria"), ("Сахароза", "Sucrose"),
+        ("Фишль", "Fischl"), ("Эмбер", "Amber"), ("Эола", "Eula"),
+    ]),
+    ("✦ 🤍🤍𝑳𝒊 𝒀𝒖𝒆🤍🤍✦", [
+        ("Бай Чжу", "Baizhu"), ("Бэй Доу", "Beidou"), ("Гань Юй", "Ganyu"),
+        ("Е Лань", "Yelan"), ("Ка Мин", "Gaming"), ("Кэ Цин", "Keqing"),
+        ("Лань Янь", "Lan Yan"), ("Нин Гуан", "Ningguang"), ("Син Цю", "Xingqiu"),
+        ("Синь Янь", "Xinyan"), ("Сян Лин", "Xiangling"), ("Сянь Юнь", "Xianyun"),
+        ("Сяо", "Xiao"), ("Ху Тао", "Hu Tao"), ("Цзы Бай", "Zibai"),
+        ("Ци Ци", "Qiqi"), ("Чжун Ли", "Zhongli"), ("Чунь Юнь", "Chongyun"),
+        ("Шэнь Хэ", "Shenhe"), ("Юнь Цзинь", "Yunjin"), ("Янь Фэй", "Yanfei"),
+        ("Яо Яо", "Yaoyao"),
+    ]),
+    ("✦ 🤍🤍𝑰𝒏𝒂𝒛𝒖𝒎𝒂🤍🤍✦", [
+        ("Аратаки Итто", "Itto"), ("Аяка", "Ayaka"), ("Аято", "Ayato"),
+        ("Горо", "Gorou"), ("Ёимия", "Yoimiya"), ("Кадзуха", "Kazuha"),
+        ("Кирара", "Kirara"), ("Кокоми", "Kokomi"), ("Мидзуки", "Mizuki"),
+        ("Райдэн Эи", "Raiden Ei"), ("Сара", "Sara"), ("Саю", "Sayu"),
+        ("Синобу", "Shinobu"), ("Тома", "Thoma"), ("Хэйдзо", "Heizou"),
+        ("Яэ Мико", "Yae Miko"),
+    ]),
+    ("✦ 🤍🤍𝑺𝒖𝒎𝒆𝒓𝒖🤍🤍✦", [
+        ("Аль-Хайтам", "Alhaitham"), ("Дори", "Dori"), ("Дэхья", "Dehya"),
+        ("Кавех", "Kaveh"), ("Кандакия", "Candace"), ("Коллеи", "Collei"),
+        ("Лайла", "Layla"), ("Нахида", "Nahida"), ("Нилу", "Nilou"),
+        ("Сайно", "Cyno"), ("Сетос", "Sethos"), ("Странник", "Wanderer"),
+        ("Тигнари", "Tighnari"), ("Фарузан", "Faruzan"),
+    ]),
+    ("✦ 🤍🤍𝑭𝒐𝒏𝒕𝒂𝒊𝒏𝒆🤍🤍✦", [
+        ("Клоринда", "Clorinde"), ("Лини", "Lyney"), ("Линетт", "Lynette"),
+        ("Навия", "Navia"), ("Нёвиллет", "Neuvillette"), ("Ризли", "Wriothesley"),
+        ("Сиджвин", "Sigewinne"), ("Тиори", "Chiori"), ("Фремине", "Freminet"),
+        ("Фурина", "Furina"), ("Шарлотта", "Charlotte"), ("Эмилия", "Emilie"),
+        ("Эскофье", "Escoffier"),
+    ]),
+    ("✦ 🤍🤍𝑵𝒂𝒕𝒍𝒂𝒏🤍🤍✦", [
+        ("Вареса", "Varesa"), ("Иансан", "Iansan"), ("Ифа", "Ifa"),
+        ("Качина", "Kachina"), ("Кинич", "Kinich"), ("Мавуика", "Mavuika"),
+        ("Муалани", "Mualani"), ("Оророн", "Ororon"), ("Ситлали", "Citlali"),
+        ("Часка", "Chasca"), ("Шилонен", "Xilonen"),
+    ]),
+    ("✦ 🤍🤍𝑵𝒐𝒅-𝑲𝒓𝒂𝒊🤍🤍✦", [
+        ("Айно", "Aino"), ("Иллуги", "Illuga"), ("Инеффа", "Ineffa"),
+        ("Коломбина", "Columbina"), ("Лаума", "Lauma"), ("Линнея", "Linnea"),
+        ("Нефер", "Nefer"), ("Флинс", "Flins"), ("Ягода", "Jahoda"),
+    ]),
+    ("✦ 🤍🤍𝑺𝒏𝒆𝒛𝒉𝒏𝒂𝒚𝒂🤍🤍✦", [
+        ("Алёша", "Alyosha"), ("Арлекино", "Arlecchino"), ("Валера", "Valera"),
+        ("Весна", "Vesna"), ("Водяница", "Vodyanitsa"), ("Даника", "Danika"),
+        ("Дотторе", "Dottore"), ("Капитано", "Capitano"), ("Митя", "Mitya"),
+        ("Ной", "Noah"), ("Одетта", "Odette"), ("Панталоне", "Pantalone"),
+        ("Пьеро", "Pierro"), ("Пульчинелла", "Pulcinella"), ("Сандроне", "Sandrone"),
+        ("Синьора", "Signora"), ("Тарталья", "Tartaglia"), ("Царица", "Tsaritsa"),
+    ]),
+    ("✦ 🤍🤍𝑲𝒉𝒂𝒆𝒏𝒓𝒊’𝒂𝒉🤍🤍✦", [
+        ("Ведрфельнир", "Vedrfolnir"), ("Дайнслейф", "Dainsleif"), ("Рери", "Rerir"),
+        ("Сурталоги", "Surtalogi"), ("Толиндис", "Tollindis"), ("Хальфдан", "Halfdan"),
+        ("Хрофтатюр", "Hroptatyr"),
+    ]),
+    ("✦ 🤍🤍𝑺𝒉𝒂𝒃𝒂𝒔𝒉🤍🤍✦", [
+        ("Алиса", "Alice"), ("Андерсдоттер", "Andersdotter"), ("Барбелот", "Barbeloth"),
+        ("Николь Рейн", "Nicole Reeyn"), ("Октавия", "Octavia"), ("Рэйндоттир", "Rhinedottir"),
+    ]),
+    ("✦ 🤍🤍𝑺𝒉𝒂𝒅𝒐𝒘𝒔🤍🤍✦", [
+        ("Астарот", "Astaroth"), ("Асмодей", "Asmoday"), ("Набериус", "Naberius"),
+        ("Ронова", "Ronova"),
+    ]),
+    ("✦ 🤍🤍𝑨𝒏𝒐𝒕𝒉𝒆𝒓🤍🤍✦", [
+        ("Итэр", "Aether"), ("Люмин", "Lumine"), ("Паймон", "Paimon"), ("Скирк", "Skirk"),
+    ]),
+]
+
+ROLE_CATALOG = [(name, english, region) for region, entries in _ROLE_GROUPS for name, english in entries]
+ROLE_BY_KEY = {}
+for _name, _english, _region in ROLE_CATALOG:
+    ROLE_BY_KEY[" ".join(_name.casefold().replace("ё", "е").split())] = {
+        "name": _name,
+        "english": _english,
+        "region": _region,
+    }
+
+# Exact initial status seed from the user's two test-channel messages.
+INITIAL_STATUS_NAMES = {
+    STATUS_TAKEN: {
+        "Альбедо", "Барбара", "Варка", "Венти", "Дилюк", "Диона", "Дурин", "Кли", "Кэйя",
+        "Лоэн", "Ноэлль", "Фишль", "Бай Чжу", "Ка Мин", "Сяо", "Ху Тао", "Ци Ци", "Чжун Ли",
+        "Аяка", "Аято", "Тома", "Хэйдзо", "Аль-Хайтам", "Кавех", "Сайно", "Странник", "Лини",
+        "Навия", "Нёвиллет", "Ризли", "Тиори", "Иллуги", "Лаума", "Флинс", "Валера", "Водяница",
+        "Дотторе", "Капитано", "Митя", "Ной", "Тарталья", "Дайнслейф", "Рэйндоттир", "Итэр", "Люмин",
+    },
+    STATUS_WANTED: {"Эола"},
+    STATUS_RESERVED: {"Фурина"},
+}
+INITIAL_STATUS_BY_KEY = {
+    " ".join(name.casefold().replace("ё", "е").split()): status
+    for status, names in INITIAL_STATUS_NAMES.items()
+    for name in names
+}
+
+
+def normalize_role(value):
+    return " ".join((value or "").casefold().replace("ё", "е").split())
+
+
+def role_for(value):
+    return ROLE_BY_KEY.get(normalize_role(value))
+
+
+def _stylize_latin(text):
+    out = []
+    for ch in text:
+        if "A" <= ch <= "Z":
+            out.append(chr(0x1D468 + (ord(ch) - ord("A"))))
+        elif "a" <= ch <= "z":
+            # Mathematical Bold Italic lowercase; this matches the original tag style.
+            out.append(chr(0x1D482 + (ord(ch) - ord("a"))))
+        else:
+            out.append(ch)
+    return "".join(out)
+
+def make_tag(english):
+    value = f"❦{_stylize_latin(english.replace(' ', ''))}❦"
+    # Telegram member tags are max 16 characters and don't allow emoji.
+    if len(value) <= 16:
+        return value
+    compact = english.replace(" ", "")
+    value = f"❦{compact}❦"
+    if len(value) <= 16:
+        return value
+    return compact[:16]
+
+
+JOIN_ACTIVE_STATUSES = {"member", "restricted"}
+LEAVE_STATUSES = {"left", "kicked"}
+
+
+def group_db_op(callback, *args):
+    return db_transaction(callback, *args)
+
+
+def bind_group(chat, title_value=""):
+    def op(conn):
+        conn.execute(
+            """
+            INSERT INTO managed_group(group_chat_id, info_channel_id, bound_at, title)
+            VALUES (?, COALESCE((SELECT info_channel_id FROM managed_group WHERE group_chat_id=?), NULL), ?, ?)
+            ON CONFLICT(group_chat_id) DO UPDATE SET
+                title=excluded.title
+            """,
+            (chat.id, chat.id, now(), title_value or ""),
+        )
+        conn.commit()
+    group_db_op(op)
+
+
+def bind_info_channel_db(chat_id):
+    def op(conn):
+        row = conn.execute("SELECT group_chat_id FROM managed_group ORDER BY bound_at DESC LIMIT 1").fetchone()
+        if row:
+            group_id = row["group_chat_id"]
+            conn.execute("UPDATE managed_group SET info_channel_id=? WHERE group_chat_id=?", (chat_id, group_id))
+            if group_id != chat_id:
+                # Migrate any legacy role_state accidentally captured before the group was linked.
+                conn.execute(
+                    """
+                    INSERT OR IGNORE INTO role_state(chat_id,role_key,role_name,user_id,legacy_marker,legacy_custom_emoji_id,bot_managed)
+                    SELECT ?,role_key,role_name,user_id,legacy_marker,legacy_custom_emoji_id,bot_managed
+                    FROM role_state WHERE chat_id=?
+                    """,
+                    (group_id, chat_id),
+                )
+        else:
+            # Temporary link; the first /bind_group will update its info channel later.
+            conn.execute(
+                "INSERT OR IGNORE INTO managed_group(group_chat_id, info_channel_id, bound_at, title) VALUES (?, ?, ?, ?)",
+                (0, chat_id, now(), ""),
+            )
+        conn.commit()
+        return row["group_chat_id"] if row else None
+    return group_db_op(op)
+
+
+def get_managed_group():
+    def op(conn):
+        row = conn.execute("SELECT * FROM managed_group WHERE group_chat_id != 0 ORDER BY bound_at DESC LIMIT 1").fetchone()
+        return row
+    return group_db_op(op)
+
+
+def get_managed_info_for_group(group_chat_id):
+    return group_db_op(lambda conn: conn.execute("SELECT * FROM managed_group WHERE group_chat_id=?", (group_chat_id,)).fetchone())
+
+
+def upsert_group_member(chat_id, user, *, active=True, role_key=None, role_name=None, tag=None, confirmed=False, welcome_message_id=None, tag_set_by_bot=False):
+    def op(conn):
+        existing = conn.execute("SELECT * FROM group_members WHERE chat_id=? AND user_id=?", (chat_id, user.id)).fetchone()
+        conn.execute(
+            """
+            INSERT INTO group_members(
+                chat_id,user_id,first_name,last_name,username,role_key,role_name,tag,
+                confirmed,active,joined_at,confirmed_at,left_at,welcome_message_id,tag_set_by_bot
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)
+            ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                first_name=excluded.first_name,
+                last_name=excluded.last_name,
+                username=excluded.username,
+                role_key=COALESCE(excluded.role_key, group_members.role_key),
+                role_name=COALESCE(excluded.role_name, group_members.role_name),
+                tag=COALESCE(excluded.tag, group_members.tag),
+                active=excluded.active,
+                confirmed=excluded.confirmed,
+                left_at=NULL,
+                welcome_message_id=COALESCE(excluded.welcome_message_id, group_members.welcome_message_id),
+                tag_set_by_bot=excluded.tag_set_by_bot
+            """,
+            (
+                chat_id, user.id, user.first_name or "", user.last_name or "", user.username or "",
+                role_key, role_name, tag, 1 if confirmed else 0, 1 if active else 0,
+                now(), welcome_message_id, 1 if tag_set_by_bot else 0,
+            ),
+        )
+        conn.commit()
+    group_db_op(op)
+
+
+def mark_member_left(chat_id, user_id):
+    def op(conn):
+        row = conn.execute("SELECT role_key, role_name, tag FROM group_members WHERE chat_id=? AND user_id=?", (chat_id,user_id)).fetchone()
+        conn.execute(
+            "UPDATE group_members SET active=0, left_at=?, confirmed=0 WHERE chat_id=? AND user_id=?",
+            (now(),chat_id,user_id),
+        )
+        if row and row["role_key"]:
+            conn.execute(
+                "UPDATE role_state SET user_id=NULL, bot_managed=0 WHERE chat_id=? AND role_key=? AND user_id=?",
+                (chat_id,row["role_key"],user_id),
+            )
+        conn.commit()
+        return dict(row) if row else None
+    return group_db_op(op)
+
+
+def confirm_member(chat_id, user_id):
+    def op(conn):
+        conn.execute(
+            "UPDATE group_members SET confirmed=1, confirmed_at=? WHERE chat_id=? AND user_id=?",
+            (now(),chat_id,user_id),
+        )
+        conn.commit()
+    group_db_op(op)
+
+
+def get_member(chat_id, user_id):
+    return group_db_op(lambda conn: conn.execute("SELECT * FROM group_members WHERE chat_id=? AND user_id=?", (chat_id,user_id)).fetchone())
+
+
+def find_group_member(chat_id, username):
+    key = normalize_target_text(username)
+    return group_db_op(lambda conn: conn.execute(
+        "SELECT * FROM group_members WHERE chat_id=? AND lower(username)=? AND active=1 LIMIT 1", (chat_id,key)
+    ).fetchone())
+
+
+def latest_pending_member(chat_id):
+    def op(conn):
+        rows = conn.execute(
+            """
+            SELECT * FROM group_members
+            WHERE chat_id=? AND active=1 AND confirmed=0
+              AND joined_at >= ?
+            ORDER BY joined_at DESC LIMIT 2
+            """,
+            (chat_id, (datetime.now(timezone.utc) - timedelta(seconds=ROLE_ASSIGNMENT_WINDOW_SECONDS)).isoformat()),
+        ).fetchall()
+        return rows[0] if len(rows) == 1 else None
+    return group_db_op(op)
+
+
+def role_is_occupied(chat_id, role_key, *, exclude_user_id=None):
+    key = normalize_role(role_key)
+    row = group_db_op(lambda conn: conn.execute(
+        "SELECT * FROM role_state WHERE chat_id=? AND role_key=?", (chat_id, key)
+    ).fetchone())
+    if not row:
+        return False
+    if row["user_id"] is not None and row["user_id"] != exclude_user_id:
+        return True
+    return (row["status"] == STATUS_TAKEN and row["user_id"] is None)
+
+
+def assign_role_db(chat_id, user, role):
+    role_key = normalize_role(role["name"])
+    tag = make_tag(role["english"])
+    def op(conn):
+        state = conn.execute("SELECT * FROM role_state WHERE chat_id=? AND role_key=?", (chat_id, role_key)).fetchone()
+        if state and state["user_id"] not in (None, user.id):
+            raise ValueError("ROLE_OCCUPIED")
+        old = conn.execute(
+            "SELECT role_key FROM group_members WHERE chat_id=? AND user_id=? AND active=1",
+            (chat_id, user.id),
+        ).fetchone()
+        if old and old["role_key"] and old["role_key"] != role_key:
+            conn.execute(
+                "UPDATE role_state SET user_id=NULL, status='free', bot_managed=0, legacy_marker='' WHERE chat_id=? AND role_key=? AND user_id=?",
+                (chat_id, old["role_key"], user.id),
+            )
+        conn.execute(
+            """
+            INSERT INTO role_state(chat_id,role_key,role_name,user_id,status,legacy_marker,legacy_custom_emoji_id,bot_managed)
+            VALUES(?,?,?,?,?,?,?,1)
+            ON CONFLICT(chat_id,role_key) DO UPDATE SET
+                user_id=excluded.user_id,
+                role_name=excluded.role_name,
+                status='taken',
+                bot_managed=1
+            """,
+            (chat_id, role_key, role["name"], user.id, STATUS_TAKEN, STATUS_MARKER[STATUS_TAKEN], CUSTOM_EMOJI_IDS[STATUS_TAKEN]),
+        )
+        conn.execute(
+            """
+            INSERT INTO group_members(chat_id,user_id,first_name,last_name,username,role_key,role_name,tag,confirmed,active,joined_at,tag_set_by_bot)
+            VALUES(?,?,?,?,?,?,?,?,1,1,?,1)
+            ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                first_name=excluded.first_name,last_name=excluded.last_name,username=excluded.username,
+                role_key=excluded.role_key,role_name=excluded.role_name,tag=excluded.tag,active=1,tag_set_by_bot=1
+            """,
+            (chat_id,user.id,user.first_name or "",user.last_name or "",user.username or "",role_key,role["name"],tag,now()),
+        )
+        conn.commit()
+        return tag, role_key
+    return group_db_op(op)
+
+
+def split_role_line(line):
+    """Return (role, marker) for roster lines like 'Диона -💛' or 'Сяо - 💛'."""
+    raw = line or ""
+    for ru, en, region in ROLE_CATALOG:
+        pattern = rf"^\s*{re.escape(ru)}\s*-\s*(.*)$"
+        m = re.match(pattern, raw, flags=re.IGNORECASE)
+        if m:
+            return role_for(ru), m.group(1).strip()
+    return None, None
+
+def store_roster_source(chat_id, slot, message):
+    custom = []
+    source_text = message.text or ""
+    line_starts = [0]
+    acc = 0
+    for line in source_text.splitlines(True):
+        acc += len(line.encode("utf-16-le")) // 2
+        line_starts.append(acc)
+    for ent in message.entities or []:
+        if getattr(ent, "type", None) == "custom_emoji" and getattr(ent, "custom_emoji_id", None):
+            char = utf16_slice(source_text, ent.offset, ent.length)
+            line_index = 0
+            for idx in range(len(line_starts) - 1):
+                if line_starts[idx] <= ent.offset < line_starts[idx + 1]:
+                    line_index = idx
+                    break
+            local_offset = ent.offset - line_starts[line_index]
+            custom.append({
+                "line": line_index,
+                "offset": local_offset,
+                "char": char,
+                "custom_emoji_id": ent.custom_emoji_id,
+                "length": ent.length,
+            })
+    def op(conn):
+        conn.execute(
+            """
+            INSERT INTO roster_sources(chat_id,slot,message_id,source_text,source_custom_emoji,captured_at)
+            VALUES(?,?,?,?,?,?)
+            ON CONFLICT(chat_id,slot) DO UPDATE SET
+                message_id=excluded.message_id,source_text=excluded.source_text,
+                source_custom_emoji=excluded.source_custom_emoji,captured_at=excluded.captured_at
+            """,
+            (chat_id,slot,message.message_id,message.text or "",json.dumps(custom,ensure_ascii=False),now()),
+        )
+        linked = conn.execute(
+            "SELECT group_chat_id FROM managed_group WHERE info_channel_id=? ORDER BY bound_at DESC LIMIT 1",
+            (chat_id,),
+        ).fetchone()
+        state_chat_id = linked["group_chat_id"] if linked and linked["group_chat_id"] else chat_id
+        # Initialize role_state legacy markers for roles not yet managed by bot.
+        lines = (message.text or "").splitlines()
+        custom_values = list(custom)
+        for line in lines:
+            role, marker = split_role_line(line)
+            if not role:
+                continue
+            existing = conn.execute("SELECT * FROM role_state WHERE chat_id=? AND role_key=?", (state_chat_id,normalize_role(role["name"]))).fetchone()
+            if not existing:
+                emoji_id = None
+                for item in custom_values:
+                    if item.get("char") == marker:
+                        emoji_id = item.get("custom_emoji_id")
+                        break
+                conn.execute(
+                    "INSERT INTO role_state(chat_id,role_key,role_name,user_id,legacy_marker,legacy_custom_emoji_id,bot_managed) VALUES(?,?,?,?,?,?,0)",
+                    (state_chat_id,normalize_role(role["name"]),role["name"],None,marker,emoji_id),
+                )
+        conn.commit()
+    group_db_op(op)
+
+
+def roster_rows_for(chat_id):
+    return group_db_op(lambda conn: conn.execute("SELECT * FROM role_state WHERE chat_id=?", (chat_id,)).fetchall())
+
+
+def roster_sources(chat_id):
+    return group_db_op(lambda conn: conn.execute("SELECT * FROM roster_sources WHERE chat_id=? ORDER BY slot", (chat_id,)).fetchall())
+
+
+def _custom_emoji_entity(offset_utf16, char, custom_emoji_id):
+    try:
+        length = len(char.encode("utf-16-le")) // 2
+    except Exception:
+        length = len(char)
+    return MessageEntity(
+        type="custom_emoji",
+        offset=offset_utf16,
+        length=length,
+        custom_emoji_id=custom_emoji_id,
+    )
+
+
+def _custom_emoji_entity(offset_utf16, char, custom_emoji_id):
+    length = len((char or "").encode("utf-16-le")) // 2
+    return MessageEntity(type="custom_emoji", offset=offset_utf16, length=length, custom_emoji_id=custom_emoji_id)
+
+
+def _role_status_for_chat(chat_id, role_name):
+    row = group_db_op(lambda conn: conn.execute(
+        "SELECT * FROM role_state WHERE chat_id=? AND role_key=?", (chat_id, normalize_role(role_name))
+    ).fetchone())
+    if not row:
+        return STATUS_FREE, None, None
+    status = row["status"] or STATUS_FREE
+    if row["user_id"] is not None:
+        status = STATUS_TAKEN
+    return status, row["user_id"], row["tag"] if "tag" in row.keys() else None
+
+
+def build_roster_message(chat_id, slot):
+    states = {row["role_key"]: row for row in roster_rows_for(chat_id)}
+    if slot == 1:
+        groups = _ROLE_GROUPS[:6]
+    elif slot == 2:
+        groups = _ROLE_GROUPS[6:]
+    else:
+        groups = _ROLE_GROUPS
+
+    lines = []
+    entities = []
+    utf_offset = 0
+
+    for region_title, entries in groups:
+        region_lines = []
+        region_entities = []
+        region_offset = len(region_title.encode("utf-16-le")) // 2 + 1
+
+        for name, english in entries:
+            key = normalize_role(name)
+            row = states.get(key)
+            status = row["status"] if row else INITIAL_STATUS_BY_KEY.get(key, STATUS_FREE)
+            if row and row["user_id"] is not None:
+                status = STATUS_TAKEN
+
+            # The roster messages intentionally show only roles with a state.
+            # Free roles are available via /free_roles; /all_roles shows the whole catalog.
+            marker = STATUS_MARKER.get(status, "")
+            if not marker:
+                continue
+
+            line = f"{name} - {marker}"
+            marker_offset = len((f"{name} - ").encode("utf-16-le")) // 2
+            region_entities.append(
+                _custom_emoji_entity(
+                    region_offset + marker_offset,
+                    marker,
+                    CUSTOM_EMOJI_IDS[status],
+                )
+            )
+            region_lines.append(line)
+            region_offset += len(line.encode("utf-16-le")) // 2 + 1
+
+        if not region_lines:
+            continue
+
+        if lines:
+            # Account for the blank separator before a new region.
+            lines.append("")
+            utf_offset += 1
+
+        lines.append(region_title)
+        utf_offset += len(region_title.encode("utf-16-le")) // 2 + 1
+
+        for line, entity in zip(region_lines, region_entities):
+            # Entity offsets were calculated relative to the region title.
+            entity.offset = utf_offset + (entity.offset - (len(region_title.encode("utf-16-le")) // 2 + 1))
+            lines.append(line)
+            entities.append(entity)
+            utf_offset += len(line.encode("utf-16-le")) // 2 + 1
+
+    if not lines:
+        lines = ["🎭 Сейчас нет ролей со статусом.", "Свободные роли смотрите через /free_roles."]
+        entities = []
+
+    return "\n".join(lines), entities
+
+
+async def update_group_roster(chat_id):
+    info_channel_id = TEST_ROSTER_CHANNEL_ID
+    # The temporary test roster is explicitly tied to messages 44 and 45.
+    # In production, this can be replaced by DB-bound source messages.
+    for slot, message_id in TEST_ROSTER_MESSAGES.items():
+        text, entities = build_roster_message(chat_id, slot)
+        try:
+            await bot.edit_message_text(
+                chat_id=info_channel_id,
+                message_id=message_id,
+                text=text,
+                entities=entities or None,
+            )
+        except TelegramBadRequest as exc:
+            if "message is not modified" not in str(exc).lower():
+                logger.warning("Roster update failed | channel=%s | message=%s | %s", info_channel_id, message_id, exc)
+        except Exception:
+            logger.exception("Unexpected roster update error")
+
+
+def _user_object_from_row(row):
+    class U:
+        pass
+    u = U()
+    u.id = row["user_id"] if isinstance(row, sqlite3.Row) else row.id
+    u.first_name = row["first_name"] if isinstance(row, sqlite3.Row) else getattr(row, "first_name", "")
+    u.last_name = row["last_name"] if isinstance(row, sqlite3.Row) else getattr(row, "last_name", "")
+    u.username = row["username"] if isinstance(row, sqlite3.Row) else getattr(row, "username", "")
+    return u
+
+
+def set_group_member_tag_db(chat_id, user_id, actual_tag):
+    def op(conn):
+        conn.execute("UPDATE group_members SET tag=? WHERE chat_id=? AND user_id=?", (actual_tag,chat_id,user_id))
+        conn.commit()
+    group_db_op(op)
+
+
+async def apply_member_tag(chat_id, user_id, desired_tag):
+    if not isinstance(desired_tag, str):
+        return False, None
+    if len(desired_tag) > 16:
+        logger.error("Refusing tag longer than Telegram's 16-character limit: %r", desired_tag)
+        return False, None
+    try:
+        ok = await bot.set_chat_member_tag(chat_id, user_id, tag=desired_tag)
+        return bool(ok), desired_tag
+    except TelegramBadRequest as exc:
+        logger.warning("Could not set tag %r | chat=%s user=%s | %s", desired_tag, chat_id, user_id, exc)
+        return False, None
+
+
+async def sync_member_tag(chat_id, user_id, *, user=None, refresh_roster=False, expected_role=None, force=False):
+    """Read the actual Telegram tag and make DB/list follow Telegram."""
+    cache_key = (chat_id, user_id)
+    now_mono = asyncio.get_running_loop().time()
+    if not force and cache_key in MEMBER_TAG_SYNC_CACHE:
+        if now_mono - MEMBER_TAG_SYNC_CACHE[cache_key] < MEMBER_TAG_SYNC_TTL_SECONDS:
+            current = get_member(chat_id, user_id)
+            return role_for(current["role_name"]) if current and current["role_name"] else role_for_tag(current["tag"]) if current else None
+    try:
+        member = await bot.get_chat_member(chat_id, user_id)
+        MEMBER_TAG_SYNC_CACHE[cache_key] = now_mono
+    except (TelegramForbiddenError, TelegramNotFound, TelegramBadRequest) as exc:
+        logger.warning("Could not read member tag | chat=%s user=%s | %s", chat_id, user_id, exc)
+        return None
+    actual_tag = getattr(member, "tag", None) or ""
+    target_user = user or getattr(member, "user", None)
+    if target_user:
+        upsert_group_member(chat_id, target_user, active=(member.status in JOIN_ACTIVE_STATUSES), tag=actual_tag)
+
+    role = role_for_tag(actual_tag)
+    def op(conn):
+        # Clear any previous role belonging to this user.
+        if target_user:
+            conn.execute(
+                "UPDATE role_state SET user_id=NULL, status='free', bot_managed=0 WHERE chat_id=? AND user_id=?",
+                (chat_id, target_user.id),
+            )
+        if role and target_user and member.status in JOIN_ACTIVE_STATUSES:
+            role_key = normalize_role(role["name"])
+            holder = conn.execute("SELECT user_id FROM role_state WHERE chat_id=? AND role_key=?", (chat_id, role_key)).fetchone()
+            if holder and holder["user_id"] not in (None, target_user.id):
+                # Two users cannot legitimately own one role. Keep the first observed owner.
+                return False
+            state = conn.execute("SELECT * FROM role_state WHERE chat_id=? AND role_key=?", (chat_id, role_key)).fetchone()
+            conn.execute(
+                """
+                INSERT INTO role_state(chat_id,role_key,role_name,user_id,status,legacy_marker,legacy_custom_emoji_id,bot_managed)
+                VALUES(?,?,?,?,?,?,?,0)
+                ON CONFLICT(chat_id,role_key) DO UPDATE SET user_id=excluded.user_id,status='taken'
+                """,
+                (chat_id, role_key, role["name"], target_user.id, STATUS_TAKEN, STATUS_MARKER[STATUS_TAKEN], CUSTOM_EMOJI_IDS[STATUS_TAKEN]),
+            )
+            conn.execute(
+                "UPDATE group_members SET role_key=?,role_name=?,tag=?,active=1 WHERE chat_id=? AND user_id=?",
+                (role_key, role["name"], actual_tag, chat_id, target_user.id),
+            )
+        elif target_user:
+            conn.execute("UPDATE group_members SET role_key=NULL,role_name=NULL,tag=? WHERE chat_id=? AND user_id=?", (actual_tag, chat_id, target_user.id))
+        conn.commit()
+        return True
+    result = group_db_op(op)
+    if refresh_roster:
+        await update_group_roster(chat_id)
+    return role
+
+
+def role_for_tag(tag):
+    value = (tag or "").strip()
+    if not value:
+        return None
+    for name, english, _region in ROLE_CATALOG:
+        canonical = make_tag(english)
+        if value == canonical or value == english or value == english.replace(" ", ""):
+            return role_for(name)
+        # tolerate the safe un-decorated fallback from older versions
+        if value == canonical.replace("❦", ""):
+            return role_for(name)
+    return None
+
+
+async def send_or_edit_welcome(chat_id, user_id):
+    row = get_member(chat_id, user_id)
+    if not row:
+        return
+    display = (row["username"] and "@" + row["username"]) or row["first_name"] or "участник"
+    if row["role_name"] and row["tag"]:
+        role_meta = role_for(row["role_name"])
+        english = role_meta["english"] if role_meta else ""
+        role_text = f"{row['tag']}\n{row['role_name']} ({english})"
+        button_text = "✅ Подтвердить"
+    else:
+        role_text = "⏳ Роль ещё не назначена.\n\nКогда роль будет назначена, бот установит Telegram-тег и обновит список."
+        button_text = "✅ Подтвердить правила"
+    text = (
+        f"{title('Добро пожаловать')}\n\n"
+        f"Привет, {display}! 🤍\n\n"
+        "Пожалуйста, соблюдайте правила сообщества и уважайте других участников.\n\n"
+        f"{section('Ваша роль')}\n{role_text}\n\n"
+        f"{divider()}\n"
+        "Подтверждение только отмечает ознакомление с правилами и не ограничивает ваши права в Telegram."
+    )
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=button_text, callback_data=f"fm:confirm:{chat_id}:{user_id}")]])
+    if row["welcome_message_id"]:
+        try:
+            await bot.edit_message_text(chat_id=chat_id, message_id=row["welcome_message_id"], text=text, reply_markup=markup)
+            return
+        except Exception:
+            pass
+    try:
+        sent = await bot.send_message(chat_id, text, reply_markup=markup)
+        group_db_op(lambda conn: (conn.execute("UPDATE group_members SET welcome_message_id=? WHERE chat_id=? AND user_id=?", (sent.message_id, chat_id, user_id)), conn.commit()))
+    except Exception:
+        logger.exception("Could not send welcome | chat=%s user=%s", chat_id, user_id)
+
+
+@dp.chat_member()
+async def group_member_update(event: ChatMemberUpdated):
+    global last_polling_activity
+    last_polling_activity = datetime.now(timezone.utc)
+    old_status = event.old_chat_member.status
+    new_status = event.new_chat_member.status
+    user = event.new_chat_member.user
+    chat_id = event.chat.id
+    bind_group(event.chat, event.chat.title or "")
+
+    if new_status in JOIN_ACTIVE_STATUSES:
+        register_user(user)
+        existing = get_member(chat_id, user.id)
+        upsert_group_member(
+            chat_id, user, active=True,
+            role_key=existing["role_key"] if existing else None,
+            role_name=existing["role_name"] if existing else None,
+            tag=existing["tag"] if existing else None,
+            confirmed=bool(existing["confirmed"]) if existing else False,
+            welcome_message_id=existing["welcome_message_id"] if existing else None,
+            tag_set_by_bot=bool(existing["tag_set_by_bot"]) if existing else False,
+        )
+        await sync_member_tag(chat_id, user.id, user=user, refresh_roster=False, force=True)
+        await send_or_edit_welcome(chat_id, user.id)
+        await update_group_roster(chat_id)
+        return
+
+    if new_status in LEAVE_STATUSES:
+        old = mark_member_left(chat_id, user.id)
+        role_text = (old or {}).get("tag") or (old or {}).get("role_name") or "роль не назначена"
+        username = f"@{user.username}" if user.username else user.first_name or str(user.id)
+        with suppress(Exception):
+            await bot.send_message(ADMIN_ID, f"{ADMIN_MENTION}\n\n🚪 Участник вышел из чата\n\n{username}\nID: {user.id}\nРоль: {role_text}")
+        await update_group_roster(chat_id)
+        return
+
+    # Tag/status/permissions change for an existing member.
+    if new_status in JOIN_ACTIVE_STATUSES:
+        await sync_member_tag(chat_id, user.id, user=user, refresh_roster=True, force=True)
+
+
+@dp.callback_query(F.data.startswith("fm:confirm:"))
+async def group_confirm(callback: CallbackQuery):
+    try:
+        _, _, chat_raw, user_raw = (callback.data or "").split(":", 3)
+        chat_id = int(chat_raw); target_user_id = int(user_raw)
+    except Exception:
+        await callback.answer("Некорректное подтверждение.", show_alert=True); return
+    if callback.from_user.id != target_user_id:
+        await callback.answer("Эта кнопка предназначена для другого участника.", show_alert=True); return
+    row = get_member(chat_id, target_user_id)
+    if not row or not row["active"]:
+        await callback.answer("Вы уже не являетесь участником этого чата.", show_alert=True); return
+    confirm_member(chat_id, target_user_id)
+    with suppress(Exception):
+        await callback.message.edit_reply_markup(
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="✅ Правила подтверждены", callback_data=f"fm:confirmed:{chat_id}:{target_user_id}")]])
+        )
+    await callback.answer("Правила подтверждены.")
+
+
+@dp.message(F.chat.type.in_({"group", "supergroup"}), F.text)
+async def group_passive_member_sync(message: Message):
+    if not message.from_user or message.from_user.is_bot:
+        return
+    try:
+        register_user(message.from_user)
+        existing = get_member(message.chat.id, message.from_user.id)
+        if not existing or (existing and existing["active"]):
+            await sync_member_tag(message.chat.id, message.from_user.id, user=message.from_user, refresh_roster=False)
+    except Exception:
+        logger.debug("Passive member sync failed | chat=%s user=%s", message.chat.id, message.from_user.id, exc_info=True)
+
+
+@dp.message(Command("setrole"))
+async def set_role_cmd(message: Message):
+    """Admin-only role assignment. This bot uses its own explicit role-management command.
+    """
+    if not _is_group_message(message) or not is_group_admin_user(message):
+        await message.reply("Нет доступа.")
+        return
+
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=2)
+    target = None
+    role_text = ""
+
+    if message.reply_to_message and message.reply_to_message.from_user:
+        target = message.reply_to_message.from_user
+        role_text = parts[1] if len(parts) > 1 else ""
+        if len(parts) > 2:
+            role_text = " ".join(parts[1:])
+    elif len(parts) >= 3 and parts[1].startswith("@"):
+        target = await _active_member_from_username(message.chat.id, parts[1])
+        role_text = parts[2]
+    else:
+        await message.reply(
+            "Использование:\n"
+            "• ответом на сообщение: /setrole Кокоми\n"
+            "• /setrole @username Кокоми"
+        )
+        return
+
+    role = role_for(role_text)
+    if not target or not role:
+        await message.reply("Не нашёл участника или роль. Проверьте точное название роли.")
+        return
+
+    try:
+        await sync_member_tag(message.chat.id, target.id, user=target, force=True)
+        current = get_member(message.chat.id, target.id)
+        if current and current["role_key"] == normalize_role(role["name"]):
+            await message.reply(f"{display_username_for_group(target)} уже носит роль «{role['name']}».")
+            return
+
+        if role_is_occupied(message.chat.id, normalize_role(role["name"]), exclude_user_id=target.id):
+            await message.reply(f"Роль «{role['name']}» уже занята.")
+            return
+
+        tag = make_tag(role["english"])
+        ok, actual = await apply_member_tag(message.chat.id, target.id, tag)
+        if not ok:
+            await message.reply("Не удалось установить тег. Проверьте право Manage Tags у бота и лимит тега Telegram.")
+            return
+
+        assign_role_db(message.chat.id, target, role)
+        set_group_member_tag_db(message.chat.id, target.id, actual)
+        await sync_member_tag(message.chat.id, target.id, user=target, force=True)
+        await send_or_edit_welcome(message.chat.id, target.id)
+        await update_group_roster(message.chat.id)
+        await message.reply(
+            f"✅ Роль назначена\n{display_username_for_group(target)}\n"
+            f"Роль: {role['name']}\nТег: {actual}"
+        )
+    except ValueError as exc:
+        if str(exc) == "ROLE_OCCUPIED":
+            await message.reply(f"Роль «{role['name']}» уже занята.")
+        else:
+            logger.exception("Role assignment value error")
+            await message.reply("Не удалось назначить роль.")
+    except Exception:
+        logger.exception("Role assignment failed")
+        await message.reply("Не удалось назначить роль. Подробность записана в лог.")
+
+
+def display_username_for_group(user):
+    return f"@{user.username}" if getattr(user,"username",None) else getattr(user,"first_name",str(user.id))
+
+
+def is_group_admin_user(message):
+    return bool(
+        message.from_user
+        and message.from_user.id == ADMIN_ID
+        and message.chat.type in {"group", "supergroup"}
+    )
+
+
+def _is_group_message(message):
+    return message.chat.type in {"group", "supergroup"}
+
+
+async def _active_member_from_username(chat_id: int, username: str):
+    """Resolve @username only if that user is actually active in this group."""
+    row = find_group_member(chat_id, username)
+    if row:
+        try:
+            cm = await bot.get_chat_member(chat_id, row["user_id"])
+            if cm.status in JOIN_ACTIVE_STATUSES:
+                return _user_object_from_row(row)
+        except Exception:
+            pass
+    row = get_user_by_username(username)
+    if not row:
+        return None
+    try:
+        cm = await bot.get_chat_member(chat_id, row["user_id"])
+        if cm.status not in JOIN_ACTIVE_STATUSES:
+            return None
+        return _user_object_from_row(row)
+    except Exception:
+        return None
+
+
+@dp.message(Command("release"))
+async def release_role_cmd(message: Message):
+    if not is_group_admin_user(message):
+        await message.reply("Нет доступа.")
+        return
+    text = (message.text or "").strip()
+    parts = text.split(maxsplit=1)
+    role_text = parts[1].strip() if len(parts) > 1 else ""
+    if not role_text:
+        await message.reply("Использование: /release <название роли>")
+        return
+    role = role_for(role_text)
+    if not role:
+        await message.reply("Роль не найдена в каталоге.")
+        return
+    key = normalize_role(role["name"] if isinstance(role, dict) else role_text)
+    row = group_db_op(lambda conn: conn.execute("SELECT * FROM role_state WHERE chat_id=? AND role_key=?", (message.chat.id, key)).fetchone())
+    if not row:
+        await message.reply("Эта роль ещё не зарегистрирована в состоянии группы.")
+        return
+    user_id = row["user_id"]
+    if user_id is None:
+        # Clear pending status without touching Telegram members.
+        group_db_op(lambda conn: (conn.execute("UPDATE role_state SET status='free', user_id=NULL, bot_managed=0, legacy_marker='' WHERE chat_id=? AND role_key=?", (message.chat.id, key)), conn.commit()))
+        await update_group_roster(message.chat.id)
+        await message.reply(f"✅ Роль «{role['name']}» освобождена.")
+        return
+    try:
+        await bot.set_chat_member_tag(message.chat.id, user_id, tag="")
+    except Exception as exc:
+        await message.reply(f"❌ Не удалось снять тег с участника: {exc}")
+        return
+    group_db_op(lambda conn: (
+        conn.execute("UPDATE role_state SET status='free', user_id=NULL, bot_managed=0, legacy_marker='' WHERE chat_id=? AND role_key=?", (message.chat.id, key)),
+        conn.execute("UPDATE group_members SET role_key=NULL, role_name=NULL, tag='', tag_set_by_bot=1 WHERE chat_id=? AND user_id=?", (message.chat.id, user_id)),
+        conn.commit()
+    ))
+    await update_group_roster(message.chat.id)
+    await message.reply(f"✅ Роль «{role['name']}» освобождена.")
+
+
+@dp.message(Command("bind_group"))
+async def bind_group_cmd(message: Message):
+    if message.chat.type not in {"group","supergroup"} or not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    bind_group(message.chat, message.chat.title or "")
+    await message.reply(f"✅ Группа привязана.\nChat ID: {message.chat.id}")
+
+
+@dp.message(Command("bind_info"))
+async def bind_info_from_group(message: Message):
+    if message.chat.type not in {"group","supergroup"} or not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    await message.reply("Для инфоканала используйте /bind_info прямо в самом канале.")
+
+
+@dp.channel_post(Command("bind_info"))
+async def bind_info_channel(message: Message):
+    # For channel posts, verify that the configured owner is an administrator of this channel.
+    try:
+        admins = await bot.get_chat_administrators(message.chat.id)
+        if not any(a.user.id == ADMIN_ID for a in admins):
+            return
+    except Exception:
+        logger.exception("Could not verify info-channel admin")
+        return
+    group = bind_info_channel_db(message.chat.id)
+    await message.answer("✅ Инфоканал привязан." if hasattr(message,"answer") else None)
+
+
+@dp.message(Command("id"))
+async def ids_group(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    reply_id = message.reply_to_message.message_id if message.reply_to_message else "—"
+    await message.reply(f"🆔 Chat ID: {message.chat.id}\nMessage ID (если ответ): {reply_id}\nВаш ID: {message.from_user.id}")
+
+
+async def capture_list_from_message(message: Message, slot: str, source: Message):
+    if source.chat.type != "channel":
+        await message.reply("Нужно отвечать командой на сообщение именно в инфоканале.")
+        return
+    store_roster_source(source.chat.id, slot, source)
+    await message.reply(f"✅ Список {slot} сохранён.\nMessage ID: {source.message_id}\nCustom emoji сущностей: {len([e for e in (source.entities or []) if getattr(e,'type',None)=='custom_emoji'])}")
+
+
+@dp.channel_post(Command("capture_list"))
+async def capture_list_channel(message: Message):
+    try:
+        admins = await bot.get_chat_administrators(message.chat.id)
+        if not any(a.user.id == ADMIN_ID for a in admins):
+            return
+    except Exception:
+        logger.exception("Could not verify channel admin for capture_list")
+        return
+    if not message.reply_to_message:
+        await message.answer("Ответьте /capture_list 40 или /capture_list 41 на нужное сообщение списка.")
+        return
+    parts = (message.text or "").split()
+    slot = parts[1] if len(parts) > 1 else "40"
+    await capture_list_from_message(message,slot,message.reply_to_message)
+
+
+@dp.message(Command("capture_list"))
+async def capture_list_group(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    if not message.reply_to_message:
+        await message.reply("Ответьте этой командой на сообщение, которое нужно сохранить.")
+        return
+    if message.reply_to_message.chat.type != "channel":
+        await message.reply("Сообщение-источник должно находиться в инфоканале.")
+        return
+    await capture_list_from_message(message,(message.text or "/capture_list 40").split()[1],message.reply_to_message)
+
+
+@dp.message(Command("sync_list"))
+async def sync_list_cmd(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    group = get_managed_group()
+    if not group:
+        await message.reply("Сначала привяжите тестовую группу через /bind_group.")
+        return
+    await update_group_roster(group["group_chat_id"])
+    await message.reply("✅ Список синхронизирован.")
+
+
+@dp.message(Command("help"))
+async def help_cmd(message: Message):
+    text = (
+        "♡₊˚ Помощь бота ˚₊♡\n\n"
+        "Для участников:\n"
+        "• /start — открыть меню обратной связи\n"
+        "• /help — показать эту справку\n"
+        "• /cancel — отменить текущее действие\n"
+        "• /roles — занятые, желаемые и забронированные роли\n"
+        "• /free_roles — только свободные роли\n"
+        "• /all_roles — полный каталог ролей\n"
+        "• /mafia — открыть/показать лобби мафии\n"
+        "• /mafia_leave — выйти из лобби\n\n"
+            )
+    if is_group_admin_user(message):
+        text += (
+            "\nДля администратора:\n"
+            "• /setrole — назначить Telegram-тег участнику\n"
+            "• /release — снять роль и освободить её\n"
+            "• /syncroles — перепроверить реальные теги участников\n"
+            "• /checkbot — проверить права бота\n"
+            "• /member — информация об участнике\n"
+            "• /pending — список ожидающих подтверждения\n"
+            "• /mafia_ban / /mafia_unban — игровой запрет\n"
+            "• /bind_group / /bind_info / /capture_list / /sync_list — управление источником списка\n"
+            "• /admin — админ-панель обратной связи\n"
+        )
+    await message.reply(text)
+
+
+@dp.message(Command("roles"))
+async def role_list_cmd(message: Message):
+    if not _is_group_message(message):
+        await message.reply("Эту команду используйте в группе.")
+        return
+    rows = roster_rows_for(message.chat.id)
+    if not rows and message.chat.id == TEST_ROSTER_CHANNEL_ID:
+        migrate_group_state()
+        rows = roster_rows_for(message.chat.id)
+    status_rows = [r for r in rows if (r["user_id"] is not None or r["status"] in {STATUS_WANTED, STATUS_RESERVED, STATUS_TAKEN})]
+    if not status_rows:
+        await message.reply("🎭 Сейчас нет занятых, желаемых или забронированных ролей.")
+        return
+    by_region = {region: [] for _, region in ROLE_CATALOG}
+    role_region = {normalize_role(name): region for name, _e, region in ROLE_CATALOG}
+    for row in status_rows:
+        region = role_region.get(row["role_key"], "Другое")
+        marker = STATUS_MARKER.get(STATUS_TAKEN if row["user_id"] is not None else row["status"], "")
+        by_region.setdefault(region, []).append(f"{row['role_name']} - {marker}")
+    lines = ["🎭 Роли со статусом"]
+    for region, entries in by_region.items():
+        if entries:
+            lines.append(region + ":")
+            lines.extend(entries)
+    lines.append(f"\nРолей со статусом: {len(status_rows)} из {len(ROLE_CATALOG)}")
+    await message.reply("\n".join(lines))
+
+
+@dp.message(Command("free_roles"))
+async def free_roles_cmd(message: Message):
+    if not _is_group_message(message):
+        await message.reply("Эту команду используйте в группе.")
+        return
+    rows = roster_rows_for(message.chat.id)
+    occupied = {r["role_key"] for r in rows if r["user_id"] is not None or r["status"] in {STATUS_TAKEN, STATUS_WANTED, STATUS_RESERVED}}
+    free = [name for name, _e, _region in ROLE_CATALOG if normalize_role(name) not in occupied]
+    await message.reply("Свободные роли:\n\n" + "\n".join(f"• {name}" for name in free) if free else "Свободных ролей нет.")
+
+
+@dp.message(Command("all_roles"))
+async def all_roles_cmd(message: Message):
+    if not _is_group_message(message):
+        await message.reply("Эту команду используйте в группе.")
+        return
+    await message.reply(f"Каталог ролей: {len(ROLE_CATALOG)}\n\n" + "\n".join(f"• {name}" for name, _e, _r in ROLE_CATALOG))
+
+
+@dp.message(Command("syncroles"))
+async def sync_roles_cmd(message: Message):
+    if not _is_group_message(message):
+        await message.reply("Эту команду используйте в группе.")
+        return
+    if not is_group_admin_user(message):
+        await message.reply("Нет доступа.")
+        return
+    rows = group_db_op(lambda conn: conn.execute("SELECT user_id FROM group_members WHERE chat_id=? AND active=1", (message.chat.id,)).fetchall())
+    checked = 0
+    for row in rows:
+        await sync_member_tag(message.chat.id, row["user_id"], refresh_roster=False)
+        checked += 1
+    await update_group_roster(message.chat.id)
+    await message.reply(f"🔄 Синхронизация завершена. Проверено участников: {checked}.\nИсточником занятости считаются реальные Telegram-теги.")
+
+
+@dp.message(Command("checkbot"))
+async def check_bot_cmd(message: Message):
+    if not _is_group_message(message):
+        return
+    if not is_group_admin_user(message):
+        return
+    try:
+        me = await bot.get_me()
+        member = await bot.get_chat_member(message.chat.id, me.id)
+        lines = [f"🤖 Бот: @{me.username or me.id}", f"Статус: {member.status}"]
+        if member.status == "administrator":
+            lines += [
+                f"can_manage_tags: {'✅' if getattr(member, 'can_manage_tags', False) else '❌'}",
+                f"can_restrict_members: {'✅' if getattr(member, 'can_restrict_members', False) else '❌'}",
+                f"can_delete_messages: {'✅' if getattr(member, 'can_delete_messages', False) else '❌'}",
+            ]
+        await message.reply("\n".join(lines))
+    except Exception as exc:
+        await message.reply(f"❌ Не удалось проверить права: {exc}")
+
+
+@dp.message(Command("pending"))
+async def pending_cmd(message: Message):
+    if not _is_group_message(message):
+        return
+    if not is_group_admin_user(message):
+        return
+    rows = group_db_op(lambda conn: conn.execute("SELECT * FROM group_members WHERE chat_id=? AND active=1 AND confirmed=0 ORDER BY joined_at DESC LIMIT 50", (message.chat.id,)).fetchall())
+    if not rows:
+        await message.reply("Ожидающих подтверждения нет.")
+        return
+    lines = ["Ожидают подтверждения:"]
+    for row in rows:
+        who = f"@{row['username']}" if row['username'] else row['first_name']
+        lines.append(f"• {who} | {row['user_id']} | {row['role_name'] or 'роль не назначена'}")
+    await message.reply("\n".join(lines))
+
+
+@dp.message(Command("member"))
+async def member_info_cmd(message: Message):
+    if not _is_group_message(message):
+        return
+    if not is_group_admin_user(message):
+        return
+    target = message.reply_to_message.from_user if message.reply_to_message and message.reply_to_message.from_user else None
+    if not target:
+        parts = (message.text or "").split()
+        row = find_group_member(message.chat.id, parts[1]) if len(parts) == 2 and parts[1].startswith("@") else None
+    else:
+        row = get_member(message.chat.id, target.id)
+    if not row:
+        await message.reply("Участник не найден в журнале.")
+        return
+    await message.reply(
+        f"👤 {('@'+row['username']) if row['username'] else row['first_name']}\n"
+        f"ID: {row['user_id']}\n"
+        f"Роль: {row['role_name'] or '—'}\n"
+        f"Тег: {row['tag'] or '—'}\n"
+        f"Подтверждение: {'да' if row['confirmed'] else 'нет'}\n"
+        f"Активен: {'да' if row['active'] else 'нет'}"
+    )
+
+
+# =========================================================
+# MAFIA
+# =========================================================
+
+def mafia_open_game(chat_id):
+    return group_db_op(lambda conn: conn.execute("SELECT * FROM mafia_games WHERE chat_id=? AND status IN ('WAITING','RUNNING') LIMIT 1", (chat_id,)).fetchone())
+
+
+def mafia_player_rows(game_id):
+    return group_db_op(lambda conn: conn.execute("SELECT * FROM mafia_players WHERE game_id=? ORDER BY joined_at", (game_id,)).fetchall())
+
+
+def mafia_is_banned(chat_id, user_id):
+    return bool(group_db_op(lambda conn: conn.execute("SELECT 1 FROM mafia_bans WHERE chat_id=? AND user_id=?", (chat_id,user_id)).fetchone()))
+
+
+def mafia_lobby_text(game):
+    players = mafia_player_rows(game["id"])
+    lines = ["🎭 МАФИЯ", "", f"Игроков: {len(players)}/5", "", "Создатель: " + str(game["creator_id"]), ""]
+    if players:
+        lines.extend([f"{i}. {('@'+p['username']) if p['username'] else p['first_name']}" for i,p in enumerate(players,1)])
+    else:
+        lines.append("Пока никто не вошёл.")
+    lines += ["", "Минимум для старта: 5 игроков."]
+    return "\n".join(lines)
+
+
+def mafia_kb(game_id, can_start=False, can_stop=False):
+    rows = [[InlineKeyboardButton(text="🎮 Вступить", callback_data=f"mf:join:{game_id}"), InlineKeyboardButton(text="🚪 Выйти", callback_data=f"mf:leave:{game_id}")]]
+    if can_start:
+        rows.append([InlineKeyboardButton(text="▶️ Начать", callback_data=f"mf:start:{game_id}")])
+    if can_stop:
+        rows.append([InlineKeyboardButton(text="⛔ Отменить", callback_data=f"mf:stop:{game_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def mafia_create_game(chat_id, creator):
+    def op(conn):
+        existing = conn.execute("SELECT * FROM mafia_games WHERE chat_id=? AND status IN ('WAITING','RUNNING') LIMIT 1", (chat_id,)).fetchone()
+        if existing:
+            return existing
+        cur = conn.execute("INSERT INTO mafia_games(chat_id,creator_id,status,created_at) VALUES(?,?, 'WAITING',?)", (chat_id,creator.id,now()))
+        game_id = cur.lastrowid
+        conn.execute("INSERT INTO mafia_players(game_id,user_id,first_name,username,joined_at) VALUES(?,?,?,?,?)", (game_id,creator.id,creator.first_name or '',creator.username or '',now()))
+        conn.commit()
+        return conn.execute("SELECT * FROM mafia_games WHERE id=?", (game_id,)).fetchone()
+    return group_db_op(op)
+
+
+def mafia_join(game_id, user):
+    def op(conn):
+        game = conn.execute("SELECT * FROM mafia_games WHERE id=?", (game_id,)).fetchone()
+        if not game or game["status"] != "WAITING": return False, "Игра уже началась или закрыта."
+        banned = conn.execute("SELECT 1 FROM mafia_bans WHERE chat_id=? AND user_id=?", (game["chat_id"], user.id)).fetchone()
+        if banned: return False, "Вам запрещено участвовать в мафии."
+        exists = conn.execute("SELECT 1 FROM mafia_players WHERE game_id=? AND user_id=?", (game_id,user.id)).fetchone()
+        if exists: return False, "Вы уже в лобби."
+        conn.execute("INSERT INTO mafia_players(game_id,user_id,first_name,username,joined_at) VALUES(?,?,?,?,?)", (game_id,user.id,user.first_name or '',user.username or '',now()))
+        conn.commit()
+        return True, "Вы вошли в игру."
+    return group_db_op(op)
+
+
+def mafia_leave(game_id,user_id):
+    def op(conn):
+        game = conn.execute("SELECT * FROM mafia_games WHERE id=?", (game_id,)).fetchone()
+        if not game or game["status"] != "WAITING": return False, "Игра уже началась."
+        conn.execute("DELETE FROM mafia_players WHERE game_id=? AND user_id=?", (game_id,user_id))
+        conn.commit(); return True, "Вы вышли из лобби."
+    return group_db_op(op)
+
+
+def mafia_start(game_id):
+    import random
+    def op(conn):
+        game = conn.execute("SELECT * FROM mafia_games WHERE id=?", (game_id,)).fetchone()
+        if not game or game["status"] != "WAITING": return None, "Игра уже началась или закрыта."
+        players = conn.execute("SELECT * FROM mafia_players WHERE game_id=? ORDER BY joined_at", (game_id,)).fetchall()
+        if len(players) < 5: return None, "Нужно минимум 5 игроков."
+        if len(players) <= 6: mafia_count = 1
+        elif len(players) <= 9: mafia_count = 2
+        else: mafia_count = 3
+        roles = ["Мафия"] * mafia_count + ["Комиссар", "Доктор"] + ["Мирный"] * max(0, len(players) - mafia_count - 2)
+        random.shuffle(roles)
+        for p, role in zip(players, roles):
+            conn.execute("UPDATE mafia_players SET role=? WHERE game_id=? AND user_id=?", (role,game_id,p["user_id"]))
+        conn.execute("UPDATE mafia_games SET status='RUNNING',started_at=? WHERE id=?", (now(),game_id)); conn.commit()
+        return conn.execute("SELECT * FROM mafia_games WHERE id=?", (game_id,)).fetchone(), players
+    return group_db_op(op)
+
+
+def mafia_stop(game_id):
+    return group_db_op(lambda conn: conn.execute("UPDATE mafia_games SET status='FINISHED',finished_at=? WHERE id=? AND status IN ('WAITING','RUNNING')", (now(),game_id)).rowcount > 0)
+
+
+@dp.message(Command("mafia"))
+async def mafia_cmd(message: Message):
+    if message.chat.type not in {"group", "supergroup"}: return
+    if not message.from_user:
+        return
+    if mafia_is_banned(message.chat.id, message.from_user.id):
+        await message.reply("🚫 Вам запрещено участвовать в мафии.")
+        return
+    game = mafia_open_game(message.chat.id)
+    if not game:
+        game = mafia_create_game(message.chat.id, message.from_user)
+    players = mafia_player_rows(game["id"])
+    can_start = len(players) >= 5 and (message.from_user.id == game["creator_id"] or message.from_user.id == ADMIN_ID)
+    can_stop = message.from_user.id in {game["creator_id"], ADMIN_ID}
+    await message.reply(mafia_lobby_text(game), reply_markup=mafia_kb(game["id"],can_start,can_stop))
+
+
+@dp.message(Command("mafia_leave"))
+async def mafia_leave_cmd(message: Message):
+    game = mafia_open_game(message.chat.id)
+    if not game:
+        await message.reply("Сейчас нет активного лобби."); return
+    ok, text = mafia_leave(game["id"], message.from_user.id)
+    await message.reply(text)
+
+
+@dp.message(Command("mafia_ban"))
+async def mafia_ban_cmd(message: Message):
+    if not is_group_admin_user(message): return
+    parts=(message.text or '').split()
+    target_id=None
+    if message.reply_to_message and message.reply_to_message.from_user: target_id=message.reply_to_message.from_user.id
+    elif len(parts)>=2 and parts[1].startswith('@'):
+        row=get_user_by_username(parts[1]); target_id=row['user_id'] if row else None
+    if not target_id:
+        await message.reply('Использование: /mafia_ban @username или ответом на сообщение.'); return
+    group_db_op(lambda conn: conn.execute("INSERT OR REPLACE INTO mafia_bans(chat_id,user_id,banned_by,reason,created_at) VALUES(?,?,?,?,?)", (message.chat.id,target_id,ADMIN_ID,'',now())))
+    await message.reply('🚫 Пользователь запрещён в мафии.')
+
+
+@dp.message(Command("mafia_unban"))
+async def mafia_unban_cmd(message: Message):
+    if not is_group_admin_user(message): return
+    parts=(message.text or '').split()
+    target_id=None
+    if message.reply_to_message and message.reply_to_message.from_user: target_id=message.reply_to_message.from_user.id
+    elif len(parts)>=2 and parts[1].startswith('@'):
+        row=get_user_by_username(parts[1]); target_id=row['user_id'] if row else None
+    if not target_id: await message.reply('Использование: /mafia_unban @username или ответом на сообщение.'); return
+    group_db_op(lambda conn: conn.execute("DELETE FROM mafia_bans WHERE chat_id=? AND user_id=?", (message.chat.id,target_id)))
+    await message.reply('✅ Запрет на мафию снят.')
+
+
+@dp.callback_query(F.data.startswith("mf:"))
+async def mafia_callback(callback: CallbackQuery):
+    parts=(callback.data or '').split(':')
+    if len(parts)!=3: await safe_callback_answer(callback,'Некорректная кнопка.',True); return
+    action, game_raw = parts[1], parts[2]
+    try: game_id=int(game_raw)
+    except ValueError: await safe_callback_answer(callback,'Некорректная игра.',True); return
+    game=group_db_op(lambda conn: conn.execute('SELECT * FROM mafia_games WHERE id=?',(game_id,)).fetchone())
+    if not game: await safe_callback_answer(callback,'Игра не найдена.',True); return
+    if action=='join':
+        ok,text=mafia_join(game_id,callback.from_user); await safe_callback_answer(callback,text,not ok)
+    elif action=='leave':
+        ok,text=mafia_leave(game_id,callback.from_user.id); await safe_callback_answer(callback,text,not ok)
+    elif action=='start':
+        if callback.from_user.id not in {game['creator_id'], ADMIN_ID}: await safe_callback_answer(callback,'Нет доступа.',True); return
+        result=mafia_start(game_id)
+        if result[0] is None: await safe_callback_answer(callback,result[1],True); return
+        started_game, players=result
+        for p in mafia_player_rows(game_id):
+            try:
+                await bot.send_message(p['user_id'], f"🎭 МАФИЯ\n\nВаша роль: {p['role']}\n\nНе показывайте её другим игрокам.")
+            except (TelegramForbiddenError, TelegramNotFound):
+                pass
+            except Exception: logger.exception('Failed to DM mafia role | user=%s',p['user_id'])
+        await callback.message.edit_text(f"🎭 МАФИЯ НАЧАЛАСЬ\n\nИгроков: {len(players)}\nРоли розданы. Проверьте личные сообщения бота.")
+        await safe_callback_answer(callback,'Игра запущена.')
+        return
+    elif action=='stop':
+        if callback.from_user.id not in {game['creator_id'], ADMIN_ID}: await safe_callback_answer(callback,'Нет доступа.',True); return
+        mafia_stop(game_id); await safe_callback_answer(callback,'Игра отменена.',True)
+    game=mafia_open_game(callback.message.chat.id)
+    if game:
+        players=mafia_player_rows(game['id'])
+        can_start=len(players)>=5 and callback.from_user.id in {game['creator_id'],ADMIN_ID}
+        can_stop=callback.from_user.id in {game['creator_id'],ADMIN_ID}
+        with suppress(Exception): await callback.message.edit_text(mafia_lobby_text(game),reply_markup=mafia_kb(game['id'],can_start,can_stop))
+
+
 # =========================================================
 # COMMANDS
 # =========================================================
 
 async def setup_commands():
-
     user_commands = [
-        BotCommand(
-            command="start",
-            description="Открыть меню",
-        ),
-        BotCommand(
-            command="cancel",
-            description="Отменить действие",
-        ),
+        BotCommand(command="start", description="Открыть меню"),
+        BotCommand(command="help", description="Все команды"),
+        BotCommand(command="cancel", description="Отменить действие"),
+        BotCommand(command="roles", description="Занятые/статусные роли"),
+        BotCommand(command="free_roles", description="Свободные роли"),
+        BotCommand(command="all_roles", description="Все 148 ролей"),
+        BotCommand(command="mafia", description="Открыть мафию"),
+        BotCommand(command="mafia_leave", description="Выйти из мафии"),
     ]
-
-    admin_commands = [
-        BotCommand(
-            command="start",
-            description="Открыть меню",
-        ),
-        BotCommand(
-            command="cancel",
-            description="Отменить действие",
-        ),
-        BotCommand(
-            command="admin",
-            description="Панель администратора",
-        ),
+    admin_commands = user_commands + [
+        BotCommand(command="admin", description="Панель администратора"),
+        BotCommand(command="id", description="Показать ID чата/сообщения"),
+        BotCommand(command="syncroles", description="Синхронизировать роли"),
+        BotCommand(command="checkbot", description="Проверить права бота"),
+        BotCommand(command="setrole", description="Назначить роль участнику"),
+        BotCommand(command="release", description="Освободить роль"),
+        BotCommand(command="member", description="Информация об участнике"),
+        BotCommand(command="mafia_ban", description="Запретить мафию"),
+        BotCommand(command="mafia_unban", description="Снять запрет мафии"),
+        BotCommand(command="bind_group", description="Привязать группу"),
+        BotCommand(command="bind_info", description="Привязать список"),
     ]
-
-    await bot.set_my_commands(
-        user_commands,
-        scope=BotCommandScopeDefault(),
-    )
-
-    await bot.set_my_commands(
-        admin_commands,
-        scope=BotCommandScopeChat(
-            chat_id=ADMIN_ID,
-        ),
-    )
-
-    logger.info(
-        "Commands configured."
-    )
+    await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+    await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    logger.info("Commands configured.")
 
 
 # =========================================================
@@ -3919,6 +5416,8 @@ async def main():
 
     init_db()
     migrate_db()
+    init_group_db()
+    migrate_group_state()
 
     DELIVERY_QUEUE = asyncio.Queue()
     BROADCAST_QUEUE = asyncio.Queue()
