@@ -10,10 +10,9 @@ TREE = ast.parse(SRC)
 
 def test_command_matrix_and_routing():
     required = [
-        'help','roles','mafia','mafia_leave',
-        'setrole','syncroles','role',
-        'game_poll',
-        'manage_commands','addcommand','delcommand','commands','bindrole'
+        'help','mafia','mafia_leave',
+        'setrole','syncroles','game_poll','schedule',
+        'manage_commands','addcommand','delcommand','commands','bindrole','roles_audit'
     ]
     handlers = set(re.findall(r'@dp\.message\(Command\("([a-z0-9_]+)"\)', SRC))
     assert not [x for x in required if x not in handlers]
@@ -107,6 +106,7 @@ def test_role_persistence_and_member_lookup():
     assert 'role_for_tag(actual_tag)' in SRC
     assert 'Роль участника:' in SRC
     assert 'async def bindrole_private_command' in SRC
+    assert 'async def roles_audit_cmd' in SRC
     assert 'async def sign_assigned_role_private' in SRC
 
 
@@ -122,8 +122,56 @@ def test_game_poll_has_real_lookup_and_no_refresh_button():
 
 
 def test_removed_commands_are_really_gone():
-    for old in ("member", "release", "schedule_set", "mafia_ban", "mafia_unban"):
+    for old in ("member", "release", "schedule_set", "mafia_ban", "mafia_unban", "roles", "role", "pending"):
         assert f'@dp.message(Command("{old}"))' not in SRC
         assert f'BotCommand(command="{old}"' not in SRC
     for marker in ("/release", "/member", "/schedule_set", "/mafia_ban", "/mafia_unban"):
         assert marker not in SRC
+    assert '@dp.message(Command("roles"))' not in SRC
+    assert '@dp.message(Command("pending"))' not in SRC
+
+
+def test_primary_chat_and_poll_finish_behavior():
+    assert 'PRIMARY_CHAT_ID = int(os.getenv("PRIMARY_CHAT_ID", "-1004313546398") or "-1004313546398")' in SRC
+    assert 'def is_primary_chat(chat_id: int)' in SRC
+    assert 'if not is_primary_chat(message.chat.id)' in SRC
+    assert 'await bot.unpin_chat_message' in SRC
+    assert '"status=\'CLOSED\'"' not in SRC  # status is parameterized in SQL
+    assert "UPDATE game_polls SET status='CLOSED'" in SRC
+    assert 'parent_poll_id' in SRC
+    assert 'tie_round' in SRC
+    assert 'gp:r:' in SRC
+    assert 'Повторная ничья. Администратор выбирает победителя' in SRC
+    assert 'За неё проголосовали:' in SRC
+
+
+def test_schedule_does_not_auto_launch_game_commands():
+    segment = SRC[SRC.find('async def schedule_worker():'):SRC.find('# =========================================================\n# MAFIA')]
+    assert 'launch_text' not in segment
+    assert "send_message(\n                                    chat_id" in segment
+    assert 'через 30 минут' in segment
+
+
+def test_removed_menu_commands_are_not_exposed():
+    exposed = [
+        'mafia_ban','mafia_unban','member','release','schedule_set',
+        'schedule_remove','game','status','me','games','pending','game_add','game_remove'
+    ]
+    for old in exposed:
+        assert f'BotCommand(command="{old}"' not in SRC
+        assert f'@dp.message(Command("{old}"))' not in SRC
+
+def test_primary_chat_id_and_role_aliases():
+    assert 'PRIMARY_CHAT_ID = int(os.getenv("PRIMARY_CHAT_ID", "-1004313546398") or "-1004313546398")' in SRC
+    assert '("Ной", "Noy")' in SRC
+    assert '_compact_role_key' in SRC
+    assert 'role_text=remainder' in SRC
+    assert 'roles_audit' in SRC
+
+
+def test_final_command_exposure():
+    exposed = set(re.findall(r'BotCommand\(command="([a-z0-9_]+)"', SRC))
+    expected = {'help','mafia','mafia_leave','schedule','game_poll','setrole','syncroles','manage_commands','addcommand','delcommand','commands','bindrole','roles_audit'}
+    assert expected.issubset(exposed)
+    forbidden = {'roles','role','member','release','pending','game','status','me','games','tonight','nextgame','games_history','stats','players','game_add','game_remove','schedule_set','schedule_remove','mafia_ban','mafia_unban'}
+    assert not (exposed & forbidden)

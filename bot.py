@@ -1,5 +1,6 @@
 import asyncio
 import json
+import html
 import logging
 import os
 import re
@@ -55,6 +56,7 @@ from aiogram.types import (
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
 ADMIN_ID = 1682289834
+PRIMARY_CHAT_ID = int(os.getenv("PRIMARY_CHAT_ID", "-1004313546398") or "-1004313546398")
 
 DB_PATH = os.getenv("DB_PATH", "users.db").strip() or "users.db"
 PORT = int(os.getenv("PORT", "10000"))
@@ -584,7 +586,9 @@ def init_group_db():
             CREATE TABLE IF NOT EXISTS game_polls (
                 id INTEGER PRIMARY KEY AUTOINCREMENT, chat_id INTEGER NOT NULL, created_by INTEGER NOT NULL,
                 created_at TEXT NOT NULL, expires_at TEXT NOT NULL, message_id INTEGER,
-                status TEXT NOT NULL DEFAULT 'OPEN', winner_game_id INTEGER
+                status TEXT NOT NULL DEFAULT 'OPEN', winner_game_id INTEGER,
+                options_json TEXT NOT NULL DEFAULT '', tie_round INTEGER NOT NULL DEFAULT 0,
+                parent_poll_id INTEGER
             );
             CREATE UNIQUE INDEX IF NOT EXISTS idx_open_game_poll_chat ON game_polls(chat_id) WHERE status='OPEN';
             CREATE TABLE IF NOT EXISTS game_poll_votes (
@@ -651,6 +655,13 @@ def migrate_group_state():
         mafia_cols = {row["name"] for row in conn.execute("PRAGMA table_info(mafia_games)").fetchall()}
         if "lobby_message_id" not in mafia_cols:
             conn.execute("ALTER TABLE mafia_games ADD COLUMN lobby_message_id INTEGER")
+        poll_cols = {row["name"] for row in conn.execute("PRAGMA table_info(game_polls)").fetchall()}
+        if "options_json" not in poll_cols:
+            conn.execute("ALTER TABLE game_polls ADD COLUMN options_json TEXT NOT NULL DEFAULT ''")
+        if "tie_round" not in poll_cols:
+            conn.execute("ALTER TABLE game_polls ADD COLUMN tie_round INTEGER NOT NULL DEFAULT 0")
+        if "parent_poll_id" not in poll_cols:
+            conn.execute("ALTER TABLE game_polls ADD COLUMN parent_poll_id INTEGER")
 
         cols = {row["name"] for row in conn.execute("PRAGMA table_info(role_state)").fetchall()}
         if "status" not in cols:
@@ -4086,7 +4097,7 @@ _ROLE_GROUPS = [
         ("Алёша", "Alyosha"), ("Арлекино", "Arlecchino"), ("Валера", "Valera"),
         ("Весна", "Vesna"), ("Водяница", "Vodyanitsa"), ("Даника", "Danika"),
         ("Дотторе", "Dottore"), ("Капитано", "Capitano"), ("Митя", "Mitya"),
-        ("Ной", "Noah"), ("Одетта", "Odette"), ("Панталоне", "Pantalone"),
+        ("Ной", "Noy"), ("Одетта", "Odette"), ("Панталоне", "Pantalone"),
         ("Пьеро", "Pierro"), ("Пульчинелла", "Pulcinella"), ("Сандроне", "Sandrone"),
         ("Синьора", "Signora"), ("Тарталья", "Tartaglia"), ("Царица", "Tsaritsa"),
     ]),
@@ -4121,8 +4132,23 @@ def normalize_role(value):
     return " ".join((value or "").casefold().replace("ё", "е").split())
 
 
+def _compact_role_key(value):
+    return re.sub(r"[^a-zа-я0-9]+", "", (value or "").casefold().replace("ё", "е"))
+
+
 def role_for(value):
-    return ROLE_BY_KEY.get(normalize_role(value))
+    key = normalize_role(value)
+    exact = ROLE_BY_KEY.get(key)
+    if exact:
+        return exact
+    compact = _compact_role_key(value)
+    if not compact:
+        return None
+    matches=[]
+    for name, english, region in ROLE_CATALOG:
+        if _compact_role_key(name)==compact or _compact_role_key(english)==compact:
+            matches.append({"name": name, "english": english, "region": region})
+    return matches[0] if len(matches)==1 else None
 
 
 def _stylize_latin(text):
@@ -4564,6 +4590,8 @@ def _chat_member_is_active(member) -> bool:
 
 @dp.chat_member()
 async def group_member_update(event: ChatMemberUpdated):
+    if not is_primary_chat(event.chat.id):
+        return
     global last_polling_activity
     last_polling_activity = datetime.now(timezone.utc)
     old_status = event.old_chat_member.status
@@ -4688,6 +4716,8 @@ async def group_confirm(callback: CallbackQuery):
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}), F.text.regexp(r"(?is)^\s*(?!/)(?!калл(?:\s|$)).+"))
 async def group_passive_member_sync(message: Message):
+    if not is_primary_chat(message.chat.id):
+        return
     if DEBUG_GROUP_UPDATES:
         logger.info("DEBUG_GROUP_UPDATE chat=%s type=%s msg=%s from=%s cmd=%s entities=%r text=%r", message.chat.id, message.chat.type, message.message_id, getattr(message.from_user, "id", None), extract_command_from_message(message), [(getattr(e,"type",None),getattr(e,"offset",None),getattr(e,"length",None)) for e in (message.entities or [])], (message.text or "")[:200])
     if has_bot_command_entity(message):
@@ -4821,6 +4851,9 @@ async def bind_role_from_private_admin(message: Message):
         await message.reply("𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nНе удалось найти этот чат. Укажи корректный CHAT_ID.")
         return
 
+    if not is_primary_chat(chat_id):
+        await message.reply("𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nЭтот чат не является основным чатом бота.")
+        return
     role = role_for(role_text)
     if not role:
         await message.reply(f"𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nРоль «{role_text}» не найдена в каталоге 148 ролей.")
@@ -4919,24 +4952,32 @@ async def _active_member_from_username(chat_id: int, username: str):
 
 @dp.message(Command("setrole"))
 async def setrole_cmd(message: Message):
-    if not _is_group_message(message) or not is_group_admin_user(message): return
-    parts=(message.text or "").split(maxsplit=2)
+    if not require_primary_group(message) or not is_group_admin_user(message):
+        return
+    text=(message.text or "").strip()
+    m=re.match(r"^\s*/setrole(?:@[A-Za-z0-9_]+)?(?:\s+|$)", text, re.IGNORECASE)
+    remainder=text[m.end():].strip() if m else ""
     target=None; role_text=""
     if message.reply_to_message and message.reply_to_message.from_user:
         target=message.reply_to_message.from_user
-        role_text=parts[1] if len(parts)>1 else ""
-    elif len(parts)>=3:
-        target_text=parts[1]; role_text=parts[2]
-        if target_text.startswith("@"):
-            row=find_group_member(message.chat.id,target_text); target=_user_object_from_row(row) if row else None
-        elif target_text.lstrip("-").isdigit():
-            with suppress(Exception): target=(await bot.get_chat_member(message.chat.id,int(target_text))).user
+        role_text=remainder
+    else:
+        parts=remainder.split(maxsplit=1)
+        if len(parts)==2:
+            target_text,role_text=parts
+            if target_text.startswith("@"):
+                row=find_group_member(message.chat.id,target_text)
+                target=_user_object_from_row(row) if row else None
+                if not target:
+                    target=await resolve_target_user(message.chat.id,target_text)
+            elif target_text.lstrip("-").isdigit():
+                with suppress(Exception): target=(await bot.get_chat_member(message.chat.id,int(target_text))).user
     if not target or not role_text:
         await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nОтветьте на сообщение участника: /setrole Роль\nИли: /setrole @username Роль")
         return
     role=role_for(role_text)
     if not role:
-        await message.reply(f"𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nРоль «{role_text}» не найдена.")
+        await message.reply(f"𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nРоль «{role_text}» не найдена в каталоге 148 ролей.")
         return
     try:
         cm=await bot.get_chat_member(message.chat.id,target.id)
@@ -4971,8 +5012,8 @@ def _normalize_custom_command_name(value: str) -> str:
 
 
 BUILTIN_COMMANDS = {
-    "help", "roles", "mafia", "mafia_leave",
-    "syncroles", "role", "game_poll", "schedule_set",
+    "help", "mafia", "mafia_leave",
+    "syncroles", "game_poll", "schedule",
     "manage_commands", "addcommand", "delcommand", "commands",
     "bindrole", "setrole",
 }
@@ -5136,7 +5177,7 @@ async def commands_cmd(message: Message):
     if message.chat.type != "private" or not message.from_user or message.from_user.id != ADMIN_ID:
         return
     rows = get_custom_commands()
-    lines = ["𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦", "", "Встроенные:", "/help", "/roles", "/mafia", "/mafia_leave", "/setrole", "/syncroles", "/role", "/game_poll"]
+    lines = ["𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦", "", "Встроенные:", "/help", "/mafia", "/mafia_leave", "/game_poll", "/setrole", "/syncroles", "/schedule"]
     lines += ["", "Пользовательские:"]
     if rows:
         for row in rows:
@@ -5148,10 +5189,11 @@ async def commands_cmd(message: Message):
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
+    if message.chat.type in {"group", "supergroup"} and not is_primary_chat(message.chat.id):
+        return
     text=(
         "𝗛𝗘𝗟𝗣\n\n"
         "Основные команды\n"
-        "/roles — назначенные роли\n"
         "/mafia — открыть лобби MafiaAzBot\n"
         "/mafia_leave — выйти из лобби\n"
     )
@@ -5165,7 +5207,7 @@ async def help_cmd(message: Message):
     if message.chat.type=="private" and message.from_user and message.from_user.id==ADMIN_ID:
         text += (
             "\n𝗟𝗦 𝗔𝗗𝗠𝗜𝗡\n"
-            "/manage_commands\n/addcommand\n/delcommand\n/commands\n/bindrole\n"
+            "/manage_commands\n/addcommand\n/delcommand\n/commands\n/bindrole\n/roles_audit\n"
         )
     custom=get_custom_commands()
     visible=[r for r in custom if _custom_command_allowed(r,message)]
@@ -5174,45 +5216,32 @@ async def help_cmd(message: Message):
     await message.reply(text)
 
 
-@dp.message(Command("roles"))
-async def role_list_cmd(message: Message):
-    if not _is_group_message(message):
-        await message.reply("Эту команду используйте в группе.")
+@dp.message(Command("roles_audit"), F.chat.type == "private")
+async def roles_audit_cmd(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
         return
-    # Refresh every participant already known to the bot so the result reflects
-    # the current Telegram tag, not stale local role_name data.
-    known = group_db_op(lambda conn: conn.execute(
-        "SELECT user_id FROM group_members WHERE chat_id=? AND active=1",
-        (message.chat.id,)
-    ).fetchall())
-    for item in known:
-        try:
-            await sync_member_tag(message.chat.id, int(item["user_id"]), force=True)
-        except Exception:
-            logger.exception("Role list live sync failed | chat=%s user=%s", message.chat.id, item["user_id"])
-    rows=group_db_op(lambda conn: conn.execute(
-        "SELECT user_id,username,first_name,role_name,tag FROM group_members WHERE chat_id=? AND active=1 AND role_key IS NOT NULL ORDER BY role_name COLLATE NOCASE",
-        (message.chat.id,)
-    ).fetchall())
-    lines=["𝗥𝗢𝗟𝗘𝗦","",f"Назначено ролей: {len(rows)}",""]
-    if not rows:
-        lines.append("Пока нет ролей, известных боту в этом чате.")
+    chat_id=PRIMARY_CHAT_ID
+    active=group_db_op(lambda conn: conn.execute("SELECT COUNT(*) AS n FROM group_members WHERE chat_id=? AND active=1",(chat_id,)).fetchone())["n"]
+    assigned=group_db_op(lambda conn: conn.execute("SELECT COUNT(*) AS n FROM group_members WHERE chat_id=? AND active=1 AND role_key IS NOT NULL",(chat_id,)).fetchone())["n"]
+    recent=group_db_op(lambda conn: conn.execute("SELECT h.user_id,h.role_name,h.event,h.created_at,COALESCE(m.username,m.first_name,CAST(h.user_id AS TEXT)) AS who FROM role_history h LEFT JOIN group_members m ON m.chat_id=h.chat_id AND m.user_id=h.user_id WHERE h.chat_id=? ORDER BY h.id DESC LIMIT 12",(chat_id,)).fetchall())
+    lines=["𝗥𝗢𝗟𝗘 𝗔𝗨𝗗𝗜𝗧","",f"Основной чат: {chat_id}",f"Активных участников: {active}",f"С назначенной ролью: {assigned}",f"Без роли: {active-assigned}","","Последние изменения:"]
+    if recent:
+        for r in recent:
+            who=f"@{r['who']}" if r['who'] and not str(r['who']).startswith('@') and not str(r['who']).isdigit() else str(r['who'])
+            lines.append(f"• {who} — {r['role_name']} ({r['event']})")
     else:
-        for row in rows:
-            who=f"@{row['username']}" if row['username'] else (row['first_name'] or str(row['user_id']))
-            lines.append(f"{row['role_name']} — {who}")
+        lines.append("• пока нет записей")
     await message.reply("\n".join(lines))
 
 
 @dp.message(Command("syncroles"))
 async def sync_roles_cmd(message: Message):
-    if not _is_group_message(message):
-        await message.reply("Эту команду используйте в группе.")
+    if not require_primary_group(message):
         return
     if not is_group_admin_user(message):
         await message.reply("𝗔𝗖𝗖𝗘𝗦𝗦\n\nУ вас нет прав для этой команды.")
         return
-    chat_id=message.chat.id
+    chat_id=PRIMARY_CHAT_ID
     known_ids=set()
     rows=group_db_op(lambda conn: conn.execute("SELECT user_id FROM group_members WHERE chat_id=? AND active=1",(chat_id,)).fetchall())
     known_ids.update(int(r["user_id"]) for r in rows)
@@ -5221,31 +5250,25 @@ async def sync_roles_cmd(message: Message):
         known_ids.update(int(m.user.id) for m in admins if getattr(m,"user",None))
     except Exception:
         logger.exception("Could not read administrators during role sync | chat=%s",chat_id)
-    checked=0; occupied=0; errors=0
+    checked=recognized=without_role=errors=0
     for user_id in sorted(known_ids):
         try:
             role=await sync_member_tag(chat_id,user_id,force=True)
             checked+=1
-            occupied+=1 if role else 0
+            if role: recognized+=1
+            else: without_role+=1
         except Exception:
             errors+=1
             logger.exception("Role sync failed | chat=%s user=%s",chat_id,user_id)
-    await message.reply(
-        "𝗥𝗢𝗟𝗘 𝗦𝗬𝗡𝗖\n\n"
-        f"Проверено известных участников: {checked}\n"
-        f"Занятых ролей найдено: {occupied}\n"
+    await message.reply("𝗥𝗢𝗟𝗘 𝗦𝗬𝗡𝗖\n\n"
+        f"Проверено участников: {checked}\n"
+        f"Ролей распознано: {recognized}\n"
+        f"Без распознанной роли: {without_role}\n"
         f"Ошибок проверки: {errors}\n\n"
-        "Роль определяется по фактическому Telegram-тегу участника и сохраняется в базе.\n"
-        "Telegram Bot API не предоставляет боту полный список участников группы, "
-        "поэтому полностью невидимые старые аккаунты невозможно перебрать автоматически. "
-        "После любого сообщения участника его tag можно определить и сохранить."
-    )
-
-
-@dp.message(Command("role"))
-async def role_info_alias_cmd(message: Message):
-    """Friendly alias for checking one participant's role."""
-    await member_info_cmd(message)
+        "Бот заново запросил актуальный Telegram-тег каждого известного участника, "
+        "сопоставил его с каталогом 148 ролей и сохранил результат.\n"
+        "Telegram Bot API не предоставляет универсальный список всех участников группы, "
+        "поэтому невидимые боту старые аккаунты нельзя перебрать одним запросом.")
 
 
 async def member_info_cmd(message: Message):
@@ -5422,6 +5445,60 @@ def compact_game_name(name, limit=24):
     value = str(name)
     return value if len(value) <= limit else value[: limit - 1] + "…"
 
+def is_primary_chat(chat_id: int) -> bool:
+    """Allow game/rolemembership features only in the single configured primary chat.
+    If PRIMARY_CHAT_ID is unset, a single managed group is accepted as the fallback.
+    """
+    if not chat_id:
+        return False
+    if PRIMARY_CHAT_ID:
+        return int(chat_id) == PRIMARY_CHAT_ID
+    try:
+        rows = group_db_op(lambda conn: conn.execute(
+            "SELECT group_chat_id FROM managed_group ORDER BY group_chat_id"
+        ).fetchall())
+        ids = [int(r["group_chat_id"]) for r in rows]
+        return len(ids) == 1 and ids[0] == int(chat_id)
+    except Exception:
+        return False
+
+def require_primary_group(message: Message) -> bool:
+    return _is_group_message(message) and is_primary_chat(message.chat.id)
+
+def poll_games(poll) -> list:
+    raw = (poll["options_json"] or "").strip() if poll else ""
+    if not raw:
+        return get_games()
+    try:
+        ids = [int(x) for x in json.loads(raw)]
+    except Exception:
+        return get_games()
+    if not ids:
+        return get_games()
+    placeholders = ",".join("?" for _ in ids)
+    return group_db_op(lambda conn: conn.execute(
+        f"SELECT * FROM game_catalog WHERE enabled=1 AND id IN ({placeholders}) ORDER BY id", ids
+    ).fetchall())
+
+def user_mention(user_id: int, name: str, username: str | None = None) -> str:
+    if username:
+        return f"@{html.escape(username)}"
+    safe_name = html.escape(name or f"ID {user_id}")
+    return f'<a href="tg://user?id={int(user_id)}">{safe_name}</a>'
+
+def poll_voter_mentions(poll_id: int, game_id: int) -> list[str]:
+    rows = group_db_op(lambda conn: conn.execute(
+        """SELECT v.user_id, COALESCE(m.first_name, u.first_name, '') AS first_name,
+                  COALESCE(m.username, u.username, '') AS username
+             FROM game_poll_votes v
+             LEFT JOIN group_members m ON m.chat_id=(SELECT chat_id FROM game_polls WHERE id=?) AND m.user_id=v.user_id
+             LEFT JOIN users u ON u.user_id=v.user_id
+             WHERE v.poll_id=? AND v.game_id=? ORDER BY v.voted_at""",
+        (poll_id, poll_id, game_id)
+    ).fetchall())
+    return [user_mention(int(r["user_id"]), r["first_name"], r["username"]) for r in rows]
+
+
 def game_poll_keyboard(poll_id, games, current_vote=None):
     rows = []
     for game in games:
@@ -5440,7 +5517,7 @@ def poll_duration_keyboard():
 
 @dp.message(Command("game_poll"))
 async def game_poll_cmd(message: Message):
-    if not _is_group_message(message) or not is_group_admin_user(message): return
+    if not require_primary_group(message) or not is_group_admin_user(message): return
     ensure_default_schedule(message.chat.id)
     games=get_games()
     if len(games)<2:
@@ -5454,7 +5531,7 @@ async def game_poll_cmd(message: Message):
 
 
 def game_poll_text(poll, games, counts):
-    expires = datetime.fromisoformat(poll["expires_at"]).astimezone(timezone.utc)
+    expires = datetime.fromisoformat(poll["expires_at"]).astimezone(timezone(timedelta(hours=DEFAULT_TIMEZONE_OFFSET_HOURS)))
     total_votes = sum(int(counts.get(int(g["id"]), 0)) for g in games)
     lines = [
         "𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟",
@@ -5468,7 +5545,7 @@ def game_poll_text(poll, games, counts):
     lines.extend([
         "",
         f"Всего голосов: {total_votes}",
-        f"Опрос завершится: {expires.strftime('%d.%m %H:%M UTC')}."
+        f"Опрос завершится: {expires.strftime('%d.%m %H:%M МСК')}."
     ])
     return "\n".join(lines)
 
@@ -5482,7 +5559,7 @@ async def refresh_game_poll_message(poll_id):
     counts = {int(r["game_id"]): int(r["votes"]) for r in group_db_op(lambda conn: conn.execute(
         "SELECT game_id, COUNT(*) votes FROM game_poll_votes WHERE poll_id=? GROUP BY game_id", (poll_id,)
     ).fetchall())}
-    games = get_games()
+    games = poll_games(poll)
     with suppress(Exception):
         await bot.edit_message_text(
             chat_id=poll["chat_id"],
@@ -5494,6 +5571,9 @@ async def refresh_game_poll_message(poll_id):
 
 @dp.callback_query(F.data.startswith("gp:"))
 async def game_poll_callback(callback: CallbackQuery):
+    if not callback.message or not is_primary_chat(callback.message.chat.id):
+        await safe_callback_answer(callback, 'Этот опрос работает только в основном чате.', True)
+        return
     parts=(callback.data or '').split(':')
     action=parts[1] if len(parts)>1 else ''
 
@@ -5519,7 +5599,8 @@ async def game_poll_callback(callback: CallbackQuery):
         if not row:
             await safe_callback_answer(callback,'Опрос не найден.',True); return
         game=get_game_by_id(gid)
-        if not game:
+        allowed_ids={int(g["id"]) for g in poll_games(row)}
+        if not game or gid not in allowed_ids:
             await safe_callback_answer(callback,'Игра не найдена.',True); return
         description = (str(game['description']).strip() or 'Для этой игры описание пока не добавлено.')[:190]
         await safe_callback_answer(callback, description, True)
@@ -5534,8 +5615,8 @@ async def game_poll_callback(callback: CallbackQuery):
         games=get_games()
         def op(conn):
             cur=conn.execute(
-                "INSERT INTO game_polls(chat_id,created_by,created_at,expires_at,status) VALUES(?,?,?,?, 'OPEN')",
-                (callback.message.chat.id,callback.from_user.id,now(),expires.isoformat()),
+                "INSERT INTO game_polls(chat_id,created_by,created_at,expires_at,status,options_json,tie_round,parent_poll_id) VALUES(?,?,?,?, 'OPEN', ?, 0, NULL)",
+                (callback.message.chat.id,callback.from_user.id,now(),expires.isoformat(), json.dumps([int(g["id"]) for g in games])),
             )
             conn.commit(); return cur.lastrowid
         pid=group_db_op(op)
@@ -5563,6 +5644,34 @@ async def game_poll_callback(callback: CallbackQuery):
     except ValueError:
         await safe_callback_answer(callback,'Некорректный опрос.',True); return
 
+    if action == "r" and len(parts) == 4:
+        if not await _assign_access(callback, callback.message.chat.id):
+            await safe_callback_answer(callback, 'Решить ничью может только администратор.', True)
+            return
+        try:
+            gid=int(parts[3])
+        except ValueError:
+            await safe_callback_answer(callback,'Некорректная игра.',True); return
+        poll=group_db_op(lambda conn: conn.execute("SELECT * FROM game_polls WHERE id=?",(pid,)).fetchone())
+        game=get_game_by_id(gid) if poll else None
+        allowed_ids={int(g["id"]) for g in poll_games(poll)} if poll else set()
+        if not poll or gid not in allowed_ids or not game:
+            await safe_callback_answer(callback,'Игра недоступна.',True); return
+        group_db_op(lambda conn:(conn.execute("UPDATE game_polls SET winner_game_id=?, status='CLOSED' WHERE id=?",(gid,pid)),conn.commit()))
+        with suppress(Exception):
+            await bot.unpin_chat_message(callback.message.chat.id, callback.message.message_id)
+        selected_slot=assign_poll_winner_to_next_slot(int(poll["chat_id"]),game["name"],pid)
+        voters=poll_voter_mentions(pid,gid)
+        voter_block="\n".join(voters) if voters else "Никто не указан."
+        schedule_line=(f"Начало по расписанию: {selected_slot[0]} · {selected_slot[1]} МСК" if selected_slot else "Время игры определяется расписанием.")
+        final=("𝗚𝗔𝗠𝗘 𝗖𝗛𝗢𝗦𝗘𝗡\n\n"
+               f"Победила игра: {game['name']}\n"
+               "Результат определён администратором после повторной ничьей.\n\n"
+               "За неё проголосовали:\n" + voter_block + "\n\n" + schedule_line + ".")
+        with suppress(Exception): await bot.edit_message_text(chat_id=callback.message.chat.id,message_id=callback.message.message_id,text=final,parse_mode="HTML")
+        await safe_callback_answer(callback,'Победитель выбран.')
+        return
+
     poll=group_db_op(lambda conn: conn.execute("SELECT * FROM game_polls WHERE id=?",(pid,)).fetchone())
     if not poll or poll['status']!='OPEN':
         await safe_callback_answer(callback,'Опрос уже закрыт.',True); return
@@ -5571,7 +5680,8 @@ async def game_poll_callback(callback: CallbackQuery):
         try: gid=int(parts[3])
         except ValueError: await safe_callback_answer(callback,'Некорректная игра.',True); return
         game=get_game_by_id(gid)
-        if not game or not game['enabled']:
+        allowed_ids={int(g["id"]) for g in poll_games(poll)}
+        if not game or not game['enabled'] or gid not in allowed_ids:
             await safe_callback_answer(callback,'Эта игра больше недоступна.',True); return
         group_db_op(lambda conn:(conn.execute(
             "INSERT INTO game_poll_votes(poll_id,user_id,game_id,voted_at) VALUES(?,?,?,?) "
@@ -5585,7 +5695,7 @@ async def game_poll_callback(callback: CallbackQuery):
     counts={int(r['game_id']):int(r['votes']) for r in group_db_op(lambda conn: conn.execute(
         "SELECT game_id,COUNT(*) votes FROM game_poll_votes WHERE poll_id=? GROUP BY game_id",(pid,)
     ).fetchall())}
-    games=get_games()
+    games=poll_games(poll)
     current=group_db_op(lambda conn: conn.execute(
         "SELECT game_id FROM game_poll_votes WHERE poll_id=? AND user_id=?",(pid,callback.from_user.id)
     ).fetchone())
@@ -5617,36 +5727,111 @@ def assign_poll_winner_to_next_slot(chat_id, game_name, poll_id):
     ),conn.commit()))
     return run_date,time_hm
 
-async def expire_game_poll(poll_id,seconds):
+async def expire_game_poll(poll_id, seconds):
     await asyncio.sleep(seconds)
-    poll=group_db_op(lambda conn: conn.execute("SELECT * FROM game_polls WHERE id=?",(poll_id,)).fetchone())
-    if not poll or poll['status']!='OPEN': return
-    counts={int(r['game_id']):int(r['votes']) for r in group_db_op(lambda conn: conn.execute("SELECT game_id,COUNT(*) votes FROM game_poll_votes WHERE poll_id=? GROUP BY game_id",(poll_id,)).fetchall())}
-    winner_id=None
-    winner=None
-    if counts:
-        top=max(counts.values())
-        leaders=sorted([gid for gid,v in counts.items() if v==top])
-        winner_id=leaders[0] if len(leaders)==1 else None
-        winner=get_game_by_id(winner_id) if winner_id else None
-    group_db_op(lambda conn:(conn.execute("UPDATE game_polls SET status='CLOSED',winner_game_id=? WHERE id=?",(winner_id,poll_id)),conn.commit()))
-    selected_slot = assign_poll_winner_to_next_slot(poll['chat_id'], winner['name'], poll_id) if winner else None
-    if poll['message_id']:
-        if winner:
-            final=(
-                "𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟 · 𝗙𝗜𝗡𝗔𝗟\n\n"
-                f"Выбрана игра: {winner['name']}\n"
-                f"Голосов: {counts.get(int(winner['id']),0)}\n\n"
-                + (f"Игра назначена на ближайший слот расписания: {selected_slot[0]} {selected_slot[1]} МСК." if selected_slot else "Следующий шаг — играть по расписанию.")
+    poll = group_db_op(lambda conn: conn.execute(
+        "SELECT * FROM game_polls WHERE id=?", (poll_id,)
+    ).fetchone())
+    if not poll or poll["status"] != "OPEN":
+        return
+
+    games = poll_games(poll)
+    counts = {int(r["game_id"]): int(r["votes"]) for r in group_db_op(lambda conn: conn.execute(
+        "SELECT game_id, COUNT(*) votes FROM game_poll_votes WHERE poll_id=? GROUP BY game_id", (poll_id,)
+    ).fetchall())}
+    top = max(counts.values(), default=0)
+    leaders = sorted([gid for gid, votes in counts.items() if votes == top and top > 0])
+
+    # Close current poll first; the old poll remains as historical record.
+    winner_id = leaders[0] if len(leaders) == 1 else None
+    group_db_op(lambda conn: (
+        conn.execute(
+            "UPDATE game_polls SET status='CLOSED', winner_game_id=? WHERE id=? AND status='OPEN'",
+            (winner_id, poll_id),
+        ),
+        conn.commit(),
+    ))
+
+    if poll["message_id"]:
+        with suppress(Exception):
+            await bot.unpin_chat_message(int(poll["chat_id"]), int(poll["message_id"]))
+
+    # No votes: announce and stop.
+    if not leaders:
+        await bot.send_message(
+            int(poll["chat_id"]),
+            "𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟 · 𝗙𝗜𝗡𝗔𝗟\n\nНикто не проголосовал. Опрос закрыт.",
+        )
+        return
+
+    # Tie: launch one short tie-break poll containing only the tied games.
+    if len(leaders) > 1:
+        if int(poll["tie_round"] or 0) >= 1:
+            tie_games = [g for g in games if int(g["id"]) in leaders]
+            rows = [
+                [InlineKeyboardButton(text=g["name"], callback_data=f"gp:r:{poll_id}:{int(g['id'])}")]
+                for g in tie_games
+            ]
+            await bot.send_message(
+                int(poll["chat_id"]),
+                "𝗧𝗜𝗘𝗕𝗥𝗘𝗔𝗞 𝗥𝗘𝗦𝗨𝗟𝗧\n\n"
+                "Повторная ничья. Администратор выбирает победителя:",
+                reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             )
-        elif counts:
-            final="𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟 · 𝗙𝗜𝗡𝗔𝗟\n\nНичья. Выберите игру повторным голосованием."
-        else:
-            final="𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟 · 𝗙𝗜𝗡𝗔𝗟\n\nНикто не проголосовал."
+            return
+        tie_games = [g for g in games if int(g["id"]) in leaders]
+        tie_minutes = min(10, GAME_POLL_MAX_MINUTES)
+        expires = datetime.now(timezone.utc) + timedelta(minutes=tie_minutes)
+        def op(conn):
+            cur = conn.execute(
+                """INSERT INTO game_polls(chat_id,created_by,created_at,expires_at,status,options_json,tie_round,parent_poll_id)
+                   VALUES(?,?,?,?, 'OPEN', ?, ?, ?)""",
+                (int(poll["chat_id"]), int(poll["created_by"]), now(), expires.isoformat(),
+                 json.dumps(leaders), int(poll["tie_round"] or 0) + 1, int(poll["id"])),
+            )
+            conn.commit()
+            return cur.lastrowid
+        tie_id = group_db_op(op)
+        tie_poll = group_db_op(lambda conn: conn.execute("SELECT * FROM game_polls WHERE id=?", (tie_id,)).fetchone())
+        msg = await bot.send_message(
+            int(poll["chat_id"]),
+            game_poll_text(tie_poll, tie_games, {}),
+            reply_markup=game_poll_keyboard(tie_id, tie_games),
+        )
+        group_db_op(lambda conn: (
+            conn.execute("UPDATE game_polls SET message_id=? WHERE id=?", (msg.message_id, tie_id)),
+            conn.commit(),
+        ))
         with suppress(Exception):
-            await bot.edit_message_text(chat_id=poll['chat_id'],message_id=poll['message_id'],text=final)
-        with suppress(Exception):
-            await bot.pin_chat_message(poll['chat_id'],poll['message_id'],disable_notification=True)
+            await bot.pin_chat_message(int(poll["chat_id"]), msg.message_id, disable_notification=True)
+        asyncio.create_task(expire_game_poll(tie_id, tie_minutes * 60))
+        await bot.send_message(
+            int(poll["chat_id"]),
+            "𝗧𝗜𝗘𝗕𝗥𝗘𝗔𝗞\n\n" + "\n".join(f"• {g['name']} — {counts.get(int(g['id']), 0)}" for g in tie_games)
+            + f"\n\nЗапущен короткий дополнительный тур на {tie_minutes} минут.",
+        )
+        return
+
+    winner = get_game_by_id(winner_id)
+    if not winner:
+        return
+
+    selected_slot = assign_poll_winner_to_next_slot(int(poll["chat_id"]), winner["name"], poll_id)
+    voters = poll_voter_mentions(poll_id, winner_id)
+    voter_block = "\n".join(voters) if voters else "Никто не указан."
+    schedule_line = (
+        f"Начало по расписанию: {selected_slot[0]} · {selected_slot[1]} МСК"
+        if selected_slot else "Время игры определяется расписанием."
+    )
+    final = (
+        "𝗚𝗔𝗠𝗘 𝗖𝗛𝗢𝗦𝗘𝗡\n\n"
+        f"Победила игра: {winner['name']}\n"
+        f"Голосов: {counts.get(int(winner['id']), 0)}\n\n"
+        "За неё проголосовали:\n"
+        f"{voter_block}\n\n"
+        f"{schedule_line}."
+    )
+    await bot.send_message(int(poll["chat_id"]), final, parse_mode="HTML")
 
 async def game_poll_refresh_worker():
     while True:
@@ -5663,42 +5848,80 @@ async def game_poll_refresh_worker():
         await asyncio.sleep(10)
 
 
-async def schedule_worker():
+async def game_poll_expiry_recovery_worker():
     while True:
         try:
-            local=datetime.now(timezone.utc)+timedelta(hours=DEFAULT_TIMEZONE_OFFSET_HOURS)
-            slot=cycle_slot_for_local(local)
-            if slot is not None:
-                rows=group_db_op(lambda conn: conn.execute(
-                    "SELECT * FROM schedule_cycle WHERE slot_index=? AND time_hm=? AND enabled=1",
-                    (slot,local.strftime('%H:%M'))
-                ).fetchall())
-                run_date=local.date().isoformat(); current_hm=local.strftime('%H:%M')
-                for row in rows:
-                    chat_id=row['chat_id']
-                    override=group_db_op(lambda conn: conn.execute(
-                        "SELECT * FROM game_schedule_overrides WHERE chat_id=? AND run_date=? AND time_hm=?",
-                        (chat_id,run_date,current_hm),
-                    ).fetchone())
-                    game_name=override['game_name'] if override else row['game_name']
-                    source='poll' if override else 'schedule'
-                    claimed=group_db_op(lambda conn: conn.execute(
-                        "INSERT OR IGNORE INTO schedule_runs(chat_id,run_date,time_hm,game_name,source,created_at) VALUES(?,?,?,?,?,?)",
-                        (chat_id,run_date,current_hm,game_name,source,now()),
-                    ).rowcount==1)
-                    if not claimed:
-                        continue
-                    game=group_db_op(lambda conn: conn.execute(
-                        "SELECT * FROM game_catalog WHERE lower(name)=lower(?) AND enabled=1",(game_name,),
-                    ).fetchone())
-                    if not game:
-                        await bot.send_message(chat_id,f"𝗚𝗔𝗠𝗘 𝗧𝗜𝗠𝗘\n\nИгра «{game_name}» сейчас отключена.")
-                        continue
-                    await bot.send_message(chat_id,f"𝗚𝗔𝗠𝗘 𝗧𝗜𝗠𝗘\n\nСейчас играем: {game['name']}.")
-                    if game['launch_text']:
-                        await bot.send_message(chat_id,game['launch_text'])
+            rows=group_db_op(lambda conn: conn.execute("SELECT id,expires_at FROM game_polls WHERE status='OPEN'").fetchall())
+            now_utc=datetime.now(timezone.utc)
+            for row in rows:
+                try:
+                    expires=datetime.fromisoformat(str(row["expires_at"]))
+                    if expires.tzinfo is None: expires=expires.replace(tzinfo=timezone.utc)
+                    if expires <= now_utc:
+                        await expire_game_poll(int(row["id"]),0)
+                except Exception:
+                    logger.exception("Poll expiry recovery failed | poll=%s",row["id"])
+        except asyncio.CancelledError:
+            raise
         except Exception:
-            logger.exception('Schedule worker failed')
+            logger.exception("Game poll expiry recovery worker failed")
+        await asyncio.sleep(5)
+
+
+async def mafia_expiry_recovery_worker():
+    while True:
+        try:
+            cutoff=(datetime.now(timezone.utc)-timedelta(minutes=5)).isoformat()
+            rows=group_db_op(lambda conn: conn.execute("SELECT id,chat_id,lobby_message_id FROM mafia_games WHERE status='WAITING' AND created_at<=?",(cutoff,)).fetchall())
+            for row in rows:
+                try:
+                    if mafia_stop(int(row["id"])) and row["lobby_message_id"]:
+                        with suppress(Exception): await bot.delete_message(int(row["chat_id"]),int(row["lobby_message_id"]))
+                        with suppress(Exception): await bot.unpin_chat_message(int(row["chat_id"]),int(row["lobby_message_id"]))
+                except Exception:
+                    logger.exception("Mafia expiry recovery failed | game=%s",row["id"])
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Mafia expiry recovery worker failed")
+        await asyncio.sleep(10)
+
+
+async def schedule_worker():
+    """Announce scheduled game time in the primary chat; never auto-launch a game."""
+    while True:
+        try:
+            local = datetime.now(timezone.utc) + timedelta(hours=DEFAULT_TIMEZONE_OFFSET_HOURS)
+            if PRIMARY_CHAT_ID:
+                slot = next_cycle_slot(PRIMARY_CHAT_ID, local)
+                if slot:
+                    candidate, slot_index, time_hm = slot
+                    delta = candidate - local
+                    chat_id = PRIMARY_CHAT_ID
+                    # 30-minute reminder. Claimed through schedule_runs to avoid repeats.
+                    if timedelta(minutes=29, seconds=50) <= delta <= timedelta(minutes=30, seconds=10):
+                        game_name = group_db_op(lambda conn: conn.execute(
+                            "SELECT game_name FROM schedule_cycle WHERE chat_id=? AND slot_index=? AND enabled=1",
+                            (chat_id, slot_index),
+                        ).fetchone())
+                        if game_name:
+                            run_key = f"reminder30:{candidate.isoformat()}"
+                            claimed = group_db_op(lambda conn: (
+                                conn.execute(
+                                    "INSERT OR IGNORE INTO schedule_runs(chat_id,run_date,time_hm,game_name,source,created_at) VALUES(?,?,?,?,?,?)",
+                                    (chat_id, candidate.date().isoformat(), time_hm, game_name["game_name"], run_key, now()),
+                                ).rowcount == 1
+                            ))
+                            if claimed:
+                                await bot.send_message(
+                                    chat_id,
+                                    f"𝗚𝗔𝗠𝗘 𝗦𝗧𝗔𝗥𝗧𝗦\n\n{html.escape(game_name['game_name'])} начнётся через 30 минут.\nВремя начала: {time_hm} МСК.",
+                                    parse_mode="HTML",
+                                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Schedule worker failed")
         await asyncio.sleep(SCHEDULE_CHECK_SECONDS)
 
 
@@ -5718,6 +5941,9 @@ async def _assign_access(callback, chat_id):
 
 @dp.callback_query(F.data.startswith("fm:role:"))
 async def role_assign_button(callback: CallbackQuery, state: FSMContext):
+    if not callback.message or not is_primary_chat(callback.message.chat.id):
+        await callback.answer("Этот чат не является основным.", show_alert=True)
+        return
     parts=(callback.data or "").split(":")
     if len(parts)!=4:
         await callback.answer("Некорректная кнопка.",show_alert=True); return
@@ -5958,6 +6184,8 @@ async def mafia_cmd(message: Message):
 
 @dp.message(Command("mafia_leave"))
 async def mafia_leave_cmd(message: Message):
+    if not require_primary_group(message):
+        return
     game = mafia_open_game(message.chat.id)
     if not game:
         await message.reply("Сейчас нет активного лобби.")
@@ -5972,6 +6200,9 @@ async def mafia_leave_cmd(message: Message):
 
 @dp.callback_query(F.data.startswith("mf:"))
 async def mafia_callback(callback: CallbackQuery):
+    if not callback.message or not is_primary_chat(callback.message.chat.id):
+        await safe_callback_answer(callback, 'Mafia работает только в основном чате.', True)
+        return
     parts=(callback.data or '').split(':')
     if len(parts)!=3:
         await safe_callback_answer(callback,'Некорректная кнопка.',True); return
@@ -6060,46 +6291,57 @@ def seed_default_games():
         add_game(name, description, launch_text)
 
 
+@dp.message(Command("schedule"))
+async def schedule_cmd(message: Message):
+    if not require_primary_group(message):
+        return
+    await message.reply(schedule_text(message.chat.id))
+
+
 async def setup_commands():
-    base_user=[
-        BotCommand(command="help",description="Помощь и команды"),
-        BotCommand(command="roles",description="Назначенные роли"),
-        BotCommand(command="mafia",description="Лобби MafiaAzBot"),
-        BotCommand(command="mafia_leave",description="Выйти из мафии"),
+    base_user = [
+        BotCommand(command="help", description="Помощь и команды"),
+        BotCommand(command="mafia", description="Лобби MafiaAzBot"),
+        BotCommand(command="mafia_leave", description="Выйти из мафии"),
+        BotCommand(command="schedule", description="Расписание игр"),
     ]
-    base_admin=[
+    base_admin = [
         *base_user,
-        BotCommand(command="setrole",description="Назначить роль"),
-        BotCommand(command="syncroles",description="Сверить роли"),
-        BotCommand(command="role",description="Роль участника"),
-        BotCommand(command="game_poll",description="Опрос на игру"),
+        BotCommand(command="game_poll", description="Опрос на игру"),
+        BotCommand(command="setrole", description="Назначить роль"),
+        BotCommand(command="syncroles", description="Сверить роли"),
     ]
-    private=[
-        BotCommand(command="manage_commands",description="Управление командами"),
-        BotCommand(command="addcommand",description="Добавить команду"),
-        BotCommand(command="delcommand",description="Удалить команду"),
-        BotCommand(command="commands",description="Список команд"),
-        BotCommand(command="bindrole",description="Привязать роль"),
+    private = [
+        BotCommand(command="manage_commands", description="Управление командами"),
+        BotCommand(command="addcommand", description="Добавить команду"),
+        BotCommand(command="delcommand", description="Удалить команду"),
+        BotCommand(command="commands", description="Список команд"),
+        BotCommand(command="bindrole", description="Привязать роль"),
+        BotCommand(command="roles_audit", description="Аудит ролей"),
     ]
-    # Custom commands are kept separate from built-ins and appended only to their scopes.
     user_commands=list(base_user)
     admin_commands=list(base_admin)
     private_commands=list(private)
     for row in get_custom_commands():
         try:
-            cmd=BotCommand(command=row['command'],description=row['description'][:256])
+            cmd=BotCommand(command=row["command"], description=row["description"][:256])
         except Exception:
             continue
-        if row['scope'] in {'all','group'}:
+        if row["scope"] in {"all", "group"}:
             user_commands.append(cmd)
-        if row['scope'] in {'all','admin'}:
+        if row["scope"] in {"all", "admin"}:
             admin_commands.append(cmd)
-        if row['scope']=='private':
+        if row["scope"] == "private":
             private_commands.append(cmd)
-    await bot.set_my_commands(user_commands,scope=BotCommandScopeDefault())
-    await bot.set_my_commands(user_commands,scope=BotCommandScopeAllGroupChats())
-    await bot.set_my_commands(admin_commands,scope=BotCommandScopeAllChatAdministrators())
-    await bot.set_my_commands(admin_commands+private_commands,scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+    if PRIMARY_CHAT_ID:
+        await bot.set_my_commands(user_commands, scope=BotCommandScopeChat(chat_id=PRIMARY_CHAT_ID))
+        await bot.set_my_commands(admin_commands, scope=BotCommandScopeChatAdministrators(chat_id=PRIMARY_CHAT_ID))
+    else:
+        # Safe fallback for first deployment before PRIMARY_CHAT_ID is configured.
+        await bot.set_my_commands(user_commands, scope=BotCommandScopeAllGroupChats())
+        await bot.set_my_commands(admin_commands, scope=BotCommandScopeAllChatAdministrators())
+    await bot.set_my_commands(admin_commands + private_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
 
 
 # =========================================================
@@ -6247,6 +6489,8 @@ async def polling_loop():
 # /roles, etc. would swallow native commands that are not custom commands.
 @dp.message(F.text.regexp(r"^\s*/[A-Za-z][A-Za-z0-9_]{0,31}(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"))
 async def custom_command_dispatch(message: Message):
+    if message.chat.type in {"group", "supergroup"} and not is_primary_chat(message.chat.id):
+        return
     text = message.text or ""
     m = re.match(r"^\s*/([A-Za-z][A-Za-z0-9_]{0,31})", text)
     if not m:
@@ -6302,6 +6546,8 @@ async def main():
 
     http_runner = await start_http_server()
     asyncio.create_task(game_poll_refresh_worker())
+    asyncio.create_task(game_poll_expiry_recovery_worker())
+    asyncio.create_task(mafia_expiry_recovery_worker())
     asyncio.create_task(schedule_worker())
 
     delivery_tasks = [
