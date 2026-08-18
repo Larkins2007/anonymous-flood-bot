@@ -34,6 +34,8 @@ from aiogram.types import (
     BotCommand,
     BotCommandScopeChat,
     BotCommandScopeDefault,
+    BotCommandScopeAllGroupChats,
+    BotCommandScopeChatAdministrators,
     CallbackQuery,
     ChatMemberUpdated,
     ChatPermissions,
@@ -134,6 +136,22 @@ DELIVERY_QUEUE = None
 BROADCAST_QUEUE = None
 DELIVERY_WORKERS = max(1, int(os.getenv("DELIVERY_WORKERS", "2")))
 BROADCAST_WORKERS = max(1, int(os.getenv("BROADCAST_WORKERS", "1")))
+
+DEBUG_GROUP_UPDATES = os.getenv("DEBUG_GROUP_UPDATES", "0") == "1"
+
+def has_bot_command_entity(message: Message) -> bool:
+    return any(getattr(e, "type", None) == "bot_command" for e in (getattr(message, "entities", None) or []))
+
+def extract_command_from_message(message: Message) -> Optional[str]:
+    text = getattr(message, "text", None) or ""
+    for e in (getattr(message, "entities", None) or []):
+        if getattr(e, "type", None) == "bot_command":
+            try:
+                return text[e.offset:e.offset + e.length]
+            except Exception:
+                return None
+    return None
+
 DELIVERY_PART_DELAY = max(0.0, float(os.getenv("DELIVERY_PART_DELAY", "0.2")))
 
 polling_running = False
@@ -215,6 +233,10 @@ class AdminSearchState(StatesGroup):
 
 
 class BroadcastState(StatesGroup):
+    waiting = State()
+
+
+class RoleAssignSearchState(StatesGroup):
     waiting = State()
 
 
@@ -484,7 +506,7 @@ def init_group_db():
 
             CREATE UNIQUE INDEX IF NOT EXISTS idx_mafia_open_game
                 ON mafia_games(chat_id)
-                WHERE status IN ('WAITING', 'RUNNING');
+                WHERE status = 'WAITING';
 
             CREATE TABLE IF NOT EXISTS mafia_players (
                 game_id INTEGER NOT NULL,
@@ -4204,12 +4226,20 @@ def role_is_occupied(chat_id, role_key, *, exclude_user_id=None):
     return (row["status"] == STATUS_TAKEN and row["user_id"] is None)
 
 
-def assign_role_db(chat_id, user, role):
+def assign_role_db_atomic(chat_id, user, role):
+    """Reserve a role atomically. Telegram tag application happens after reservation.
+    A conditional UPDATE under BEGIN IMMEDIATE prevents two admins from taking the same role.
+    """
     role_key = normalize_role(role["name"])
     tag = make_tag(role["english"])
     def op(conn):
-        state = conn.execute("SELECT * FROM role_state WHERE chat_id=? AND role_key=?", (chat_id, role_key)).fetchone()
+        conn.execute("BEGIN IMMEDIATE")
+        state = conn.execute(
+            "SELECT * FROM role_state WHERE chat_id=? AND role_key=?",
+            (chat_id, role_key),
+        ).fetchone()
         if state and state["user_id"] not in (None, user.id):
+            conn.rollback()
             raise ValueError("ROLE_OCCUPIED")
         old = conn.execute(
             "SELECT role_key FROM group_members WHERE chat_id=? AND user_id=? AND active=1",
@@ -4217,35 +4247,56 @@ def assign_role_db(chat_id, user, role):
         ).fetchone()
         if old and old["role_key"] and old["role_key"] != role_key:
             conn.execute(
-                "UPDATE role_state SET user_id=NULL, status='free', bot_managed=0, legacy_marker='' WHERE chat_id=? AND role_key=? AND user_id=?",
+                "UPDATE role_state SET user_id=NULL,status='free',bot_managed=0,legacy_marker='' "
+                "WHERE chat_id=? AND role_key=? AND user_id=?",
                 (chat_id, old["role_key"], user.id),
             )
+        if state:
+            cur = conn.execute(
+                "UPDATE role_state SET user_id=?,status='taken',role_name=?,bot_managed=1,legacy_marker=?,legacy_custom_emoji_id=? "
+                "WHERE chat_id=? AND role_key=? AND (user_id IS NULL OR user_id=?)",
+                (user.id, role["name"], STATUS_MARKER[STATUS_TAKEN], CUSTOM_EMOJI_IDS[STATUS_TAKEN], chat_id, role_key, user.id),
+            )
+        else:
+            cur = conn.execute(
+                "INSERT INTO role_state(chat_id,role_key,role_name,user_id,status,legacy_marker,legacy_custom_emoji_id,bot_managed) "
+                "VALUES(?,?,?,?,?,?,?,1)",
+                (chat_id, role_key, role["name"], user.id, STATUS_TAKEN, STATUS_MARKER[STATUS_TAKEN], CUSTOM_EMOJI_IDS[STATUS_TAKEN]),
+            )
+        if cur.rowcount != 1:
+            conn.rollback()
+            raise ValueError("ROLE_OCCUPIED")
         conn.execute(
-            """
-            INSERT INTO role_state(chat_id,role_key,role_name,user_id,status,legacy_marker,legacy_custom_emoji_id,bot_managed)
-            VALUES(?,?,?,?,?,?,?,1)
-            ON CONFLICT(chat_id,role_key) DO UPDATE SET
-                user_id=excluded.user_id,
-                role_name=excluded.role_name,
-                status='taken',
-                bot_managed=1
-            """,
-            (chat_id, role_key, role["name"], user.id, STATUS_TAKEN, STATUS_MARKER[STATUS_TAKEN], CUSTOM_EMOJI_IDS[STATUS_TAKEN]),
-        )
-        conn.execute(
-            """
-            INSERT INTO group_members(chat_id,user_id,first_name,last_name,username,role_key,role_name,tag,confirmed,active,joined_at,tag_set_by_bot)
-            VALUES(?,?,?,?,?,?,?,?,1,1,?,1)
-            ON CONFLICT(chat_id,user_id) DO UPDATE SET
-                first_name=excluded.first_name,last_name=excluded.last_name,username=excluded.username,
-                role_key=excluded.role_key,role_name=excluded.role_name,tag=excluded.tag,active=1,tag_set_by_bot=1
-            """,
+            """INSERT INTO group_members(chat_id,user_id,first_name,last_name,username,role_key,role_name,tag,confirmed,active,joined_at,tag_set_by_bot)
+            VALUES(?,?,?,?,?,?,?,?,1,1,?,0)
+            ON CONFLICT(chat_id,user_id) DO UPDATE SET first_name=excluded.first_name,last_name=excluded.last_name,
+            username=excluded.username,role_key=excluded.role_key,role_name=excluded.role_name,tag=excluded.tag,active=1,tag_set_by_bot=0""",
             (chat_id,user.id,user.first_name or "",user.last_name or "",user.username or "",role_key,role["name"],tag,now()),
         )
         conn.commit()
         return tag, role_key
     return group_db_op(op)
 
+
+def release_role_assignment(chat_id, user_id, role_key):
+    def op(conn):
+        conn.execute("BEGIN IMMEDIATE")
+        conn.execute("UPDATE role_state SET user_id=NULL,status='free',bot_managed=0,legacy_marker='' WHERE chat_id=? AND role_key=? AND user_id=?", (chat_id,role_key,user_id))
+        conn.execute("UPDATE group_members SET role_key=NULL,role_name=NULL,tag=NULL,tag_set_by_bot=0 WHERE chat_id=? AND user_id=?", (chat_id,user_id))
+        conn.commit()
+    group_db_op(op)
+
+
+def finalize_role_assignment(chat_id, user_id, role_key, actual_tag):
+    def op(conn):
+        conn.execute("UPDATE group_members SET tag=?,tag_set_by_bot=1 WHERE chat_id=? AND user_id=? AND role_key=?", (actual_tag,chat_id,user_id,role_key))
+        conn.commit()
+    group_db_op(op)
+
+
+# Backward-compatible name used by existing code.
+def assign_role_db(chat_id, user, role):
+    return assign_role_db_atomic(chat_id, user, role)
 
 def split_role_line(line):
     """Return (role, marker) for roster lines like 'Диона -💛' or 'Сяо - 💛'."""
@@ -4568,7 +4619,7 @@ async def send_or_edit_welcome(chat_id, user_id):
         f"{divider()}\n"
         "Подтверждение только отмечает ознакомление с правилами и не ограничивает ваши права в Telegram."
     )
-    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=button_text, callback_data=f"fm:confirm:{chat_id}:{user_id}")]])
+    markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text=button_text, callback_data=f"fm:confirm:{chat_id}:{user_id}")], [InlineKeyboardButton(text="🎭 Назначить роль", callback_data=f"fm:assign:{chat_id}:{user_id}:0")]])
     if row["welcome_message_id"]:
         try:
             await bot.edit_message_text(chat_id=chat_id, message_id=row["welcome_message_id"], text=text, reply_markup=markup)
@@ -4645,6 +4696,10 @@ async def group_confirm(callback: CallbackQuery):
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}), F.text)
 async def group_passive_member_sync(message: Message):
+    if DEBUG_GROUP_UPDATES:
+        logger.info("DEBUG_GROUP_UPDATE chat=%s type=%s msg=%s from=%s cmd=%s entities=%r text=%r", message.chat.id, message.chat.type, message.message_id, getattr(message.from_user, "id", None), extract_command_from_message(message), [(getattr(e,"type",None),getattr(e,"offset",None),getattr(e,"length",None)) for e in (message.entities or [])], (message.text or "")[:200])
+    if has_bot_command_entity(message):
+        return
     if not message.from_user or message.from_user.is_bot:
         return
     try:
@@ -4870,6 +4925,8 @@ async def capture_list_channel(message: Message):
 
 @dp.message(Command("capture_list"))
 async def capture_list_group(message: Message):
+    if has_bot_command_entity(message):
+        return
     if not message.from_user or message.from_user.id != ADMIN_ID:
         return
     if not message.reply_to_message:
@@ -5054,8 +5111,140 @@ async def member_info_cmd(message: Message):
 # MAFIA
 # =========================================================
 
+ROLE_PAGE_SIZE = 12
+
+def _role_pages():
+    return [ROLE_CATALOG[i:i+ROLE_PAGE_SIZE] for i in range(0, len(ROLE_CATALOG), ROLE_PAGE_SIZE)]
+
+def role_assign_keyboard(chat_id, target_user_id, page=0, query=None):
+    roles = ROLE_CATALOG
+    if query:
+        q=normalize_role(query)
+        roles=[r for r in roles if q in normalize_role(r[0]) or q in normalize_role(r[1])]
+    pages=[roles[i:i+ROLE_PAGE_SIZE] for i in range(0,len(roles),ROLE_PAGE_SIZE)] or [[]]
+    page=max(0,min(page,len(pages)-1))
+    rows=[]
+    for i,(name,english,region) in enumerate(pages[page]):
+        absolute = roles.index((name,english,region))
+        rows.append([InlineKeyboardButton(text=name[:35], callback_data=f"fm:as:{chat_id}:{target_user_id}:{absolute}")])
+    nav=[]
+    if page>0: nav.append(InlineKeyboardButton(text="◀️",callback_data=f"fm:assign:{chat_id}:{target_user_id}:{page-1}"))
+    if page+1<len(pages): nav.append(InlineKeyboardButton(text="▶️",callback_data=f"fm:assign:{chat_id}:{target_user_id}:{page+1}"))
+    if nav: rows.append(nav)
+    rows.append([InlineKeyboardButton(text="🔎 Поиск",callback_data=f"fm:search:{chat_id}:{target_user_id}"),InlineKeyboardButton(text="✖️ Закрыть",callback_data=f"fm:close:{chat_id}:{target_user_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows), len(roles), len(pages)
+
+async def _assign_access(callback, chat_id):
+    if callback.from_user.id == ADMIN_ID: return True
+    try:
+        member=await bot.get_chat_member(chat_id,callback.from_user.id)
+        return getattr(member,"status",None) in {"administrator","creator"}
+    except Exception:
+        return False
+
+@dp.callback_query(F.data.startswith("fm:assign:"))
+async def role_assign_open(callback: CallbackQuery):
+    parts=(callback.data or "").split(":")
+    if len(parts)!=5:
+        await callback.answer("Некорректная кнопка.",show_alert=True); return
+    _,_,chat_raw,target_raw,page_raw=parts
+    try: chat_id,target_id,page=int(chat_raw),int(target_raw),int(page_raw)
+    except ValueError:
+        await callback.answer("Некорректные данные.",show_alert=True); return
+    if not await _assign_access(callback,chat_id):
+        await callback.answer("Нет доступа: назначать роли могут только администраторы.",show_alert=True); return
+    kb,total,pages=role_assign_keyboard(chat_id,target_id,page)
+    with suppress(Exception): await callback.message.edit_reply_markup(reply_markup=kb)
+    await callback.answer(f"Роли: {total} · страница {page+1}/{pages}")
+
+@dp.callback_query(F.data.startswith("fm:search:"))
+async def role_assign_search_start(callback: CallbackQuery,state:FSMContext):
+    parts=(callback.data or "").split(":")
+    if len(parts)!=4:
+        await callback.answer("Некорректная кнопка.",show_alert=True); return
+    _,_,chat_raw,target_raw=parts
+    chat_id,target_id=int(chat_raw),int(target_raw)
+    if not await _assign_access(callback,chat_id):
+        await callback.answer("Нет доступа.",show_alert=True); return
+    await state.set_state(RoleAssignSearchState.waiting)
+    await state.update_data(chat_id=chat_id,target_id=target_id)
+    await callback.message.reply("🔎 Введите часть названия роли в этом чате. Для отмены: /cancel")
+    await callback.answer()
+
+@dp.message(RoleAssignSearchState.waiting, F.text)
+async def role_assign_search_input(message: Message,state:FSMContext):
+    if not _is_group_message(message) or not is_group_admin_user(message):
+        await state.clear(); return
+    data=await state.get_data(); await state.clear()
+    kb,total,pages=role_assign_keyboard(data["chat_id"],data["target_id"],0,message.text.strip())
+    await message.reply(f"🔎 Найдено: {total}",reply_markup=kb)
+
+@dp.callback_query(F.data.startswith("fm:as:"))
+async def role_assign_select(callback: CallbackQuery):
+    parts=(callback.data or "").split(":")
+    if len(parts)!=5:
+        await callback.answer("Некорректная кнопка.",show_alert=True); return
+    _,_,chat_raw,target_raw,index_raw=parts
+    try: chat_id,target_id,index=int(chat_raw),int(target_raw),int(index_raw)
+    except ValueError:
+        await callback.answer("Некорректные данные.",show_alert=True); return
+    if not await _assign_access(callback,chat_id):
+        await callback.answer("Нет доступа.",show_alert=True); return
+    if index<0 or index>=len(ROLE_CATALOG):
+        await callback.answer("Роль не найдена.",show_alert=True); return
+    role=role_for(ROLE_CATALOG[index][0])
+    target=await _active_member_from_username(chat_id, str(get_member(chat_id,target_id)["username"]) if get_member(chat_id,target_id) and get_member(chat_id,target_id)["username"] else "")
+    if not target:
+        row=get_member(chat_id,target_id)
+        if row: target=_user_object_from_row(row)
+    if not target:
+        await callback.answer("Участник не найден.",show_alert=True); return
+    try:
+        tag,role_key=assign_role_db_atomic(chat_id,target,role)
+        ok,actual=await apply_member_tag(chat_id,target.id,tag)
+        if not ok:
+            release_role_assignment(chat_id,target.id,role_key)
+            await callback.answer("Telegram не разрешил установить тег. Роль освобождена.",show_alert=True)
+            with suppress(Exception): await callback.message.reply("⚠️ Не удалось установить Telegram-тег. Проверьте право Manage Tags у бота. Назначение роли откатено.")
+            return
+        finalize_role_assignment(chat_id,target.id,role_key,actual or tag)
+        await send_or_edit_welcome(chat_id,target.id)
+        await update_group_roster(chat_id)
+        await callback.answer(f"Роль «{role['name']}» назначена.")
+        with suppress(Exception): await callback.message.edit_text(f"✅ Роль назначена\n\nУчастник: {display_username_for_group(target)}\nРоль: {role['name']}\nТег: {actual or tag}")
+    except ValueError as exc:
+        await callback.answer("Роль уже занята." if str(exc)=="ROLE_OCCUPIED" else "Не удалось назначить роль.",show_alert=True)
+    except Exception:
+        logger.exception("Role assignment callback failed")
+        await callback.answer("Ошибка назначения роли.",show_alert=True)
+
+@dp.callback_query(F.data.startswith("fm:close:"))
+async def role_assign_close(callback: CallbackQuery):
+    parts=(callback.data or "").split(":")
+    if len(parts)!=4 or not await _assign_access(callback,int(parts[2])):
+        await callback.answer("Нет доступа.",show_alert=True); return
+    with suppress(Exception): await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Закрыто.")
+
+@dp.message(F.chat.type.in_({"group","supergroup"}), F.text.regexp(r"(?iu)^\s*флудик\b.*"))
+async def fludik_handler(message: Message):
+    text=(message.text or "").lower()
+    if "маф" not in text: return
+    if any(k in text for k in ("нач","запус","давай","собер","старт")):
+        await mafia_cmd(message); return
+    if any(k in text for k in ("статус","сколько")):
+        game=mafia_open_game(message.chat.id)
+        await message.reply("Лобби не создано." if not game else f"Игроков: {len(mafia_player_rows(game['id']))}/5")
+        return
+    if any(k in text for k in ("закр","закрой")):
+        game=mafia_open_game(message.chat.id)
+        if not game: await message.reply("Лобби не найдено."); return
+        if message.from_user and message.from_user.id in {game['creator_id'],ADMIN_ID}: mafia_stop(game['id']); await message.reply("Лобби закрыто.")
+        else: await message.reply("Нет доступа.")
+
+
 def mafia_open_game(chat_id):
-    return group_db_op(lambda conn: conn.execute("SELECT * FROM mafia_games WHERE chat_id=? AND status IN ('WAITING','RUNNING') LIMIT 1", (chat_id,)).fetchone())
+    return group_db_op(lambda conn: conn.execute("SELECT * FROM mafia_games WHERE chat_id=? AND status='WAITING' LIMIT 1", (chat_id,)).fetchone())
 
 
 def mafia_player_rows(game_id):
@@ -5080,7 +5269,7 @@ def mafia_lobby_text(game):
 def mafia_kb(game_id, can_start=False, can_stop=False):
     rows = [[InlineKeyboardButton(text="🎮 Вступить", callback_data=f"mf:join:{game_id}"), InlineKeyboardButton(text="🚪 Выйти", callback_data=f"mf:leave:{game_id}")]]
     if can_start:
-        rows.append([InlineKeyboardButton(text="▶️ Начать", callback_data=f"mf:start:{game_id}")])
+        rows.append([InlineKeyboardButton(text="▶️ Запустить MafiaAzBot", callback_data=f"mf:start:{game_id}")])
     if can_stop:
         rows.append([InlineKeyboardButton(text="⛔ Отменить", callback_data=f"mf:stop:{game_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
@@ -5088,7 +5277,7 @@ def mafia_kb(game_id, can_start=False, can_stop=False):
 
 def mafia_create_game(chat_id, creator):
     def op(conn):
-        existing = conn.execute("SELECT * FROM mafia_games WHERE chat_id=? AND status IN ('WAITING','RUNNING') LIMIT 1", (chat_id,)).fetchone()
+        existing = conn.execute("SELECT * FROM mafia_games WHERE chat_id=? AND status='WAITING' LIMIT 1", (chat_id,)).fetchone()
         if existing:
             return existing
         cur = conn.execute("INSERT INTO mafia_games(chat_id,creator_id,status,created_at) VALUES(?,?, 'WAITING',?)", (chat_id,creator.id,now()))
@@ -5123,32 +5312,20 @@ def mafia_leave(game_id,user_id):
 
 
 def mafia_start(game_id):
-    import random
-    def op(conn):
-        game = conn.execute("SELECT * FROM mafia_games WHERE id=?", (game_id,)).fetchone()
-        if not game or game["status"] != "WAITING": return None, "Игра уже началась или закрыта."
-        players = conn.execute("SELECT * FROM mafia_players WHERE game_id=? ORDER BY joined_at", (game_id,)).fetchall()
-        if len(players) < 5: return None, "Нужно минимум 5 игроков."
-        if len(players) <= 6: mafia_count = 1
-        elif len(players) <= 9: mafia_count = 2
-        else: mafia_count = 3
-        roles = ["Мафия"] * mafia_count + ["Комиссар", "Доктор"] + ["Мирный"] * max(0, len(players) - mafia_count - 2)
-        random.shuffle(roles)
-        for p, role in zip(players, roles):
-            conn.execute("UPDATE mafia_players SET role=? WHERE game_id=? AND user_id=?", (role,game_id,p["user_id"]))
-        conn.execute("UPDATE mafia_games SET status='RUNNING',started_at=? WHERE id=?", (now(),game_id)); conn.commit()
-        return conn.execute("SELECT * FROM mafia_games WHERE id=?", (game_id,)).fetchone(), players
-    return group_db_op(op)
+    """Compatibility wrapper: MafiaAzBot owns the actual game now."""
+    return None, "Внутренняя игра отключена. Используйте передачу в MafiaAzBot."
 
 
 def mafia_stop(game_id):
-    return group_db_op(lambda conn: conn.execute("UPDATE mafia_games SET status='FINISHED',finished_at=? WHERE id=? AND status IN ('WAITING','RUNNING')", (now(),game_id)).rowcount > 0)
+    return group_db_op(lambda conn: conn.execute(
+        "UPDATE mafia_games SET status='FINISHED',finished_at=? WHERE id=? AND status='WAITING'",
+        (now(),game_id)
+    ).rowcount > 0)
 
 
 @dp.message(Command("mafia"))
 async def mafia_cmd(message: Message):
-    if message.chat.type not in {"group", "supergroup"}: return
-    if not message.from_user:
+    if message.chat.type not in {"group", "supergroup"} or not message.from_user:
         return
     if mafia_is_banned(message.chat.id, message.from_user.id):
         await message.reply("🚫 Вам запрещено участвовать в мафии.")
@@ -5157,7 +5334,7 @@ async def mafia_cmd(message: Message):
     if not game:
         game = mafia_create_game(message.chat.id, message.from_user)
     players = mafia_player_rows(game["id"])
-    can_start = len(players) >= 5 and (message.from_user.id == game["creator_id"] or message.from_user.id == ADMIN_ID)
+    can_start = len(players) >= 5 and message.from_user.id in {game["creator_id"], ADMIN_ID}
     can_stop = message.from_user.id in {game["creator_id"], ADMIN_ID}
     await message.reply(mafia_lobby_text(game), reply_markup=mafia_kb(game["id"],can_start,can_stop))
 
@@ -5166,30 +5343,29 @@ async def mafia_cmd(message: Message):
 async def mafia_leave_cmd(message: Message):
     game = mafia_open_game(message.chat.id)
     if not game:
-        await message.reply("Сейчас нет активного лобби."); return
-    ok, text = mafia_leave(game["id"], message.from_user.id)
+        await message.reply("Сейчас нет активного лобби.")
+        return
+    ok,text=mafia_leave(game["id"], message.from_user.id)
     await message.reply(text)
 
 
 @dp.message(Command("mafia_ban"))
 async def mafia_ban_cmd(message: Message):
     if not is_group_admin_user(message): return
-    parts=(message.text or '').split()
-    target_id=None
+    parts=(message.text or '').split(); target_id=None
     if message.reply_to_message and message.reply_to_message.from_user: target_id=message.reply_to_message.from_user.id
     elif len(parts)>=2 and parts[1].startswith('@'):
         row=get_user_by_username(parts[1]); target_id=row['user_id'] if row else None
     if not target_id:
         await message.reply('Использование: /mafia_ban @username или ответом на сообщение.'); return
-    group_db_op(lambda conn: conn.execute("INSERT OR REPLACE INTO mafia_bans(chat_id,user_id,banned_by,reason,created_at) VALUES(?,?,?,?,?)", (message.chat.id,target_id,ADMIN_ID,'',now())))
+    group_db_op(lambda conn: conn.execute("INSERT OR REPLACE INTO mafia_bans(chat_id,user_id,banned_by,reason,created_at) VALUES(?,?,?,?,?)", (message.chat.id,target_id,message.from_user.id,'',now())))
     await message.reply('🚫 Пользователь запрещён в мафии.')
 
 
 @dp.message(Command("mafia_unban"))
 async def mafia_unban_cmd(message: Message):
     if not is_group_admin_user(message): return
-    parts=(message.text or '').split()
-    target_id=None
+    parts=(message.text or '').split(); target_id=None
     if message.reply_to_message and message.reply_to_message.from_user: target_id=message.reply_to_message.from_user.id
     elif len(parts)>=2 and parts[1].startswith('@'):
         row=get_user_by_username(parts[1]); target_id=row['user_id'] if row else None
@@ -5201,39 +5377,45 @@ async def mafia_unban_cmd(message: Message):
 @dp.callback_query(F.data.startswith("mf:"))
 async def mafia_callback(callback: CallbackQuery):
     parts=(callback.data or '').split(':')
-    if len(parts)!=3: await safe_callback_answer(callback,'Некорректная кнопка.',True); return
+    if len(parts)!=3:
+        await safe_callback_answer(callback,'Некорректная кнопка.',True); return
     action, game_raw = parts[1], parts[2]
     try: game_id=int(game_raw)
-    except ValueError: await safe_callback_answer(callback,'Некорректная игра.',True); return
+    except ValueError:
+        await safe_callback_answer(callback,'Некорректная игра.',True); return
     game=group_db_op(lambda conn: conn.execute('SELECT * FROM mafia_games WHERE id=?',(game_id,)).fetchone())
-    if not game: await safe_callback_answer(callback,'Игра не найдена.',True); return
+    if not game:
+        await safe_callback_answer(callback,'Лобби не найдено.',True); return
     if action=='join':
         ok,text=mafia_join(game_id,callback.from_user); await safe_callback_answer(callback,text,not ok)
     elif action=='leave':
         ok,text=mafia_leave(game_id,callback.from_user.id); await safe_callback_answer(callback,text,not ok)
     elif action=='start':
-        if callback.from_user.id not in {game['creator_id'], ADMIN_ID}: await safe_callback_answer(callback,'Нет доступа.',True); return
-        result=mafia_start(game_id)
-        if result[0] is None: await safe_callback_answer(callback,result[1],True); return
-        started_game, players=result
-        for p in mafia_player_rows(game_id):
-            try:
-                await bot.send_message(p['user_id'], f"🎭 МАФИЯ\n\nВаша роль: {p['role']}\n\nНе показывайте её другим игрокам.")
-            except (TelegramForbiddenError, TelegramNotFound):
-                pass
-            except Exception: logger.exception('Failed to DM mafia role | user=%s',p['user_id'])
-        await callback.message.edit_text(f"🎭 МАФИЯ НАЧАЛАСЬ\n\nИгроков: {len(players)}\nРоли розданы. Проверьте личные сообщения бота.")
-        await safe_callback_answer(callback,'Игра запущена.')
+        if callback.from_user.id not in {game['creator_id'], ADMIN_ID}:
+            await safe_callback_answer(callback,'Нет доступа.',True); return
+        players=mafia_player_rows(game_id)
+        if len(players)<5:
+            await safe_callback_answer(callback,'Нужно минимум 5 игроков.',True); return
+        try:
+            await bot.send_message(callback.message.chat.id, '/start@MafiaAzBot')
+        except Exception:
+            logger.exception('Could not send transfer command to MafiaAzBot')
+            await safe_callback_answer(callback,'Не удалось передать лобби MafiaAzBot.',True); return
+        group_db_op(lambda conn: conn.execute("UPDATE mafia_games SET status='TRANSFERRED',finished_at=? WHERE id=? AND status='WAITING'", (now(),game_id)))
+        with suppress(Exception):
+            await callback.message.edit_text(f"🎭 Лобби передано MafiaAzBot\n\nИгроков: {len(players)}")
+        await safe_callback_answer(callback,'Лобби передано MafiaAzBot.')
         return
     elif action=='stop':
-        if callback.from_user.id not in {game['creator_id'], ADMIN_ID}: await safe_callback_answer(callback,'Нет доступа.',True); return
-        mafia_stop(game_id); await safe_callback_answer(callback,'Игра отменена.',True)
-    game=mafia_open_game(callback.message.chat.id)
-    if game:
-        players=mafia_player_rows(game['id'])
-        can_start=len(players)>=5 and callback.from_user.id in {game['creator_id'],ADMIN_ID}
-        can_stop=callback.from_user.id in {game['creator_id'],ADMIN_ID}
-        with suppress(Exception): await callback.message.edit_text(mafia_lobby_text(game),reply_markup=mafia_kb(game['id'],can_start,can_stop))
+        if callback.from_user.id not in {game['creator_id'], ADMIN_ID}:
+            await safe_callback_answer(callback,'Нет доступа.',True); return
+        mafia_stop(game_id); await safe_callback_answer(callback,'Лобби отменено.')
+    active=mafia_open_game(callback.message.chat.id)
+    if active:
+        players=mafia_player_rows(active['id'])
+        can_start=len(players)>=5 and callback.from_user.id in {active['creator_id'],ADMIN_ID}
+        can_stop=callback.from_user.id in {active['creator_id'],ADMIN_ID}
+        with suppress(Exception): await callback.message.edit_text(mafia_lobby_text(active),reply_markup=mafia_kb(active['id'],can_start,can_stop))
 
 
 # =========================================================
@@ -5265,7 +5447,11 @@ async def setup_commands():
         BotCommand(command="bind_info", description="Привязать список"),
     ]
     await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
-    await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    for scope, commands in ((BotCommandScopeAllGroupChats(), user_commands),(BotCommandScopeChatAdministrators(), admin_commands),(BotCommandScopeChat(chat_id=ADMIN_ID), admin_commands)):
+        try:
+            await bot.set_my_commands(commands, scope=scope)
+        except Exception:
+            logger.exception("Could not configure command scope %s", type(scope).__name__)
     logger.info("Commands configured.")
 
 
