@@ -4502,6 +4502,118 @@ async def sync_member_tag(chat_id, user_id, *, user=None, refresh_roster=False, 
     return role
 
 
+async def adopt_external_roles(chat_id: int, user_ids: set[int]):
+    """Take over existing Telegram member tags that were not set by this bot.
+
+    For each known active regular member with a recognizable role tag and
+    bot_managed=0, the bot clears the tag and immediately restores the same
+    tag. Only after the Telegram round-trip succeeds does it mark the role as
+    bot-managed and persist the user/role/tag mapping. Existing bot-managed
+    assignments are skipped on subsequent runs.
+    """
+    adopted = []
+    skipped_bot = 0
+    skipped_no_tag = 0
+    skipped_unknown = 0
+    skipped_admin = 0
+    conflicts = 0
+    errors = 0
+
+    for user_id in sorted(user_ids):
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+            if not _chat_member_is_active(member):
+                continue
+            status = getattr(member, "status", "")
+            # Telegram's setChatMemberTag is documented for regular members.
+            if status in {"creator", "administrator"}:
+                skipped_admin += 1
+                continue
+            target_user = getattr(member, "user", None)
+            actual_tag = (getattr(member, "tag", None) or "").strip()
+            if not target_user or not actual_tag:
+                skipped_no_tag += 1
+                continue
+
+            role = role_for_tag(actual_tag)
+            if not role:
+                skipped_unknown += 1
+                continue
+
+            current = get_member(chat_id, user_id)
+            state = get_role_state(chat_id, normalize_role(role["name"]))
+            if ((current and int(current["tag_set_by_bot"] or 0) == 1)
+                    or (state and int(state["bot_managed"] or 0) == 1)):
+                skipped_bot += 1
+                continue
+
+            role_key = normalize_role(role["name"])
+            holder = group_db_op(lambda conn: conn.execute(
+                "SELECT user_id, bot_managed FROM role_state WHERE chat_id=? AND role_key=?",
+                (chat_id, role_key),
+            ).fetchone())
+            if holder and holder["user_id"] not in (None, user_id):
+                conflicts += 1
+                continue
+
+            # First remove the old tag, then restore exactly the same tag.
+            removed = await bot.set_chat_member_tag(chat_id, user_id, tag="")
+            if not removed:
+                errors += 1
+                continue
+            restored = await bot.set_chat_member_tag(chat_id, user_id, tag=actual_tag)
+            if not restored:
+                # Best-effort rollback: put the original tag back.
+                with suppress(Exception):
+                    await bot.set_chat_member_tag(chat_id, user_id, tag=actual_tag)
+                errors += 1
+                continue
+
+            def op(conn):
+                conn.execute(
+                    """
+                    INSERT INTO role_state(chat_id,role_key,role_name,user_id,status,legacy_marker,legacy_custom_emoji_id,bot_managed)
+                    VALUES(?,?,?,?,?,?,?,1)
+                    ON CONFLICT(chat_id,role_key) DO UPDATE SET
+                        user_id=excluded.user_id, role_name=excluded.role_name,
+                        status='taken', bot_managed=1
+                    """,
+                    (chat_id, role_key, role["name"], user_id, STATUS_TAKEN,
+                     STATUS_MARKER[STATUS_TAKEN], CUSTOM_EMOJI_IDS[STATUS_TAKEN]),
+                )
+                conn.execute(
+                    """
+                    INSERT INTO group_members(chat_id,user_id,first_name,last_name,username,role_key,role_name,tag,confirmed,active,joined_at,tag_set_by_bot)
+                    VALUES(?,?,?,?,?,?,?,?,0,1,?,1)
+                    ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                        first_name=excluded.first_name, last_name=excluded.last_name,
+                        username=excluded.username, role_key=excluded.role_key,
+                        role_name=excluded.role_name, tag=excluded.tag,
+                        active=1, tag_set_by_bot=1
+                    """,
+                    (chat_id, target_user.id, target_user.first_name or "",
+                     target_user.last_name or "", target_user.username or "",
+                     role_key, role["name"], actual_tag, now()),
+                )
+                conn.commit()
+            group_db_op(op)
+            record_role_history(chat_id, user_id, role_key, role["name"], actual_tag, "adopted")
+            adopted.append((role["name"], display_username_for_group(target_user)))
+        except Exception:
+            errors += 1
+            logger.exception("Role adoption failed | chat=%s user=%s", chat_id, user_id)
+
+    return {
+        "adopted": adopted,
+        "skipped_bot": skipped_bot,
+        "skipped_no_tag": skipped_no_tag,
+        "skipped_unknown": skipped_unknown,
+        "skipped_admin": skipped_admin,
+        "conflicts": conflicts,
+        "errors": errors,
+    }
+
+
 def _normalize_role_tag_value(value):
     # Telegram can return the actual member tag using mathematical/stylized
     # Unicode characters. NFKC turns those presentation variants back into
@@ -5015,7 +5127,7 @@ BUILTIN_COMMANDS = {
     "help", "mafia", "mafia_leave",
     "syncroles", "game_poll",
     "manage_commands", "addcommand", "delcommand", "commands",
-    "bindrole", "setrole",
+    "bindrole", "setrole", "adoptroles",
 }
 
 
@@ -5202,6 +5314,7 @@ async def help_cmd(message: Message):
             "\n𝗔𝗗𝗠𝗜𝗡\n"
             "/setrole — назначить роль участнику\n"
             "/syncroles — сверить роли с Telegram\n"
+            "/adoptroles — принять существующие Telegram-теги под управление бота\n"
             "/game_poll — запустить опрос на игру\n"
                     )
     if message.chat.type=="private" and message.from_user and message.from_user.id==ADMIN_ID:
@@ -5233,6 +5346,50 @@ async def roles_audit_cmd(message: Message):
     else:
         lines.append("• пока нет записей")
     await message.reply("\n".join(lines))
+
+
+@dp.message(Command("adoptroles"))
+async def adoptroles_cmd(message: Message):
+    if not require_primary_group(message):
+        return
+    if not is_group_admin_user(message):
+        await message.reply("𝗔𝗖𝗖𝗘𝗦𝗦\n\nУ вас нет прав для этой команды.")
+        return
+    chat_id = PRIMARY_CHAT_ID
+    rows = group_db_op(lambda conn: conn.execute(
+        "SELECT user_id FROM group_members WHERE chat_id=? AND active=1", (chat_id,)
+    ).fetchall())
+    user_ids = {int(r["user_id"]) for r in rows}
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        user_ids.update(int(m.user.id) for m in admins if getattr(m, "user", None))
+    except Exception:
+        logger.exception("Could not read administrators during role adoption | chat=%s", chat_id)
+
+    result = await adopt_external_roles(chat_id, user_ids)
+    adopted = result["adopted"]
+    lines = [
+        "𝗥𝗢𝗟𝗘 𝗔𝗗𝗢𝗣𝗧",
+        "",
+        f"Новых ролей принял бот: {len(adopted)}",
+        f"Уже подписаны ботом: {result['skipped_bot']}",
+        f"Без тега: {result['skipped_no_tag']}",
+        f"Неизвестный тег: {result['skipped_unknown']}",
+        f"Администраторы пропущены: {result['skipped_admin']}",
+        f"Конфликты ролей: {result['conflicts']}",
+        f"Ошибки: {result['errors']}",
+    ]
+    await message.reply("\n".join(lines))
+
+    # Send the requested concise ownership list to the owner in private chat.
+    if adopted:
+        dm_lines = ["𝗥𝗢𝗟𝗘 𝗔𝗗𝗢𝗣𝗧", ""]
+        dm_lines.extend(f"Роль участника — {role} — {who}" for role, who in adopted)
+        with suppress(Exception):
+            await bot.send_message(ADMIN_ID, "\n".join(dm_lines))
+    else:
+        with suppress(Exception):
+            await bot.send_message(ADMIN_ID, "𝗥𝗢𝗟𝗘 𝗔𝗗𝗢𝗣𝗧\n\nНовых внешних ролей для принятия не найдено.")
 
 
 @dp.message(Command("syncroles"))
@@ -6304,6 +6461,7 @@ async def setup_commands():
         BotCommand(command="game_poll", description="Опрос на игру"),
         BotCommand(command="setrole", description="Назначить роль"),
         BotCommand(command="syncroles", description="Сверить роли"),
+        BotCommand(command="adoptroles", description="Принять существующие теги"),
     ]
     private = [
         BotCommand(command="manage_commands", description="Управление командами"),
