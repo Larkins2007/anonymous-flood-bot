@@ -36,5 +36,5 @@ services:
       - .:/app
       - ./data:/app/data
       - ./log:/app/log
-    command: ["pytest", "-q", "test_delivery_recovery.py"]
+    command: ["pytest", "-q"]
     restart: "no"
