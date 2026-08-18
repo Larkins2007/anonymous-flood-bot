@@ -11,8 +11,8 @@ TREE = ast.parse(SRC)
 def test_command_matrix_and_routing():
     required = [
         'help','roles','mafia','mafia_leave',
-        'setrole','release','syncroles','member','role',
-        'game_poll','schedule_set','mafia_ban',
+        'setrole','syncroles','role',
+        'game_poll',
         'manage_commands','addcommand','delcommand','commands','bindrole'
     ]
     handlers = set(re.findall(r'@dp\.message\(Command\("([a-z0-9_]+)"\)', SRC))
@@ -108,3 +108,22 @@ def test_role_persistence_and_member_lookup():
     assert 'Роль участника:' in SRC
     assert 'async def bindrole_private_command' in SRC
     assert 'async def sign_assigned_role_private' in SRC
+
+
+def test_game_poll_has_real_lookup_and_no_refresh_button():
+    assert 'def get_game_by_id' in SRC
+    poll = SRC.split('def game_poll_keyboard', 1)[1].split('@dp.message(Command("game_poll"))', 1)[0]
+    assert 'callback_data=f"gp:v:' in poll
+    assert 'callback_data=f"gp:i:' in poll
+    assert 'Обновить' not in poll
+    callback = SRC.split('@dp.callback_query(F.data.startswith("gp:"))', 1)[1].split('def next_scheduled_slot', 1)[0]
+    assert 'await callback.message.edit_text' in callback
+    assert 'get_game_by_id(gid)' in callback
+
+
+def test_removed_commands_are_really_gone():
+    for old in ("member", "release", "schedule_set", "mafia_ban", "mafia_unban"):
+        assert f'@dp.message(Command("{old}"))' not in SRC
+        assert f'BotCommand(command="{old}"' not in SRC
+    for marker in ("/release", "/member", "/schedule_set", "/mafia_ban", "/mafia_unban"):
+        assert marker not in SRC

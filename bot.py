@@ -4962,48 +4962,6 @@ async def setrole_cmd(message: Message):
         await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nНе удалось назначить роль.")
 
 
-@dp.message(Command("release"))
-async def release_role_cmd(message: Message):
-    if not is_group_admin_user(message):
-        await message.reply("𝗔𝗖𝗖𝗘𝗦𝗦\n\nУ вас нет прав для этой команды.")
-        return
-    text = (message.text or "").strip()
-    parts = text.split(maxsplit=1)
-    role_text = parts[1].strip() if len(parts) > 1 else ""
-    if not role_text:
-        await message.reply("𝗥𝗢𝗟𝗘 𝗥𝗘𝗟𝗘𝗔𝗦𝗘𝗗\n\nИспользование: /release <название роли>")
-        return
-    role = role_for(role_text)
-    if not role:
-        await message.reply("𝗥𝗢𝗟𝗘 𝗥𝗘𝗟𝗘𝗔𝗦𝗘𝗗\n\nРоль не найдена в каталоге.")
-        return
-    key = normalize_role(role["name"] if isinstance(role, dict) else role_text)
-    row = group_db_op(lambda conn: conn.execute("SELECT * FROM role_state WHERE chat_id=? AND role_key=?", (message.chat.id, key)).fetchone())
-    if not row:
-        await message.reply("𝗥𝗢𝗟𝗘 𝗥𝗘𝗟𝗘𝗔𝗦𝗘\n\nЭта роль ещё не зарегистрирована в этом чате.")
-        return
-    user_id = row["user_id"]
-    if user_id is None:
-        # Clear pending status without touching Telegram members.
-        group_db_op(lambda conn: (conn.execute("UPDATE role_state SET status='free', user_id=NULL, bot_managed=0, legacy_marker='' WHERE chat_id=? AND role_key=?", (message.chat.id, key)), conn.commit()))
-
-        await message.reply(f"𝗥𝗢𝗟𝗘 𝗥𝗘𝗟𝗘𝗔𝗦𝗘𝗗\n\nРоль: {role['name']}\nСостояние: свободна.")
-        return
-    try:
-        await bot.set_chat_member_tag(message.chat.id, user_id, tag="")
-    except Exception as exc:
-        await message.reply(f"❌ Не удалось снять тег с участника: {exc}")
-        return
-    group_db_op(lambda conn: (
-        conn.execute("UPDATE role_state SET status='free', user_id=NULL, bot_managed=0, legacy_marker='' WHERE chat_id=? AND role_key=?", (message.chat.id, key)),
-        conn.execute("UPDATE group_members SET role_key=NULL, role_name=NULL, tag='', tag_set_by_bot=1 WHERE chat_id=? AND user_id=?", (message.chat.id, user_id)),
-        conn.commit()
-    ))
-
-    await message.reply(f"𝗥𝗢𝗟𝗘 𝗥𝗘𝗟𝗘𝗔𝗦𝗘𝗗\n\nРоль: {role['name']}\nСостояние: свободна.")
-
-
-
 def _normalize_custom_command_name(value: str) -> str:
     value = (value or "").strip().lower()
     value = value.removeprefix("/")
@@ -5013,10 +4971,10 @@ def _normalize_custom_command_name(value: str) -> str:
 
 
 BUILTIN_COMMANDS = {
-    "help", "roles", "me", "mafia", "mafia_leave",
-    "release", "syncroles", "member", "pending",
-    "mafia_ban", "mafia_unban",
+    "help", "roles", "mafia", "mafia_leave",
+    "syncroles", "role", "game_poll", "schedule_set",
     "manage_commands", "addcommand", "delcommand", "commands",
+    "bindrole", "setrole",
 }
 
 
@@ -5178,7 +5136,7 @@ async def commands_cmd(message: Message):
     if message.chat.type != "private" or not message.from_user or message.from_user.id != ADMIN_ID:
         return
     rows = get_custom_commands()
-    lines = ["𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦", "", "Встроенные:", "/help", "/roles", "/mafia", "/mafia_leave", "/release", "/syncroles", "/member", "/role", "/game_poll", "/schedule_set", "/mafia_ban"]
+    lines = ["𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦", "", "Встроенные:", "/help", "/roles", "/mafia", "/mafia_leave", "/setrole", "/syncroles", "/role", "/game_poll"]
     lines += ["", "Пользовательские:"]
     if rows:
         for row in rows:
@@ -5201,13 +5159,9 @@ async def help_cmd(message: Message):
         text += (
             "\n𝗔𝗗𝗠𝗜𝗡\n"
             "/setrole — назначить роль участнику\n"
-            "/release — освободить роль\n"
             "/syncroles — сверить роли с Telegram\n"
-            "/member — информация об участнике\n"
             "/game_poll — запустить опрос на игру\n"
-            "/schedule_set — изменить расписание\n"
-            "/mafia_ban — запретить участие\n"
-        )
+                    )
     if message.chat.type=="private" and message.from_user and message.from_user.id==ADMIN_ID:
         text += (
             "\n𝗟𝗦 𝗔𝗗𝗠𝗜𝗡\n"
@@ -5290,11 +5244,10 @@ async def sync_roles_cmd(message: Message):
 
 @dp.message(Command("role"))
 async def role_info_alias_cmd(message: Message):
-    """Friendly alias for /member when checking one participant's role."""
+    """Friendly alias for checking one participant's role."""
     await member_info_cmd(message)
 
 
-@dp.message(Command("member"))
 async def member_info_cmd(message: Message):
     if not _is_group_message(message):
         return
@@ -5449,6 +5402,14 @@ def get_games(enabled_only=True):
     sql="SELECT * FROM game_catalog"+(' WHERE enabled=1' if enabled_only else '')+" ORDER BY id"
     return group_db_op(lambda conn: conn.execute(sql).fetchall())
 
+def get_game_by_id(game_id, enabled_only=False):
+    """Return a single game by id; used by poll callbacks and winner resolution."""
+    sql = "SELECT * FROM game_catalog WHERE id=?"
+    params = (int(game_id),)
+    if enabled_only:
+        sql += " AND enabled=1"
+    return group_db_op(lambda conn: conn.execute(sql, params).fetchone())
+
 def add_game(name, description="", launch_text=""):
     name=(name or "").strip()
     if not name: raise ValueError("EMPTY_GAME")
@@ -5470,7 +5431,6 @@ def game_poll_keyboard(poll_id, games, current_vote=None):
             InlineKeyboardButton(text=label, callback_data=f"gp:v:{poll_id}:{gid}"),
             InlineKeyboardButton(text="ℹ", callback_data=f"gp:i:{poll_id}:{gid}"),
         ])
-    rows.append([InlineKeyboardButton(text="Обновить", callback_data=f"gp:r:{poll_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def poll_duration_keyboard():
@@ -5493,37 +5453,13 @@ async def game_poll_cmd(message: Message):
     await message.reply("𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟\n\nНа сколько оставить опрос?",reply_markup=poll_duration_keyboard())
 
 
-@dp.message(Command("schedule_set"))
-async def schedule_set_cmd(message: Message):
-    if not _is_group_message(message) or not is_group_admin_user(message): return
-    raw=(message.text or "").split(maxsplit=1)
-    if len(raw)<2:
-        await message.reply("𝗦𝗖𝗛𝗘𝗗𝗨𝗟𝗘\n\n/schedule_set День|HH:MM|Игра|Примечание\n\nЦикл: Вторник, Четверг, Суббота, Понедельник, Среда, Пятница, Воскресенье")
-        return
-    parts=[x.strip() for x in raw[1].split('|')]
-    if len(parts)<3:
-        await message.reply("𝗦𝗖𝗛𝗘𝗗𝗨𝗟𝗘\n\nПример: /schedule_set Пятница|20:00|Чёрный ящик")
-        return
-    selected=get_games(False)
-    if not any(str(r["name"]).casefold()==parts[2].casefold() and int(r["enabled"])==1 for r in selected):
-        await message.reply("𝗦𝗖𝗛𝗘𝗗𝗨𝗟𝗘\n\nТакой игры нет в расписании. Выбери одну из игр каталога.")
-        return
-    try:
-        set_schedule(message.chat.id,parts[0],parts[1],parts[2],parts[3] if len(parts)>3 else "")
-    except ValueError:
-        await message.reply("𝗦𝗖𝗛𝗘𝗗𝗨𝗟𝗘\n\nПроверь день цикла и время HH:MM.")
-        return
-    await pin_schedule(message.chat.id)
-    await message.reply("𝗦𝗖𝗛𝗘𝗗𝗨𝗟𝗘\n\nСлот сохранён и расписание закреплено.")
-
-
 def game_poll_text(poll, games, counts):
     expires = datetime.fromisoformat(poll["expires_at"]).astimezone(timezone.utc)
     total_votes = sum(int(counts.get(int(g["id"]), 0)) for g in games)
     lines = [
         "𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟",
         "",
-        "Нажмите на название игры, чтобы выбрать её. Выбор можно изменить.",
+        "Выберите одну игру. Нажатие на название меняет ваш голос.",
         "Нажмите ℹ рядом с игрой, чтобы открыть описание.",
         "",
     ]
@@ -5643,8 +5579,6 @@ async def game_poll_callback(callback: CallbackQuery):
             (pid,callback.from_user.id,gid,now()),
         ),conn.commit()))
         await safe_callback_answer(callback,'Выбор сохранён. Его можно изменить.')
-    elif action=='r':
-        await safe_callback_answer(callback,'Обновлено.')
     else:
         await safe_callback_answer(callback,'Неизвестное действие.',True); return
 
@@ -5726,7 +5660,7 @@ async def game_poll_refresh_worker():
             raise
         except Exception:
             logger.exception("Game poll refresh worker failed")
-        await asyncio.sleep(20)
+        await asyncio.sleep(10)
 
 
 async def schedule_worker():
@@ -6036,19 +5970,6 @@ async def mafia_leave_cmd(message: Message):
             await _update_mafia_lobby_message(active)
 
 
-@dp.message(Command("mafia_ban"))
-async def mafia_ban_cmd(message: Message):
-    if not is_group_admin_user(message): return
-    parts=(message.text or '').split(); target_id=None
-    if message.reply_to_message and message.reply_to_message.from_user: target_id=message.reply_to_message.from_user.id
-    elif len(parts)>=2 and parts[1].startswith('@'):
-        row=get_user_by_username(parts[1]); target_id=row['user_id'] if row else None
-    if not target_id:
-        await message.reply('Использование: /mafia_ban @username или ответом на сообщение.'); return
-    group_db_op(lambda conn: conn.execute("INSERT OR REPLACE INTO mafia_bans(chat_id,user_id,banned_by,reason,created_at) VALUES(?,?,?,?,?)", (message.chat.id,target_id,message.from_user.id,'',now())))
-    await message.reply('𝗠𝗔𝗙𝗜𝗔 𝗕𝗟𝗔𝗖𝗞𝗟𝗜𝗦𝗧\n\nПользователь больше не может вступать в лобби.')
-
-
 @dp.callback_query(F.data.startswith("mf:"))
 async def mafia_callback(callback: CallbackQuery):
     parts=(callback.data or '').split(':')
@@ -6149,13 +6070,9 @@ async def setup_commands():
     base_admin=[
         *base_user,
         BotCommand(command="setrole",description="Назначить роль"),
-        BotCommand(command="release",description="Освободить роль"),
         BotCommand(command="syncroles",description="Сверить роли"),
-        BotCommand(command="member",description="Участник"),
         BotCommand(command="role",description="Роль участника"),
         BotCommand(command="game_poll",description="Опрос на игру"),
-        BotCommand(command="schedule_set",description="Изменить расписание"),
-        BotCommand(command="mafia_ban",description="Запретить мафию"),
     ]
     private=[
         BotCommand(command="manage_commands",description="Управление командами"),
