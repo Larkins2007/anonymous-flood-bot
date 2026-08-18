@@ -1,0 +1,40 @@
+services:
+  bot:
+    build: .
+    container_name: afb_bot_staging
+    env_file:
+      - .env
+    environment:
+      BOT_TOKEN: "${BOT_TOKEN}"
+      DB_PATH: "/app/data/staging.db"
+      PORT: "10000"
+      LOG_FILE: "/app/log/staging.log"
+      DELIVERY_WORKERS: "${DELIVERY_WORKERS:-2}"
+      BROADCAST_WORKERS: "${BROADCAST_WORKERS:-1}"
+      DELIVERY_PART_DELAY: "${DELIVERY_PART_DELAY:-0.2}"
+    volumes:
+      - ./data:/app/data
+      - ./log:/app/log
+    ports:
+      - "10000:10000"
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD-SHELL", "curl -fsS --max-time 2 http://127.0.0.1:10000/health >/dev/null"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  tests:
+    build: .
+    container_name: afb_bot_tests
+    env_file:
+      - .env
+    environment:
+      DB_PATH: "/app/data/test.db"
+      PORT: "10001"
+    volumes:
+      - .:/app
+      - ./data:/app/data
+      - ./log:/app/log
+    command: ["pytest", "-q"]
+    restart: "no"
