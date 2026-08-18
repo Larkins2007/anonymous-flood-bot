@@ -25,13 +25,13 @@ assert len({r[0] for r in roles}) == 148
 assert len({r[1] for r in roles}) == 148
 
 # important commands exposed in the menu
-for command in ('help', 'roles', 'mafia', 'mafia_leave', 'setrole', 'release', 'syncroles', 'member', 'pending', 'mafia_ban', 'mafia_unban'):
+for command in ('help', 'roles', 'me', 'mafia', 'mafia_leave', 'release', 'syncroles', 'member', 'pending', 'mafia_ban', 'mafia_unban'):
     assert f'BotCommand(command="{command}"' in SRC
 
 # commands explicitly removed from menu / old list mechanics
 for command in ('start', 'cancel', 'free_roles', 'all_roles', 'checkbot', 'id', 'admin', 'bind_group'):
     assert f'BotCommand(command="{command}"' not in SRC
-for legacy in ('update_group_roster', 'capture_list', 'sync_list', 'bind_info', 'roster_sources', 'TEST_ROSTER', 'build_roster_message'):
+for legacy in ('update_group_roster', 'capture_list', 'sync_list', 'bind_info', 'roster_sources', 'TEST_ROSTER', 'build_roster_message', 'set_role_cmd'):
     assert legacy not in SRC
 
 # kall must remain the text shortcut, not a Command("kall") handler.

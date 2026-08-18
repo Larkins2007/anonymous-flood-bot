@@ -22,11 +22,15 @@ print('REQUESTED BEHAVIOR TEST PASSED')
 # Welcome is about rules/confirmation, not role verification.
 assert 'ознакомлен(а) с правилами' in s
 assert 'самостоятельно несёшь ответственность' in s
+assert 'правилами флуда' in s
+assert 'После подтверждения ограничение' not in s
+assert 'Администратор получит уведомление о подтверждении.' not in s
 assert 'Администратор назначит её после проверки' not in s
 
-# Confirmation notifies owner and lifts restrictions.
+# Confirmation notifies owner, but restriction is released only by kall <role>.
 assert '𝗥𝗨𝗟𝗘𝗦 𝗖𝗢𝗡𝗙𝗜𝗥𝗠𝗘𝗗' in s
-assert 'lift_member_restriction(chat_id, target_user_id)' in s
+assert 'confirm_member(chat_id, target_user_id)' in s
+assert 'restriction_lifted = await lift_member_restriction(message.chat.id, target.id)' in s
 assert 'await bot.send_message(\n            ADMIN_ID' in s
 
 # Departure never triggers welcome; old welcome is removed.
