@@ -10,10 +10,10 @@ TREE = ast.parse(SRC)
 
 def test_command_matrix_and_routing():
     required = [
-        'help','roles','me','games','schedule','mafia','mafia_leave',
-        'setrole','release','syncroles','member','role','pending',
-        'game_add','game_remove','game_poll','schedule_set','schedule_remove',
-        'mafia_ban','mafia_unban','manage_commands','addcommand','delcommand','commands','bindrole'
+        'help','roles','mafia','mafia_leave',
+        'setrole','release','syncroles','member','role',
+        'game_poll','schedule_set','mafia_ban',
+        'manage_commands','addcommand','delcommand','commands','bindrole'
     ]
     handlers = set(re.findall(r'@dp\.message\(Command\("([a-z0-9_]+)"\)', SRC))
     assert not [x for x in required if x not in handlers]
@@ -64,7 +64,10 @@ def test_game_vote_is_single_and_changeable():
     conn.execute("INSERT INTO votes VALUES(1,100,4,'b') ON CONFLICT(poll_id,user_id) DO UPDATE SET game_id=excluded.game_id,voted_at=excluded.voted_at")
     assert conn.execute('SELECT game_id FROM votes WHERE poll_id=1 AND user_id=100').fetchone()[0] == 4
     assert 'gp:i:' in SRC
-    assert 'Нажмите ℹ рядом с игрой' in SRC
+    assert 'Нажмите ℹ рядом с игрой' in SRC or 'Нажмите на название игры, чтобы выбрать её.' in SRC
+    assert 'InlineKeyboardButton(text=label, callback_data=f"gp:v:{poll_id}:{gid}")' in SRC
+    assert 'label = compact_game_name(game["name"])' in SRC
+    assert 'counts.get(gid, 0)' not in SRC.split('def game_poll_keyboard',1)[1].split('def poll_duration_keyboard',1)[0]
 
 
 def test_schedule_cycle():

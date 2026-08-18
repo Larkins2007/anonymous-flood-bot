@@ -5178,7 +5178,7 @@ async def commands_cmd(message: Message):
     if message.chat.type != "private" or not message.from_user or message.from_user.id != ADMIN_ID:
         return
     rows = get_custom_commands()
-    lines = ["𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦", "", "Встроенные:", "/help", "/roles", "/me", "/mafia", "/mafia_leave", "/release", "/syncroles", "/member", "/role", "/pending", "/games", "/schedule", "/game_poll", "/game_add", "/game_remove", "/schedule_set", "/schedule_remove", "/mafia_ban", "/mafia_unban"]
+    lines = ["𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦", "", "Встроенные:", "/help", "/roles", "/mafia", "/mafia_leave", "/release", "/syncroles", "/member", "/role", "/game_poll", "/schedule_set", "/mafia_ban"]
     lines += ["", "Пользовательские:"]
     if rows:
         for row in rows:
@@ -5194,9 +5194,6 @@ async def help_cmd(message: Message):
         "𝗛𝗘𝗟𝗣\n\n"
         "Основные команды\n"
         "/roles — назначенные роли\n"
-        "/me — моя роль\n"
-        "/games — список игр и описаний\n"
-        "/schedule — расписание недели\n"
         "/mafia — открыть лобби MafiaAzBot\n"
         "/mafia_leave — выйти из лобби\n"
     )
@@ -5207,14 +5204,9 @@ async def help_cmd(message: Message):
             "/release — освободить роль\n"
             "/syncroles — сверить роли с Telegram\n"
             "/member — информация об участнике\n"
-            "/pending — новые участники\n"
-            "/game_add — добавить игру\n"
-            "/game_remove — убрать игру\n"
             "/game_poll — запустить опрос на игру\n"
             "/schedule_set — изменить расписание\n"
-            "/schedule_remove — удалить слот\n"
             "/mafia_ban — запретить участие\n"
-            "/mafia_unban — снять запрет\n"
         )
     if message.chat.type=="private" and message.from_user and message.from_user.id==ADMIN_ID:
         text += (
@@ -5226,17 +5218,6 @@ async def help_cmd(message: Message):
     if visible:
         text += "\n𝗖𝗨𝗦𝗧𝗢𝗠\n" + "\n".join(f"/{r['command']} — {r['description']}" for r in visible)
     await message.reply(text)
-
-
-@dp.message(Command("me"))
-async def my_role_cmd(message: Message):
-    if not _is_group_message(message) or not message.from_user:
-        return
-    row = get_member(message.chat.id, message.from_user.id)
-    if not row or not row["role_name"]:
-        await message.reply("𝗠𝗬 𝗥𝗢𝗟𝗘\n\nРоль пока не назначена.")
-        return
-    await message.reply(f"𝗠𝗬 𝗥𝗢𝗟𝗘\n\nРоль участника: {row['role_name']}\nТег: {row['tag'] or '—'}")
 
 
 @dp.message(Command("roles"))
@@ -5307,23 +5288,6 @@ async def sync_roles_cmd(message: Message):
     )
 
 
-@dp.message(Command("pending"))
-async def pending_cmd(message: Message):
-    if not _is_group_message(message):
-        return
-    if not is_group_admin_user(message):
-        return
-    rows = group_db_op(lambda conn: conn.execute("SELECT * FROM group_members WHERE chat_id=? AND active=1 AND confirmed=0 ORDER BY joined_at DESC LIMIT 50", (message.chat.id,)).fetchall())
-    if not rows:
-        await message.reply("𝗣𝗘𝗡𝗗𝗜𝗡𝗚 𝗠𝗘𝗠𝗕𝗘𝗥𝗦\n\nСейчас новых участников без роли нет.")
-        return
-    lines = ["Ожидают подтверждения:"]
-    for row in rows:
-        who = f"@{row['username']}" if row['username'] else row['first_name']
-        lines.append(f"• {who} | {row['user_id']} | {row['role_name'] or 'роль не назначена'}")
-    await message.reply("\n".join(lines))
-
-
 @dp.message(Command("role"))
 async def role_info_alias_cmd(message: Message):
     """Friendly alias for /member when checking one participant's role."""
@@ -5374,9 +5338,9 @@ SCHEDULE_DAY_TO_SLOT={name:i for i,(name,_) in enumerate(SCHEDULE_CYCLE_DAYS)}
 
 GAME_DEFINITIONS = [
     ("Шпион", "Все участники, кроме одного, знают загаданную локацию. Игроки задают друг другу вопросы, пытаясь вычислить шпиона. Задача шпиона — понять локацию и назвать её.", ""),
-    ("Жених и невеста", "Ведущий выбирает жениха, остальные становятся невестами и получают номера. Жених задаёт вопросы ведущему, невесты отвечают ему в личке. Жених выбирает, чья анонимная позиция выбывает. Игра заканчивается, когда остаётся одна невеста.", ""),
+    ("Жених и невеста", "Ведущий выбирает жениха, остальные получают номера. Жених задаёт вопросы, невесты отвечают в личке ведущего. Жених выбирает, чей ответ выбивает участницу. Побеждает последняя оставшаяся невеста.", ""),
     ("Правда или ложь", "Каждый участник рассказывает три факта о себе: два правдивых и один ложный. Остальные пытаются определить ложный факт и получают баллы за правильные ответы.", ""),
-    ("Мафия", "Игроки получают случайные роли и делятся на мирных жителей и мафию. Днём проходит обсуждение и голосование, ночью мафия действует. Наш бот только собирает игроков и передаёт запуск MafiaAzBot.", "/start@MafiaAzBot"),
+    ("Мафия", "Игроки получают роли и делятся на мирных и мафию. Днём обсуждение и голосование, ночью действует мафия. Наш бот только собирает игроков и передаёт запуск MafiaAzBot.", "/start@MafiaAzBot"),
     ("Снежный ком историй", "Первый игрок начинает историю одним предложением. Каждый следующий повторяет предыдущие предложения и добавляет своё. История постепенно превращается в общий абсурдный рассказ.", ""),
     ("Чёрный ящик", "Ведущий объявляет, что в воображаемом чёрном ящике лежит предмет. Игроки задают наводящие вопросы, а ведущий описывает свойства, функции, историю или ассоциации предмета.", ""),
     ("Бункер", "После катаклизма игроки пытаются попасть в бункер. Каждый получает случайные характеристики и постепенно раскрывает их, убеждая остальных, что именно он должен выжить.", ""),
@@ -5497,12 +5461,11 @@ def compact_game_name(name, limit=24):
     value = str(name)
     return value if len(value) <= limit else value[: limit - 1] + "…"
 
-def game_poll_keyboard(poll_id, games, counts, current_vote=None):
-    rows=[]
+def game_poll_keyboard(poll_id, games, current_vote=None):
+    rows = []
     for game in games:
-        gid=int(game["id"])
-        prefix = "✓ " if current_vote == gid else ""
-        label = f"{prefix}{compact_game_name(game['name'])} · {counts.get(gid, 0)}"
+        gid = int(game["id"])
+        label = compact_game_name(game["name"])
         rows.append([
             InlineKeyboardButton(text=label, callback_data=f"gp:v:{poll_id}:{gid}"),
             InlineKeyboardButton(text="ℹ", callback_data=f"gp:i:{poll_id}:{gid}"),
@@ -5513,39 +5476,6 @@ def game_poll_keyboard(poll_id, games, counts, current_vote=None):
 def poll_duration_keyboard():
     opts=[(15,"15 мин"),(30,"30 мин"),(60,"1 час"),(120,"2 часа"),(360,"6 часов"),(1440,"1 день"),(10080,"7 дней")]
     return InlineKeyboardMarkup(inline_keyboard=[ [InlineKeyboardButton(text=l,callback_data=f"gp:d:{m}") for m,l in opts[i:i+2]] for i in range(0,len(opts),2) ]+[[InlineKeyboardButton(text="Отмена",callback_data="gp:cancel")]])
-
-
-@dp.message(Command("games"))
-async def games_cmd(message: Message):
-    if _is_group_message(message):
-        ensure_default_schedule(message.chat.id)
-    rows=get_games()
-    lines=["𝗚𝗔𝗠𝗘𝗦","","Доступные игры:"]
-    lines += [f"{i}. {r['name']}" for i,r in enumerate(rows,1)] or ["Пока игр нет."]
-    lines += ["", "В опросе рядом с каждой игрой есть ℹ — там откроется короткое описание."]
-    await message.reply("\n".join(lines))
-
-
-@dp.message(Command("game_add"))
-async def game_add_cmd(message: Message):
-    if not _is_group_message(message) or not is_group_admin_user(message): return
-    raw=(message.text or "").split(maxsplit=1)
-    if len(raw)<2:
-        await message.reply("𝗚𝗔𝗠𝗘𝗦\n\n/game_add Название | описание | команда запуска")
-        return
-    parts=[x.strip() for x in raw[1].split('|')]
-    add_game(parts[0],parts[1] if len(parts)>1 else '',parts[2] if len(parts)>2 else '')
-    await message.reply(f"𝗚𝗔𝗠𝗘𝗦\n\nИгра «{parts[0]}» сохранена.")
-
-
-@dp.message(Command("game_remove"))
-async def game_remove_cmd(message: Message):
-    if not _is_group_message(message) or not is_group_admin_user(message): return
-    raw=(message.text or "").split(maxsplit=1)
-    if len(raw)<2:
-        await message.reply("𝗚𝗔𝗠𝗘𝗦\n\n/game_remove Название")
-        return
-    await message.reply("𝗚𝗔𝗠𝗘𝗦\n\nИгра убрана." if remove_game(raw[1]) else "𝗚𝗔𝗠𝗘𝗦\n\nТакой игры нет.")
 
 
 @dp.message(Command("game_poll"))
@@ -5563,16 +5493,6 @@ async def game_poll_cmd(message: Message):
     await message.reply("𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟\n\nНа сколько оставить опрос?",reply_markup=poll_duration_keyboard())
 
 
-@dp.message(Command("schedule"))
-async def schedule_cmd(message: Message):
-    if not _is_group_message(message):
-        await message.reply("𝗦𝗖𝗛𝗘𝗗𝗨𝗟𝗘\n\nЭто расписание группы. Открой команду в чате.")
-        return
-    ensure_default_schedule(message.chat.id)
-    await pin_schedule(message.chat.id)
-    await message.reply(schedule_text(message.chat.id))
-
-
 @dp.message(Command("schedule_set"))
 async def schedule_set_cmd(message: Message):
     if not _is_group_message(message) or not is_group_admin_user(message): return
@@ -5586,7 +5506,7 @@ async def schedule_set_cmd(message: Message):
         return
     selected=get_games(False)
     if not any(str(r["name"]).casefold()==parts[2].casefold() and int(r["enabled"])==1 for r in selected):
-        await message.reply("𝗦𝗖𝗛𝗘𝗗𝗨𝗟𝗘\n\nТакой включённой игры нет в каталоге. Сначала добавь её через /game_add.")
+        await message.reply("𝗦𝗖𝗛𝗘𝗗𝗨𝗟𝗘\n\nТакой игры нет в расписании. Выбери одну из игр каталога.")
         return
     try:
         set_schedule(message.chat.id,parts[0],parts[1],parts[2],parts[3] if len(parts)>3 else "")
@@ -5597,16 +5517,44 @@ async def schedule_set_cmd(message: Message):
     await message.reply("𝗦𝗖𝗛𝗘𝗗𝗨𝗟𝗘\n\nСлот сохранён и расписание закреплено.")
 
 
-@dp.message(Command("schedule_remove"))
-async def schedule_remove_cmd(message: Message):
-    if not _is_group_message(message) or not is_group_admin_user(message): return
-    raw=(message.text or "").split(maxsplit=1)
-    if len(raw)<2:
-        await message.reply("𝗦𝗖𝗛𝗘𝗗𝗨𝗟𝗘\n\n/schedule_remove День")
+def game_poll_text(poll, games, counts):
+    expires = datetime.fromisoformat(poll["expires_at"]).astimezone(timezone.utc)
+    total_votes = sum(int(counts.get(int(g["id"]), 0)) for g in games)
+    lines = [
+        "𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟",
+        "",
+        "Нажмите на название игры, чтобы выбрать её. Выбор можно изменить.",
+        "Нажмите ℹ рядом с игрой, чтобы открыть описание.",
+        "",
+    ]
+    for game in games:
+        lines.append(f"{game['name']} — {counts.get(int(game['id']), 0)}")
+    lines.extend([
+        "",
+        f"Всего голосов: {total_votes}",
+        f"Опрос завершится: {expires.strftime('%d.%m %H:%M UTC')}."
+    ])
+    return "\n".join(lines)
+
+
+async def refresh_game_poll_message(poll_id):
+    poll = group_db_op(lambda conn: conn.execute(
+        "SELECT * FROM game_polls WHERE id=?", (poll_id,)
+    ).fetchone())
+    if not poll or poll["status"] != "OPEN" or not poll["message_id"]:
         return
-    ok=delete_schedule(message.chat.id,raw[1].strip())
-    await pin_schedule(message.chat.id)
-    await message.reply("𝗦𝗖𝗛𝗘𝗗𝗨𝗟𝗘\n\nСлот удалён." if ok else "𝗦𝗖𝗛𝗘𝗗𝗨𝗟𝗘\n\nТакого дня в цикле нет.")
+    counts = {int(r["game_id"]): int(r["votes"]) for r in group_db_op(lambda conn: conn.execute(
+        "SELECT game_id, COUNT(*) votes FROM game_poll_votes WHERE poll_id=? GROUP BY game_id", (poll_id,)
+    ).fetchall())}
+    games = get_games()
+    with suppress(Exception):
+        await bot.edit_message_text(
+            chat_id=poll["chat_id"],
+            message_id=poll["message_id"],
+            text=game_poll_text(poll, games, counts),
+            reply_markup=game_poll_keyboard(poll_id, games, None),
+        )
+
 
 @dp.callback_query(F.data.startswith("gp:"))
 async def game_poll_callback(callback: CallbackQuery):
@@ -5637,7 +5585,8 @@ async def game_poll_callback(callback: CallbackQuery):
         game=get_game_by_id(gid)
         if not game:
             await safe_callback_answer(callback,'Игра не найдена.',True); return
-        await safe_callback_answer(callback, str(game['description'])[:190], True)
+        description = (str(game['description']).strip() or 'Для этой игры описание пока не добавлено.')[:190]
+        await safe_callback_answer(callback, description, True)
         return
 
     if action=='d' and len(parts)==3:
@@ -5654,9 +5603,12 @@ async def game_poll_callback(callback: CallbackQuery):
             )
             conn.commit(); return cur.lastrowid
         pid=group_db_op(op)
+        poll_row = group_db_op(lambda conn: conn.execute(
+            "SELECT * FROM game_polls WHERE id=?", (pid,)
+        ).fetchone())
         msg=await callback.message.answer(
-            "𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟\n\nВыберите одну игру на эту неделю. Выбор можно изменить.\nНажмите ℹ рядом с игрой, чтобы открыть её описание.",
-            reply_markup=game_poll_keyboard(pid,games,{},None),
+            game_poll_text(poll_row, games, {}),
+            reply_markup=game_poll_keyboard(pid, games, None),
         )
         group_db_op(lambda conn:(conn.execute("UPDATE game_polls SET message_id=? WHERE id=?",(msg.message_id,pid)),conn.commit()))
         with suppress(Exception):
@@ -5704,15 +5656,11 @@ async def game_poll_callback(callback: CallbackQuery):
         "SELECT game_id FROM game_poll_votes WHERE poll_id=? AND user_id=?",(pid,callback.from_user.id)
     ).fetchone())
     current_vote=int(current['game_id']) if current else None
-    expires=datetime.fromisoformat(poll['expires_at']).astimezone(timezone.utc)
-    text=(
-        "𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟\n\n"
-        "Выберите одну игру на эту неделю. Выбор можно изменить.\n"
-        "Нажмите ℹ рядом с игрой, чтобы открыть её описание.\n\n"
-        + "\n".join(f"{g['name']} — {counts.get(int(g['id']),0)}" for g in games)
-        + f"\n\nОпрос завершится: {expires.strftime('%d.%m %H:%M UTC')}."
+    text = game_poll_text(poll, games, counts)
+    await callback.message.edit_text(
+        text,
+        reply_markup=game_poll_keyboard(pid, games, current_vote),
     )
-    await callback.message.edit_text(text,reply_markup=game_poll_keyboard(pid,games,counts,current_vote))
 
 def next_scheduled_slot(chat_id, after_local):
     slot=next_cycle_slot(chat_id, after_local)
@@ -5765,6 +5713,21 @@ async def expire_game_poll(poll_id,seconds):
             await bot.edit_message_text(chat_id=poll['chat_id'],message_id=poll['message_id'],text=final)
         with suppress(Exception):
             await bot.pin_chat_message(poll['chat_id'],poll['message_id'],disable_notification=True)
+
+async def game_poll_refresh_worker():
+    while True:
+        try:
+            polls = group_db_op(lambda conn: conn.execute(
+                "SELECT id FROM game_polls WHERE status='OPEN'"
+            ).fetchall())
+            for row in polls:
+                await refresh_game_poll_message(int(row["id"]))
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Game poll refresh worker failed")
+        await asyncio.sleep(20)
+
 
 async def schedule_worker():
     while True:
@@ -6086,18 +6049,6 @@ async def mafia_ban_cmd(message: Message):
     await message.reply('𝗠𝗔𝗙𝗜𝗔 𝗕𝗟𝗔𝗖𝗞𝗟𝗜𝗦𝗧\n\nПользователь больше не может вступать в лобби.')
 
 
-@dp.message(Command("mafia_unban"))
-async def mafia_unban_cmd(message: Message):
-    if not is_group_admin_user(message): return
-    parts=(message.text or '').split(); target_id=None
-    if message.reply_to_message and message.reply_to_message.from_user: target_id=message.reply_to_message.from_user.id
-    elif len(parts)>=2 and parts[1].startswith('@'):
-        row=get_user_by_username(parts[1]); target_id=row['user_id'] if row else None
-    if not target_id: await message.reply('Использование: /mafia_unban @username или ответом на сообщение.'); return
-    group_db_op(lambda conn: conn.execute("DELETE FROM mafia_bans WHERE chat_id=? AND user_id=?", (message.chat.id,target_id)))
-    await message.reply('𝗠𝗔𝗙𝗜𝗔 𝗕𝗟𝗔𝗖𝗞𝗟𝗜𝗦𝗧\n\nЗапрет снят. Пользователь снова может вступать в лобби.')
-
-
 @dp.callback_query(F.data.startswith("mf:"))
 async def mafia_callback(callback: CallbackQuery):
     parts=(callback.data or '').split(':')
@@ -6192,9 +6143,6 @@ async def setup_commands():
     base_user=[
         BotCommand(command="help",description="Помощь и команды"),
         BotCommand(command="roles",description="Назначенные роли"),
-        BotCommand(command="me",description="Моя роль"),
-        BotCommand(command="games",description="Игры"),
-        BotCommand(command="schedule",description="Расписание"),
         BotCommand(command="mafia",description="Лобби MafiaAzBot"),
         BotCommand(command="mafia_leave",description="Выйти из мафии"),
     ]
@@ -6205,14 +6153,9 @@ async def setup_commands():
         BotCommand(command="syncroles",description="Сверить роли"),
         BotCommand(command="member",description="Участник"),
         BotCommand(command="role",description="Роль участника"),
-        BotCommand(command="pending",description="Новые участники"),
-        BotCommand(command="game_add",description="Добавить игру"),
-        BotCommand(command="game_remove",description="Убрать игру"),
         BotCommand(command="game_poll",description="Опрос на игру"),
         BotCommand(command="schedule_set",description="Изменить расписание"),
-        BotCommand(command="schedule_remove",description="Удалить слот"),
         BotCommand(command="mafia_ban",description="Запретить мафию"),
-        BotCommand(command="mafia_unban",description="Снять запрет"),
     ]
     private=[
         BotCommand(command="manage_commands",description="Управление командами"),
@@ -6441,6 +6384,7 @@ async def main():
         logger.exception("Could not configure commands; continuing")
 
     http_runner = await start_http_server()
+    asyncio.create_task(game_poll_refresh_worker())
     asyncio.create_task(schedule_worker())
 
     delivery_tasks = [
