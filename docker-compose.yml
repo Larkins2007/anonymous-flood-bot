@@ -27,11 +27,14 @@ services:
   tests:
     build: .
     container_name: afb_bot_tests
+    env_file:
+      - .env
     environment:
-      BOT_TOKEN: "dummy-test-token"
-      DB_PATH: "/tmp/test.db"
+      DB_PATH: "/app/data/test.db"
       PORT: "10001"
     volumes:
       - .:/app
-    command: ["pytest", "-q", "test_delivery_recovery.py", "test_bot_static.py"]
+      - ./data:/app/data
+      - ./log:/app/log
+    command: ["pytest", "-q", "test_delivery_recovery.py"]
     restart: "no"

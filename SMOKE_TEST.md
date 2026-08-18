@@ -1,16 +1,67 @@
 # Smoke test
 
-1. Set `BOT_TOKEN` on Render.
-2. Make sure only one service/process uses the token.
-3. Add the bot to a test group and give it admin rights including Manage Tags and permission to pin messages.
-4. Check `/health` returns `polling_running=true`, `db_ok=true`, `fatal_error=null`.
-5. In the group test:
-   - `/help@justice_faite_bot`
-   - `/roles@justice_faite_bot`
-   - `/free_roles@justice_faite_bot`
-   - `калл <роль>` after one new member joins
-   - reply + `калл <роль>`
-   - `/syncroles@justice_faite_bot`
-   - `/mafia@justice_faite_bot`
-6. Mafia test: join five players, verify the same lobby message updates after join/leave, verify it is pinned, then press `ЗАПУСТИТЬ MAFIA` and confirm the bot sends `/start@MafiaAzBot`.
-7. Do not expect this bot to run the Mafia game itself.
+## 1. Проверка Python
+
+```bash
+python -m py_compile bot.py
+```
+
+## 2. Тесты
+
+```bash
+pytest -q test_delivery_recovery.py
+```
+
+## 3. Группа
+
+Проверить:
+
+```text
+/help@justice_faite_bot
+/roles@justice_faite_bot
+/free_roles@justice_faite_bot
+/all_roles@justice_faite_bot
+/mafia@justice_faite_bot
+```
+
+## 4. Роль нового участника
+
+После входа нового участника проверить:
+
+```text
+калл <роль>
+```
+
+Также проверить ответом на сообщение участника и вариантом `калл @username <роль>`.
+
+## 5. Mafia
+
+```text
+/mafia
+```
+
+Собрать минимум 5 участников. После этого нажать:
+
+```text
+▶️ Запустить MafiaAzBot
+```
+
+Бот должен отправить:
+
+```text
+/start@MafiaAzBot
+```
+
+Наш бот не должен раздавать собственные игровые роли.
+
+## 6. Health
+
+```bash
+curl -fsS http://127.0.0.1:10000/health
+```
+
+Ожидаются поля:
+
+- `polling_running`
+- `db_ok`
+- `fatal_error`
