@@ -541,11 +541,60 @@ def init_group_db():
                 created_at TEXT NOT NULL,
                 created_by INTEGER NOT NULL
             );
+
+            CREATE TABLE IF NOT EXISTS role_catalog (
+                role_key TEXT PRIMARY KEY,
+                role_name TEXT NOT NULL,
+                english_name TEXT NOT NULL,
+                region TEXT NOT NULL,
+                updated_at TEXT NOT NULL
+            );
+
+            CREATE TABLE IF NOT EXISTS role_history (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                role_key TEXT NOT NULL,
+                role_name TEXT NOT NULL,
+                tag TEXT NOT NULL DEFAULT '',
+                event TEXT NOT NULL,
+                created_at TEXT NOT NULL
+            );
+
+            CREATE INDEX IF NOT EXISTS idx_role_history_chat_user
+                ON role_history(chat_id, user_id, created_at);
+            CREATE INDEX IF NOT EXISTS idx_role_history_chat_role
+                ON role_history(chat_id, role_key, created_at);
             """
         )
         conn.commit()
     db_transaction(op)
 
+
+
+def seed_role_catalog():
+    def op(conn):
+        if len(ROLE_CATALOG) != 148:
+            raise RuntimeError(f"ROLE_CATALOG must contain 148 roles, got {len(ROLE_CATALOG)}")
+        keys, english = set(), set()
+        for name, en, region in ROLE_CATALOG:
+            key = normalize_role(name)
+            ek = en.casefold()
+            if key in keys or ek in english:
+                raise RuntimeError(f"Duplicate role in catalog: {name} / {en}")
+            keys.add(key); english.add(ek)
+            conn.execute(
+                """INSERT INTO role_catalog(role_key,role_name,english_name,region,updated_at)
+                   VALUES(?,?,?,?,?)
+                   ON CONFLICT(role_key) DO UPDATE SET
+                       role_name=excluded.role_name,
+                       english_name=excluded.english_name,
+                       region=excluded.region,
+                       updated_at=excluded.updated_at""",
+                (key, name, en, region, now()),
+            )
+        conn.commit()
+    group_db_op(op)
 
 
 def migrate_group_state():
@@ -1758,7 +1807,7 @@ async def admin_cancel(
     await safe_callback_answer(callback)
 
 
-@dp.message(Command("cancel"))
+# Internal cancellation helper; not exposed as a standalone command.
 async def command_cancel(
     message: Message,
     state: FSMContext,
@@ -4110,16 +4159,40 @@ def upsert_group_member(chat_id, user, *, active=True, role_key=None, role_name=
     group_db_op(op)
 
 
+def record_role_history(chat_id, user_id, role_key, role_name, tag, event):
+    if not role_key or not role_name:
+        return
+    def op(conn):
+        conn.execute(
+            "INSERT INTO role_history(chat_id,user_id,role_key,role_name,tag,event,created_at) VALUES(?,?,?,?,?,?,?)",
+            (chat_id, user_id, normalize_role(role_key), role_name, tag or "", event, now()),
+        )
+        conn.commit()
+    group_db_op(op)
+
+
+def get_role_history(chat_id, user_id, limit=20):
+    return group_db_op(lambda conn: conn.execute(
+        "SELECT * FROM role_history WHERE chat_id=? AND user_id=? ORDER BY id DESC LIMIT ?",
+        (chat_id, user_id, int(limit)),
+    ).fetchall())
+
+
 def mark_member_left(chat_id, user_id):
     def op(conn):
         row = conn.execute("SELECT role_key, role_name, tag FROM group_members WHERE chat_id=? AND user_id=?", (chat_id,user_id)).fetchone()
+        stamp = now()
         conn.execute(
             "UPDATE group_members SET active=0, left_at=?, confirmed=0 WHERE chat_id=? AND user_id=?",
-            (now(),chat_id,user_id),
+            (stamp,chat_id,user_id),
         )
         if row and row["role_key"]:
             conn.execute(
-                "UPDATE role_state SET user_id=NULL, bot_managed=0 WHERE chat_id=? AND role_key=? AND user_id=?",
+                "INSERT INTO role_history(chat_id,user_id,role_key,role_name,tag,event,created_at) VALUES(?,?,?,?,?,?,?)",
+                (chat_id,user_id,row["role_key"],row["role_name"] or row["role_key"],row["tag"] or "","left",stamp),
+            )
+            conn.execute(
+                "UPDATE role_state SET user_id=NULL,status='free',bot_managed=0,legacy_marker='' WHERE chat_id=? AND role_key=? AND user_id=?",
                 (chat_id,row["role_key"],user_id),
             )
         conn.commit()
@@ -4149,18 +4222,17 @@ def find_group_member(chat_id, username):
 
 
 def latest_pending_member(chat_id):
-    def op(conn):
-        rows = conn.execute(
-            """
-            SELECT * FROM group_members
-            WHERE chat_id=? AND active=1 AND role_key IS NULL
-              AND joined_at >= ?
-            ORDER BY joined_at DESC LIMIT 2
-            """,
-            (chat_id, (datetime.now(timezone.utc) - timedelta(seconds=ROLE_ASSIGNMENT_WINDOW_SECONDS)).isoformat()),
-        ).fetchall()
-        return rows[0] if len(rows) == 1 else None
-    return group_db_op(op)
+    """Return the newest active member with no assigned role."""
+    return group_db_op(lambda conn: conn.execute(
+        """
+        SELECT * FROM group_members
+        WHERE chat_id=? AND active=1 AND role_key IS NULL
+          AND joined_at >= ?
+        ORDER BY joined_at DESC, user_id DESC
+        LIMIT 1
+        """,
+        (chat_id, (datetime.now(timezone.utc) - timedelta(seconds=ROLE_ASSIGNMENT_WINDOW_SECONDS)).isoformat()),
+    ).fetchone())
 
 
 def role_is_occupied(chat_id, role_key, *, exclude_user_id=None):
@@ -4238,7 +4310,16 @@ def release_role_assignment(chat_id, user_id, role_key):
 
 def finalize_role_assignment(chat_id, user_id, role_key, actual_tag):
     def op(conn):
+        row = conn.execute(
+            "SELECT role_name FROM group_members WHERE chat_id=? AND user_id=? AND role_key=?",
+            (chat_id,user_id,role_key),
+        ).fetchone()
         conn.execute("UPDATE group_members SET tag=?,tag_set_by_bot=1 WHERE chat_id=? AND user_id=? AND role_key=?", (actual_tag,chat_id,user_id,role_key))
+        if row:
+            conn.execute(
+                "INSERT INTO role_history(chat_id,user_id,role_key,role_name,tag,event,created_at) VALUES(?,?,?,?,?,?,?)",
+                (chat_id,user_id,role_key,row["role_name"] or role_key,actual_tag or "","assigned",now()),
+            )
         conn.commit()
     group_db_op(op)
 
@@ -4628,6 +4709,105 @@ async def call_assign_role(message: Message):
     except Exception:
         logger.exception("Kall role assignment failed")
         await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nНе удалось назначить роль.")
+
+
+async def resolve_bind_target(chat_id, target_text):
+    value = (target_text or "").strip()
+    if value.isdigit() or (value.startswith("-") and value[1:].isdigit()):
+        user_id = int(value)
+        try:
+            cm = await bot.get_chat_member(chat_id, user_id)
+            return cm.user
+        except Exception:
+            row = get_member(chat_id, user_id)
+            return _user_object_from_row(row) if row else None
+    username = value.lstrip("@").casefold()
+    row = find_group_member(chat_id, username)
+    if row:
+        return _user_object_from_row(row)
+    return None
+
+
+async def bind_role_from_private_admin(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    raw = (message.text or "").strip()
+    parts = raw.split(maxsplit=3)
+    if len(parts) < 4:
+        await message.reply(
+            "𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\n"
+            "Формат:\n"
+            "/bindrole CHAT_ID USER_ID РОЛЬ\n\n"
+            "Пример:\n"
+            "/bindrole -1001234567890 123456789 Кокоми\n\n"
+            "Можно указать @username вместо USER_ID, если участник уже сохранён ботом."
+        )
+        return
+
+    chat_raw, target_raw, role_text = parts[1], parts[2], parts[3].strip()
+    try:
+        chat_obj = await bot.get_chat(chat_raw)
+        chat_id = int(chat_obj.id)
+    except Exception:
+        await message.reply("𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nНе удалось найти этот чат. Укажи корректный CHAT_ID.")
+        return
+
+    role = role_for(role_text)
+    if not role:
+        await message.reply(f"𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nРоль «{role_text}» не найдена в каталоге 148 ролей.")
+        return
+
+    target = await resolve_bind_target(chat_id, target_raw)
+    if not target:
+        await message.reply(
+            "𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\n"
+            "Участник не найден. Он должен находиться в чате или уже быть сохранён в базе.\n"
+            "Используй USER_ID или @username."
+        )
+        return
+
+    try:
+        cm = await bot.get_chat_member(chat_id, target.id)
+        if not _chat_member_is_active(cm):
+            await message.reply("𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nЭтот пользователь сейчас не является участником чата.")
+            return
+        target = cm.user
+    except Exception:
+        pass
+
+    current = get_member(chat_id, target.id)
+    try:
+        tag, role_key = assign_role_db_atomic(chat_id, target, role)
+        ok, actual = await apply_member_tag(chat_id, target.id, tag)
+        if not ok:
+            release_role_assignment(chat_id, target.id, role_key)
+            await message.reply("𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nTelegram не разрешил установить тег. Изменение откатано.")
+            return
+        finalize_role_assignment(chat_id, target.id, role_key, actual or tag)
+        await lift_member_restriction(chat_id, target.id)
+        await send_or_edit_welcome(chat_id, target.id)
+        await message.reply(
+            "𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\n"
+            f"Участник: {display_username_for_group(target)}\n"
+            f"ID: {target.id}\n"
+            f"Роль: {role['name']}\n"
+            f"Тег: {actual or tag}\n\n"
+            "Роль сохранена в базе."
+        )
+    except ValueError as exc:
+        if str(exc) == "ROLE_OCCUPIED":
+            await message.reply("𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nЭта роль уже занята в указанном чате.")
+        else:
+            logger.exception("Private bind role failed")
+            await message.reply("𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nНе удалось привязать роль.")
+    except Exception:
+        logger.exception("Private bind role failed")
+        await message.reply("𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nНе удалось привязать роль. Подробность записана в лог.")
+
+
+@dp.message(Command("bindrole"), F.chat.type == "private")
+async def bindrole_private_command(message: Message):
+    await bind_role_from_private_admin(message)
 
 
 def display_username_for_group(user):
@@ -5286,8 +5466,17 @@ async def fludik_handler(message: Message, state: FSMContext):
         await pending_cmd(message)
         return
     if action == "cancel":
-        await message.reply("𝗔𝗖𝗧𝗜𝗢𝗡 𝗖𝗔𝗡𝗖𝗘𝗟𝗟𝗘𝗗\n\nТекущее групповое действие отменено.")
+        await message.reply("𝗔𝗖𝗧𝗜𝗢𝗡 𝗖𝗔𝗡𝗖𝗘𝗟𝗟𝗘𝗗\n\nТекущее действие отменено.")
         return
+
+    raw_text = _fludik_normalize(message.text or "")
+    rest = re.sub(r"^флудик\s*", "", raw_text).strip()
+    custom_name = rest.split()[0].lstrip("/") if rest else ""
+    if custom_name:
+        custom_row = get_custom_command(custom_name)
+        if custom_row and _custom_command_allowed(custom_row, message):
+            await message.reply(render_custom_response(custom_row["response"], message))
+            return
 
     await help_cmd(message)
 
@@ -5554,6 +5743,7 @@ async def setup_commands():
         BotCommand(command="release", description="Освободить роль"),
         BotCommand(command="syncroles", description="Проверить Telegram-теги"),
         BotCommand(command="member", description="Участник"),
+        BotCommand(command="bindrole", description="Привязать роль участнику"),
         BotCommand(command="pending", description="Новые участники"),
         BotCommand(command="mafia_ban", description="Запретить мафию"),
         BotCommand(command="mafia_unban", description="Снять запрет на мафию"),
@@ -5739,6 +5929,7 @@ async def main():
     init_db()
     migrate_db()
     init_group_db()
+    seed_role_catalog()
     migrate_group_state()
 
     DELIVERY_QUEUE = asyncio.Queue()
