@@ -5013,7 +5013,7 @@ def _normalize_custom_command_name(value: str) -> str:
 
 BUILTIN_COMMANDS = {
     "help", "mafia", "mafia_leave",
-    "syncroles", "game_poll", "schedule",
+    "syncroles", "game_poll",
     "manage_commands", "addcommand", "delcommand", "commands",
     "bindrole", "setrole",
 }
@@ -5177,7 +5177,7 @@ async def commands_cmd(message: Message):
     if message.chat.type != "private" or not message.from_user or message.from_user.id != ADMIN_ID:
         return
     rows = get_custom_commands()
-    lines = ["𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦", "", "Встроенные:", "/help", "/mafia", "/mafia_leave", "/game_poll", "/setrole", "/syncroles", "/schedule"]
+    lines = ["𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦", "", "Встроенные:", "/help", "/mafia", "/mafia_leave", "/game_poll", "/setrole", "/syncroles", ]
     lines += ["", "Пользовательские:"]
     if rows:
         for row in rows:
@@ -5207,6 +5207,7 @@ async def help_cmd(message: Message):
     if message.chat.type=="private" and message.from_user and message.from_user.id==ADMIN_ID:
         text += (
             "\n𝗟𝗦 𝗔𝗗𝗠𝗜𝗡\n"
+            "/start — открыть анонимную обратную связь\n"
             "/manage_commands\n/addcommand\n/delcommand\n/commands\n/bindrole\n/roles_audit\n"
         )
     custom=get_custom_commands()
@@ -6291,19 +6292,12 @@ def seed_default_games():
         add_game(name, description, launch_text)
 
 
-@dp.message(Command("schedule"))
-async def schedule_cmd(message: Message):
-    if not require_primary_group(message):
-        return
-    await message.reply(schedule_text(message.chat.id))
-
-
 async def setup_commands():
     base_user = [
+        BotCommand(command="start", description="Открыть анонимную обратную связь"),
         BotCommand(command="help", description="Помощь и команды"),
         BotCommand(command="mafia", description="Лобби MafiaAzBot"),
         BotCommand(command="mafia_leave", description="Выйти из мафии"),
-        BotCommand(command="schedule", description="Расписание игр"),
     ]
     base_admin = [
         *base_user,
@@ -6333,14 +6327,32 @@ async def setup_commands():
             admin_commands.append(cmd)
         if row["scope"] == "private":
             private_commands.append(cmd)
+    # Clear stale command scopes from previous deployments first.
+    with suppress(Exception):
+        await bot.set_my_commands([], scope=BotCommandScopeDefault())
+    with suppress(Exception):
+        await bot.set_my_commands([], scope=BotCommandScopeAllGroupChats())
+    with suppress(Exception):
+        await bot.set_my_commands([], scope=BotCommandScopeAllChatAdministrators())
+    if PRIMARY_CHAT_ID:
+        with suppress(Exception):
+            await bot.set_my_commands([], scope=BotCommandScopeChat(chat_id=PRIMARY_CHAT_ID))
+        with suppress(Exception):
+            await bot.set_my_commands([], scope=BotCommandScopeChatAdministrators(chat_id=PRIMARY_CHAT_ID))
+
+    # Private/default user commands. No legacy /schedule command.
     await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
     if PRIMARY_CHAT_ID:
+        # Everyone in the primary chat sees base user commands.
         await bot.set_my_commands(user_commands, scope=BotCommandScopeChat(chat_id=PRIMARY_CHAT_ID))
+        # Administrators additionally see /setrole, /syncroles and /game_poll.
         await bot.set_my_commands(admin_commands, scope=BotCommandScopeChatAdministrators(chat_id=PRIMARY_CHAT_ID))
     else:
         # Safe fallback for first deployment before PRIMARY_CHAT_ID is configured.
         await bot.set_my_commands(user_commands, scope=BotCommandScopeAllGroupChats())
         await bot.set_my_commands(admin_commands, scope=BotCommandScopeAllChatAdministrators())
+
+    # Owner's private command menu.
     await bot.set_my_commands(admin_commands + private_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
 
 
