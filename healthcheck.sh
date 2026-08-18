@@ -1,37 +1,15 @@
-#!/usr/bin/env bash
-set -euo pipefail
-
-URL="http://127.0.0.1:${PORT:-10000}/health"
-
-for _ in 1 2 3; do
-  RESP="$(curl -fsS --max-time 3 "$URL" || true)"
-
-  if [ -n "$RESP" ]; then
-    if RESP="$RESP" python - <<'PY'
+#!/bin/sh
+set -eu
+curl -fsS --max-time 5 http://127.0.0.1:10000/health >/tmp/health.json
+python - <<'PY'
 import json
-import os
-import sys
-
-try:
-    data = json.loads(os.environ.get("RESP", "{}"))
-except Exception:
-    sys.exit(1)
-
-if (
-    data.get("polling_running") is True
-    and data.get("db_ok") is True
-    and not data.get("fatal_error")
-):
-    sys.exit(0)
-
-sys.exit(1)
+with open('/tmp/health.json', 'r', encoding='utf-8') as f:
+    data = json.load(f)
+if not data.get('polling_running'):
+    raise SystemExit('polling_running is false')
+if not data.get('db_ok'):
+    raise SystemExit('db_ok is false')
+if data.get('fatal_error'):
+    raise SystemExit(f"fatal_error={data['fatal_error']}")
+print('healthcheck OK')
 PY
-    then
-      exit 0
-    fi
-  fi
-
-  sleep 1
-done
-
-exit 1

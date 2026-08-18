@@ -1,45 +1,46 @@
-# Justice faite bot
+# Justice Faite Bot
 
-Telegram-бот на aiogram 3 для анонимной обратной связи, жалоб, админки, управления ролями участников и lobby для запуска отдельного MafiaAzBot.
+Telegram bot for anonymous feedback, moderation/admin tools, group role tags, and a Mafia lobby that hands the game over to `MafiaAzBot`.
 
-## Основные функции
+## Core group features
 
-- анонимная обратная связь;
-- жалобы и админская обработка;
-- поиск пользователей, блокировка и рассылка;
-- SQLite + миграции + delivery/recovery;
-- `/help`, `/roles`, `/free_roles`, `/all_roles`;
-- каталог из 148 ролей;
-- назначение Telegram member tag через `калл <роль>` после входа участника, через reply или `@username`;
-- административное назначение роли через UI;
-- lobby мафии с минимумом 5 участников и передачей запуска в `MafiaAzBot` через `/start@MafiaAzBot`;
-- HTTP `/health` для Render.
+- `/help` — participant/admin help.
+- `/roles` — roles currently occupied in this chat.
+- `/free_roles` — currently free roles.
+- `калл <роль>` — admin assigns the role to the newest single pending member.
+- Reply to a member with `калл <роль>` — admin assigns the role to that member.
+- `калл @username <роль>` — admin assigns the role to that member.
+- `🎭 Назначить роль` — welcome-button flow that asks the admin to type the role name.
+- `/syncroles` — re-check all active members against their real Telegram member tags.
+- `/release <роль>` — clear a role and remove the Telegram tag.
+- `/mafia` — open the lobby.
+- `/mafia_leave` — leave the lobby.
+- `флудик начни мафию` / `флудик статус` / `флудик закрой мафию` — natural shortcuts for the lobby.
 
-## Важно
+## Mafia behavior
 
-`калл` не является отдельным новым ботом/подсистемой созыва: наш бот использует его только как shortcut для назначения роли новому участнику. Неизвестные `калл ...` игнорируются, чтобы не мешать другому боту.
+This bot does **not** run the Mafia game itself. It only maintains the lobby. At 5 players the creator/admin can press `ЗАПУСТИТЬ MAFIA`; the bot sends `/start@MafiaAzBot` and closes/transfers the lobby.
 
-Этот бот **не ведёт саму игру в мафию**: нет собственной раздачи игровых ролей, day/night и фаз. Он только собирает lobby и передаёт запуск `MafiaAzBot`.
+## Role behavior
 
-Внешний список ролей больше не редактируется ботом. Нет привязки к сообщениям списка, `capture_list`, `sync_list`, `bind_info` и автоматического редактирования чужих сообщений.
+The external roster/list editor has been removed. The bot no longer edits external roster messages, captures roster messages, or manages a linked info channel. Role state is based on members and Telegram member tags in the current chat.
 
-## Запуск
-
-```bash
-pip install -r requirements.txt
-python bot.py
-```
-
-Нужна переменная окружения `BOT_TOKEN`.
-
-Для группы желательно отключить Privacy Mode через BotFather, чтобы работал текстовый shortcut `калл` и `флудик`.
+`set_chat_member_tag` requires the bot to have the appropriate Telegram admin permission (Manage Tags).
 
 ## Render
 
-Start Command:
+Start command:
 
-```text
+```bash
 python bot.py
 ```
 
-Бот поднимает `/health` на `PORT` (по умолчанию `10000`).
+Required environment variable:
+
+```text
+BOT_TOKEN=...
+```
+
+The app exposes `/health` on port `10000`.
+
+Only run **one** instance of the bot with the same token. A second long-polling instance causes Telegram `Conflict: terminated by other getUpdates request`.
