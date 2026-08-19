@@ -5,6 +5,3 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     plan: free
-    envVars:
-      - key: DB_PATH
-        value: /var/data/users.db
