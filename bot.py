@@ -6,6 +6,7 @@ import os
 import re
 import signal
 import sqlite3
+import hashlib
 import sys
 import threading
 import traceback
@@ -58,7 +59,19 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 ADMIN_ID = 1682289834
 PRIMARY_CHAT_ID = int(os.getenv("PRIMARY_CHAT_ID", "-1004313546398") or "-1004313546398")
 
-DB_PATH = os.getenv("DB_PATH", "users.db").strip() or "users.db"
+_configured_db_path = os.getenv("DB_PATH", "").strip()
+if _configured_db_path:
+    DB_PATH = _configured_db_path
+elif os.path.isdir("/var/data"):
+    DB_PATH = "/var/data/users.db"
+else:
+    DB_PATH = "users.db"
+try:
+    _db_parent = os.path.dirname(os.path.abspath(DB_PATH))
+    if _db_parent and _db_parent != os.getcwd():
+        os.makedirs(_db_parent, exist_ok=True)
+except Exception:
+    pass
 PORT = int(os.getenv("PORT", "10000"))
 
 REPORT_COOLDOWN_SECONDS = 600
@@ -502,6 +515,7 @@ def init_group_db():
 
             CREATE INDEX IF NOT EXISTS idx_participant_roster_user
                 ON participant_roster(chat_id, user_id);
+            CREATE TABLE IF NOT EXISTS role_snapshot_state (chat_id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, message_id INTEGER, version INTEGER NOT NULL DEFAULT 0, checksum TEXT NOT NULL DEFAULT "", content TEXT NOT NULL DEFAULT "", updated_at TEXT NOT NULL);
 
             CREATE TABLE IF NOT EXISTS role_state (
                 chat_id INTEGER NOT NULL,
@@ -683,6 +697,56 @@ def role_snapshot_rows(chat_id):
         (chat_id,)
     ).fetchall())
 
+def _role_snapshot_text(chat_id):
+    rows = role_snapshot_rows(chat_id)
+    lines = ["𝗥𝗢𝗟𝗘 𝗦𝗡𝗔𝗣𝗦𝗛𝗢𝗧", "", f"Основной чат: {chat_id}", f"Участников в базе: {len(rows)}", ""]
+    for r in rows:
+        username = (r["username"] or "").strip()
+        who = f"@{username}" if username else str(r["user_id"] or "?")
+        role = (r["role_name"] or "роль не назначена").strip()
+        tag = (r["tag"] or "").strip()
+        lines.append(f"Роль участника — {role} — {who}" + (f" — {tag}" if tag else ""))
+    return "\n".join(lines)
+
+def _snapshot_state(chat_id):
+    return group_db_op(lambda conn: conn.execute("SELECT * FROM role_snapshot_state WHERE chat_id=?", (chat_id,)).fetchone())
+
+def _save_snapshot_state(chat_id, message_id, content):
+    checksum = hashlib.sha256(content.encode("utf-8")).hexdigest()
+    def op(conn):
+        row = conn.execute("SELECT version FROM role_snapshot_state WHERE chat_id=?", (chat_id,)).fetchone()
+        version = int(row["version"] or 0) + 1 if row else 1
+        conn.execute("INSERT INTO role_snapshot_state(chat_id,owner_id,message_id,version,checksum,content,updated_at) VALUES(?,?,?,?,?,?,?) ON CONFLICT(chat_id) DO UPDATE SET owner_id=excluded.owner_id,message_id=excluded.message_id,version=excluded.version,checksum=excluded.checksum,content=excluded.content,updated_at=excluded.updated_at", (chat_id,ADMIN_ID,message_id,version,checksum,content,now()))
+        conn.commit()
+    group_db_op(op)
+
+async def update_role_snapshot(chat_id=PRIMARY_CHAT_ID):
+    if chat_id != PRIMARY_CHAT_ID:
+        return None
+    content = _role_snapshot_text(chat_id)
+    state = _snapshot_state(chat_id)
+    message_id = int(state["message_id"]) if state and state["message_id"] else None
+    if message_id:
+        try:
+            await bot.edit_message_text(chat_id=ADMIN_ID,message_id=message_id,text=content[:4000])
+            _save_snapshot_state(chat_id,message_id,content)
+            return message_id
+        except Exception:
+            logger.warning("Role snapshot edit failed; creating replacement", exc_info=True)
+    try:
+        sent = await bot.send_message(ADMIN_ID,content[:4000])
+        _save_snapshot_state(chat_id,sent.message_id,content)
+        return sent.message_id
+    except Exception:
+        logger.exception("Role snapshot creation failed")
+        return None
+
+def schedule_role_snapshot_update(chat_id=PRIMARY_CHAT_ID):
+    try:
+        asyncio.get_running_loop().create_task(update_role_snapshot(chat_id))
+    except RuntimeError:
+        pass
+
 def seed_role_catalog():
     def op(conn):
         if len(ROLE_CATALOG) != 148:
@@ -735,6 +799,10 @@ def migrate_group_state():
                 status = STATUS_FREE
             conn.execute("UPDATE role_state SET status=? WHERE chat_id=? AND role_key=?", (status, row["chat_id"], row["role_key"]))
 
+        conn.execute("CREATE TABLE IF NOT EXISTS role_snapshot_state (chat_id INTEGER PRIMARY KEY, owner_id INTEGER NOT NULL, message_id INTEGER, version INTEGER NOT NULL DEFAULT 0, checksum TEXT NOT NULL DEFAULT '', content TEXT NOT NULL DEFAULT '', updated_at TEXT NOT NULL)")
+        snap_cols = {row["name"] for row in conn.execute("PRAGMA table_info(role_snapshot_state)").fetchall()}
+        if "content" not in snap_cols:
+            conn.execute("ALTER TABLE role_snapshot_state ADD COLUMN content TEXT NOT NULL DEFAULT ''")
         # No external roster is imported. Roles are created on demand when assigned or observed in Telegram.
         conn.commit()
     group_db_op(op)
@@ -4258,10 +4326,10 @@ def upsert_group_member(chat_id, user, *, active=True, role_key=None, role_name=
                 role_name=COALESCE(excluded.role_name, group_members.role_name),
                 tag=COALESCE(excluded.tag, group_members.tag),
                 active=excluded.active,
-                confirmed=excluded.confirmed,
+                confirmed=CASE WHEN excluded.confirmed=1 THEN 1 ELSE group_members.confirmed END,
                 left_at=NULL,
                 welcome_message_id=COALESCE(excluded.welcome_message_id, group_members.welcome_message_id),
-                tag_set_by_bot=excluded.tag_set_by_bot
+                tag_set_by_bot=CASE WHEN excluded.tag_set_by_bot=1 THEN 1 ELSE group_members.tag_set_by_bot END
             """,
             (
                 chat_id, user.id, user.first_name or "", user.last_name or "", user.username or "",
@@ -4311,7 +4379,9 @@ def mark_member_left(chat_id, user_id):
             )
         conn.commit()
         return dict(row) if row else None
-    return group_db_op(op)
+    result = group_db_op(op)
+    schedule_role_snapshot_update(chat_id)
+    return result
 
 
 def confirm_member(chat_id, user_id):
@@ -4523,6 +4593,7 @@ async def sync_member_tag(chat_id, user_id, *, user=None, refresh_roster=False, 
         return None
 
     previous = get_member(chat_id, target_user.id)
+    role_state_row = get_role_state(chat_id, previous["role_key"]) if previous and previous["role_key"] else None
     active = member.status in JOIN_ACTIVE_STATUSES
     upsert_group_member(
         chat_id,
@@ -4532,7 +4603,7 @@ async def sync_member_tag(chat_id, user_id, *, user=None, refresh_roster=False, 
         confirmed=bool(previous["confirmed"]) if previous else False,
         role_key=previous["role_key"] if previous else None,
         role_name=previous["role_name"] if previous else None,
-        tag_set_by_bot=bool(previous["tag_set_by_bot"]) if previous else False,
+        tag_set_by_bot=(bool(previous["tag_set_by_bot"]) if previous else False) or bool(role_state_row and role_state_row["bot_managed"]),
     )
 
     # A departed member is recorded as inactive, but their last role remains in
@@ -4552,6 +4623,7 @@ async def sync_member_tag(chat_id, user_id, *, user=None, refresh_roster=False, 
 
         previous_role = previous["role_name"] if previous else None
         previous_tag = previous["tag"] if previous else None
+        previous_managed = bool((previous and previous["tag_set_by_bot"]) or (holder and holder["user_id"] == target_user.id))
         def op(conn):
             conn.execute(
                 """INSERT INTO role_state(chat_id,role_key,role_name,user_id,status,legacy_marker,legacy_custom_emoji_id,bot_managed)
@@ -4561,7 +4633,7 @@ async def sync_member_tag(chat_id, user_id, *, user=None, refresh_roster=False, 
                        status='taken'""",
                 (chat_id, role_key, role["name"], target_user.id, STATUS_TAKEN,
                  STATUS_MARKER[STATUS_TAKEN], CUSTOM_EMOJI_IDS[STATUS_TAKEN],
-                 1 if (previous and int(previous["tag_set_by_bot"] or 0)) else 0),
+                 1 if previous_managed else 0),
             )
             conn.execute(
                 "UPDATE group_members SET role_key=?, role_name=?, tag=?, active=1 WHERE chat_id=? AND user_id=?",
@@ -4607,7 +4679,7 @@ async def adopt_external_roles(chat_id: int, user_ids: set[int]):
                 skipped_admin += 1
                 continue
             target_user = getattr(member, "user", None)
-            actual_tag = (getattr(member, "tag", None) or "").strip()
+            actual_tag = (getattr(member, "tag", None) or getattr(member, "custom_title", None) or "").strip()
             if not target_user or not actual_tag:
                 skipped_no_tag += 1
                 continue
@@ -4820,11 +4892,13 @@ async def group_member_update(event: ChatMemberUpdated):
             except Exception:
                 logger.exception("Could not restrict new member | chat=%s user=%s", chat_id, user.id)
         await send_or_edit_welcome(chat_id, user.id)
+        schedule_role_snapshot_update(chat_id)
         return
 
     # A member became a full/known active member without being a fresh join.
     if new_active:
         await sync_member_tag(chat_id, user.id, user=user, refresh_roster=False, force=True)
+        schedule_role_snapshot_update(chat_id)
         return
 
     # Left/kicked, including restricted users with is_member=False.
@@ -4850,6 +4924,7 @@ async def group_member_update(event: ChatMemberUpdated):
                 f"Последняя роль: {role_text}"
                 + (f"\nTelegram-тег: {old_tag}" if old_tag and old_tag != role_text else ""),
             )
+        schedule_role_snapshot_update(chat_id)
         return
 
 
@@ -5192,6 +5267,7 @@ async def setrole_cmd(message: Message):
         lifted=await lift_member_restriction(message.chat.id,target.id)
         await message.reply(f"✅ Назначено\n{display_username_for_group(target)}\nРоль: {role['name']}\nТег: {actual or tag}\nОграничение снято: {'да' if lifted else 'нет'}")
         with suppress(Exception): await bot.send_message(ADMIN_ID,f"𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗘𝗗\n\nУчастник: {display_username_for_group(target)}\nРоль участника: {role['name']}\nТег: {actual or tag}")
+        schedule_role_snapshot_update(message.chat.id)
     except ValueError as exc:
         await message.reply("𝗥𝗢𝗟𝗘 𝗢𝗖𝗖𝗨𝗣𝗜𝗘𝗗\n\nЭта роль уже занята." if str(exc)=="ROLE_OCCUPIED" else "𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nНе удалось назначить роль.")
     except RuntimeError as exc:
@@ -5454,6 +5530,18 @@ async def sync_roles_cmd(message: Message):
     ).fetchall())
     known_ids.update(int(r["user_id"]) for r in gm_rows)
 
+    # Always include owner and current chat administrators. Their roles are read-only;
+    # adoption never removes/reapplies administrator tags.
+    known_ids.add(int(ADMIN_ID))
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        for adm in admins:
+            if getattr(adm, "user", None):
+                known_ids.add(int(adm.user.id))
+                note_roster_user(chat_id, adm.user)
+    except Exception:
+        logger.exception("Could not enumerate chat administrators during role sync | chat=%s", chat_id)
+
     checked = recognized = adopted = preserved = without_role = skipped_admin = errors = 0
     lines = ["𝗥𝗢𝗟𝗘 𝗦𝗬𝗡𝗖", ""]
 
@@ -5491,8 +5579,7 @@ async def sync_roles_cmd(message: Message):
 
     # Keep the owner's DM as the durable human-readable snapshot. Do not send it
     # to any other group: PRIMARY_CHAT_ID is the only managed group.
-    with suppress(Exception):
-        await bot.send_message(ADMIN_ID, "\n".join(lines)[:3900])
+    await update_role_snapshot(chat_id)
 
     await message.reply(
         "𝗥𝗢𝗟𝗘 𝗦𝗬𝗡𝗖\n\n"
@@ -6765,6 +6852,8 @@ async def main():
     FATAL_EVENT = asyncio.Event()
 
     logger.info("SQLite initialized: %s", DB_PATH)
+    if not os.path.abspath(DB_PATH).startswith("/var/data/"):
+        logger.warning("ROLE DATA IS EPHEMERAL: set DB_PATH=/var/data/users.db and attach a persistent disk on Render, or migrate to Render Postgres. Local SQLite is lost across redeploy/restart on Render Free.")
 
     try:
         me = await bot.get_me()

@@ -72,3 +72,9 @@ python bot.py
 
 ### Синхронизация ролей
 `/syncroles` проверяет сохранённых участников основного чата, читает их реальные Telegram-теги, сопоставляет их с каталогом из 148 ролей, принимает ранее выставленные чужим/старым ботом теги под управление и отправляет владельцу полный снимок «роль участника — роль — @username».
+
+## Role snapshot
+The owner-facing role snapshot is kept as one editable private message. SQLite remains the machine-readable source of truth because Telegram Bot API does not provide a method to read arbitrary old bot messages back. The snapshot is regenerated from persistent role state after `/syncroles`, role assignment, joins and leaves.
+
+## Persistence on Render
+For role/member state to survive redeploys, configure a persistent disk mounted at `/var/data` and set `DB_PATH=/var/data/users.db`. On Render Free, the local filesystem is ephemeral.
