@@ -688,12 +688,13 @@ def note_roster_user(chat_id, user):
 
 def role_snapshot_rows(chat_id):
     return group_db_op(lambda conn: conn.execute(
-        """SELECT r.username, r.user_id, COALESCE(m.role_name,'') AS role_name,
+        """SELECT COALESCE(NULLIF(r.username,''), m.username, '') AS username,
+                  r.user_id, COALESCE(m.role_name,'') AS role_name,
                   COALESCE(m.tag,'') AS tag, COALESCE(m.active,0) AS active
            FROM participant_roster r
            LEFT JOIN group_members m ON m.chat_id=r.chat_id AND m.user_id=r.user_id
            WHERE r.chat_id=?
-           ORDER BY r.username COLLATE NOCASE""",
+           ORDER BY username COLLATE NOCASE""",
         (chat_id,)
     ).fetchall())
 
@@ -4178,7 +4179,7 @@ _ROLE_GROUPS = [
     ]),
     ("✦ 🤍🤍𝑳𝒊 𝒀𝒖𝒆🤍🤍✦", [
         ("Бай Чжу", "Baizhu"), ("Бэй Доу", "Beidou"), ("Гань Юй", "Ganyu"),
-        ("Е Лань", "Yelan"), ("Ка Мин", "Gaming"), ("Кэ Цин", "Keqing"),
+        ("Е Лань", "Yelan"), ("Камин", "Gaming"), ("Кэ Цин", "Keqing"),
         ("Лань Янь", "Lan Yan"), ("Нин Гуан", "Ningguang"), ("Син Цю", "Xingqiu"),
         ("Синь Янь", "Xinyan"), ("Сян Лин", "Xiangling"), ("Сянь Юнь", "Xianyun"),
         ("Сяо", "Xiao"), ("Ху Тао", "Hu Tao"), ("Цзы Бай", "Zibai"),
@@ -4559,7 +4560,7 @@ async def apply_member_tag(chat_id, user_id, desired_tag):
         return False, None
 
 
-async def sync_member_tag(chat_id, user_id, *, user=None, refresh_roster=False, expected_role=None, force=False):
+async def sync_member_tag(chat_id, user_id, *, user=None, member=None, refresh_roster=False, expected_role=None, force=False):
     """Read Telegram's current member tag and update local state without mutating Telegram.
 
     Important invariant: /syncroles is a read/adopt operation. It must NEVER clear and
@@ -4576,12 +4577,15 @@ async def sync_member_tag(chat_id, user_id, *, user=None, refresh_roster=False, 
                 return role_for(current["role_name"])
             return role_for_tag(current["tag"]) if current else None
 
-    try:
-        member = await bot.get_chat_member(chat_id, user_id)
+    if member is None:
+        try:
+            member = await bot.get_chat_member(chat_id, user_id)
+            MEMBER_TAG_SYNC_CACHE[cache_key] = now_mono
+        except (TelegramForbiddenError, TelegramNotFound, TelegramBadRequest) as exc:
+            logger.warning("Could not read member tag | chat=%s user=%s | %s", chat_id, user_id, exc)
+            return None
+    else:
         MEMBER_TAG_SYNC_CACHE[cache_key] = now_mono
-    except (TelegramForbiddenError, TelegramNotFound, TelegramBadRequest) as exc:
-        logger.warning("Could not read member tag | chat=%s user=%s | %s", chat_id, user_id, exc)
-        return None
 
     actual_tag = (
         getattr(member, "tag", None)
@@ -4774,21 +4778,39 @@ def _normalize_role_tag_value(value):
 
 
 def role_for_tag(tag):
+    """Resolve a Telegram member tag to one catalog role.
+
+    Tags in this chat may contain a decorative/admin prefix before the role, e.g.
+    ``𝕸𝖔𝖓𝖙❦𝑵𝒐𝒆𝒍𝒍𝒆❦`` or ``𝕺𝖜𝖓𝖊𝖗❦𝑨𝒍𝑯𝒂𝒊𝒕𝒉𝒂𝒎❦``.
+    The role is the content enclosed by the role markers.  We therefore first
+    inspect each ❦...❦ segment, then fall back to the whole tag for legacy tags.
+    Never let an unrelated prefix such as Owner/Co-Owner/Chat become part of the
+    role key.
+    """
     if not tag:
         return None
     raw = str(tag).strip()
-    normalized = _normalize_role_tag_value(raw)
-    if not normalized:
-        return None
-    for name, english, _region in ROLE_CATALOG:
-        candidates = {
-            _normalize_role_tag_value(make_tag(english)),
-            _normalize_role_tag_value(english),
-            _normalize_role_tag_value(english.replace(" ", "")),
-            _normalize_role_tag_value(name),
-        }
-        if normalized in candidates:
-            return role_for(name)
+
+    candidates_raw = []
+    marked = re.findall(r"❦([^❦]+)❦", raw)
+    candidates_raw.extend(marked)
+    candidates_raw.append(raw.replace("❦", ""))
+
+    seen = set()
+    for candidate in candidates_raw:
+        normalized = _normalize_role_tag_value(candidate)
+        if not normalized or normalized in seen:
+            continue
+        seen.add(normalized)
+        for name, english, _region in ROLE_CATALOG:
+            role_candidates = {
+                _normalize_role_tag_value(make_tag(english)),
+                _normalize_role_tag_value(english),
+                _normalize_role_tag_value(english.replace(" ", "")),
+                _normalize_role_tag_value(name),
+            }
+            if normalized in role_candidates:
+                return role_for(name)
     return None
 
 
@@ -5545,13 +5567,8 @@ async def sync_roles_cmd(message: Message):
     checked = recognized = adopted = preserved = without_role = skipped_admin = errors = 0
     lines = ["𝗥𝗢𝗟𝗘 𝗦𝗬𝗡𝗖", ""]
 
-    # First run: adopt externally assigned regular-member tags by the agreed
-    # clear -> restore round trip. Later runs: bot-managed users are read only.
-    adoption = await adopt_external_roles(chat_id, known_ids)
-    adopted = len(adoption["adopted"])
-    skipped_admin = adoption["skipped_admin"]
-    errors += adoption["errors"]
-
+    # One Telegram lookup per known user.  The same fetched member object is
+    # passed into sync_member_tag so /syncroles does not make duplicate API calls.
     for user_id in sorted(known_ids):
         try:
             member = await bot.get_chat_member(chat_id, user_id)
@@ -5559,10 +5576,73 @@ async def sync_roles_cmd(message: Message):
                 mark_member_left(chat_id, user_id)
                 continue
             checked += 1
-            role = await sync_member_tag(chat_id, user_id, user=getattr(member, "user", None), force=True)
+            status = getattr(member, "status", "")
+            target_user = getattr(member, "user", None)
+            if not target_user:
+                without_role += 1
+                continue
+            note_roster_user(chat_id, target_user)
+
+            actual_tag = (getattr(member, "tag", None) or getattr(member, "custom_title", None) or "").strip()
             current = get_member(chat_id, user_id)
+            previous_role = current["role_name"] if current else None
+            previous_managed = bool(current and current["tag_set_by_bot"])
+            role_state_row = get_role_state(chat_id, current["role_key"]) if current and current["role_key"] else None
+            previous_managed = previous_managed or bool(role_state_row and role_state_row["bot_managed"])
+
+            role = role_for_tag(actual_tag)
             if role:
                 recognized += 1
+                role_key = normalize_role(role["name"])
+                holder = group_db_op(lambda conn: conn.execute(
+                    "SELECT user_id FROM role_state WHERE chat_id=? AND role_key=?",
+                    (chat_id, role_key),
+                ).fetchone())
+                if holder and holder["user_id"] not in (None, user_id):
+                    # Keep the existing holder; do not steal a role.
+                    errors += 1
+                    role = current and role_for(current["role_name"]) or role
+                else:
+                    if status not in {"creator", "administrator"} and not previous_managed and actual_tag:
+                        removed = await bot.set_chat_member_tag(chat_id, user_id, tag="")
+                        if not removed:
+                            raise RuntimeError("TELEGRAM_TAG_REMOVE_FAILED")
+                        restored = await bot.set_chat_member_tag(chat_id, user_id, tag=actual_tag)
+                        if not restored:
+                            with suppress(Exception):
+                                await bot.set_chat_member_tag(chat_id, user_id, tag=actual_tag)
+                            raise RuntimeError("TELEGRAM_TAG_RESTORE_FAILED")
+                        adopted += 1
+
+                    def op(conn):
+                        conn.execute(
+                            """INSERT INTO role_state(chat_id,role_key,role_name,user_id,status,legacy_marker,legacy_custom_emoji_id,bot_managed)
+                               VALUES(?,?,?,?,?,?,?,?)
+                               ON CONFLICT(chat_id,role_key) DO UPDATE SET
+                                   user_id=excluded.user_id, role_name=excluded.role_name,
+                                   status='taken',
+                                   bot_managed=CASE WHEN excluded.bot_managed=1 THEN 1 ELSE role_state.bot_managed END""",
+                            (chat_id, role_key, role["name"], user_id, STATUS_TAKEN,
+                             STATUS_MARKER[STATUS_TAKEN], CUSTOM_EMOJI_IDS[STATUS_TAKEN],
+                             1 if (previous_managed or status in {"creator", "administrator"}) else 0),
+                        )
+                        conn.execute(
+                            """INSERT INTO group_members(chat_id,user_id,first_name,last_name,username,role_key,role_name,tag,confirmed,active,joined_at,tag_set_by_bot)
+                               VALUES(?,?,?,?,?,?,?,?,0,1,?,?)
+                               ON CONFLICT(chat_id,user_id) DO UPDATE SET
+                                   first_name=excluded.first_name, last_name=excluded.last_name,
+                                   username=excluded.username, role_key=excluded.role_key,
+                                   role_name=excluded.role_name, tag=excluded.tag, active=1,
+                                   tag_set_by_bot=CASE WHEN excluded.tag_set_by_bot=1 THEN 1 ELSE group_members.tag_set_by_bot END""",
+                            (chat_id, target_user.id, target_user.first_name or "", target_user.last_name or "",
+                             target_user.username or "", role_key, role["name"], actual_tag, now(),
+                             1 if (previous_managed or status in {"creator", "administrator"} or adopted) else 0),
+                        )
+                        conn.commit()
+                    group_db_op(op)
+                    if previous_role != role["name"] or (current and current["tag"] != actual_tag):
+                        record_role_history(chat_id, user_id, role_key, role["name"], actual_tag, "synced")
+
                 role_name = role["name"]
             elif current and current["role_name"]:
                 preserved += 1
@@ -5570,15 +5650,19 @@ async def sync_roles_cmd(message: Message):
             else:
                 without_role += 1
                 role_name = "роль не распознана"
-            username = getattr(member.user, "username", None) or (current["username"] if current else "")
-            uname = f"@{username}" if username else str(user_id)
+
+            if status in {"creator", "administrator"}:
+                skipped_admin += 1
+            uname = f"@{target_user.username}" if target_user.username else str(user_id)
             lines.append(f"Роль участника — {role_name} — {uname}")
+        except (TelegramForbiddenError, TelegramNotFound, TelegramBadRequest) as exc:
+            errors += 1
+            logger.warning("Role sync Telegram lookup failed | chat=%s user=%s | %s", chat_id, user_id, exc)
         except Exception:
             errors += 1
             logger.exception("Role sync failed | chat=%s user=%s", chat_id, user_id)
 
-    # Keep the owner's DM as the durable human-readable snapshot. Do not send it
-    # to any other group: PRIMARY_CHAT_ID is the only managed group.
+    # Keep the owner's DM as the durable human-readable snapshot.
     await update_role_snapshot(chat_id)
 
     await message.reply(
