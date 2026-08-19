@@ -11,7 +11,7 @@ TREE = ast.parse(SRC)
 def test_command_matrix_and_routing():
     required = [
         'help','mafia','mafia_leave',
-        'setrole','syncroles','game_poll','schedule',
+        'setrole','syncroles','game_poll',
         'manage_commands','addcommand','delcommand','commands','bindrole','roles_audit'
     ]
     handlers = set(re.findall(r'@dp\.message\(Command\("([a-z0-9_]+)"\)', SRC))
@@ -171,7 +171,26 @@ def test_primary_chat_id_and_role_aliases():
 
 def test_final_command_exposure():
     exposed = set(re.findall(r'BotCommand\(command="([a-z0-9_]+)"', SRC))
-    expected = {'help','mafia','mafia_leave','schedule','game_poll','setrole','syncroles','manage_commands','addcommand','delcommand','commands','bindrole','roles_audit'}
+    expected = {'help','mafia','mafia_leave','game_poll','setrole','syncroles','manage_commands','addcommand','delcommand','commands','bindrole','roles_audit'}
     assert expected.issubset(exposed)
     forbidden = {'roles','role','member','release','pending','game','status','me','games','tonight','nextgame','games_history','stats','players','game_add','game_remove','schedule_set','schedule_remove','mafia_ban','mafia_unban'}
     assert not (exposed & forbidden)
+
+
+def test_setrole_accepts_multiword_role_without_target():
+    assert 'if len(parts)==1:' in SRC
+    assert 'pending = latest_pending_member(message.chat.id)' in SRC
+    assert 'role_text = remainder' in SRC
+
+
+def test_sync_never_clears_unknown_role_or_rewrites_managed_tag():
+    segment = SRC[SRC.find('async def sync_member_tag'):SRC.find('async def adopt_external_roles')]
+    assert 'Never blank it here.' in segment
+    assert 'previous["role_name"]' in segment
+    assert 'set_chat_member_tag' not in segment
+
+
+def test_sync_is_single_primary_chat():
+    segment = SRC[SRC.find('@dp.message(Command("syncroles"))'):SRC.find('async def member_info_cmd')]
+    assert 'chat_id = PRIMARY_CHAT_ID' in segment
+    assert 'adopt_external_roles(chat_id, known_ids)' in segment

@@ -4178,7 +4178,6 @@ _ROLE_GROUPS = [
 ]
 
 ROLE_CATALOG = [(name, english, region) for region, entries in _ROLE_GROUPS for name, english in entries]
-ROLE_TAG_ALIASES = {"gaming": "Ка Мин", "ka ming": "Ка Мин", "ayaka": "Аяка", "kaeya": "Кэйя", "noelle": "Ноэлль", "illuga": "Иллуги", "vodyanitsa": "Водяница"}
 ROLE_BY_KEY = {}
 for _name, _english, _region in ROLE_CATALOG:
     ROLE_BY_KEY[" ".join(_name.casefold().replace("ё", "е").split())] = {
@@ -4242,7 +4241,7 @@ def group_db_op(callback, *args):
     return db_transaction(callback, *args)
 
 
-def upsert_group_member(chat_id, user, *, active=True, role_key=None, role_name=None, tag=None, confirmed=False, welcome_message_id=None, tag_set_by_bot=None):
+def upsert_group_member(chat_id, user, *, active=True, role_key=None, role_name=None, tag=None, confirmed=False, welcome_message_id=None, tag_set_by_bot=False):
     def op(conn):
         existing = conn.execute("SELECT * FROM group_members WHERE chat_id=? AND user_id=?", (chat_id, user.id)).fetchone()
         conn.execute(
@@ -4262,12 +4261,12 @@ def upsert_group_member(chat_id, user, *, active=True, role_key=None, role_name=
                 confirmed=excluded.confirmed,
                 left_at=NULL,
                 welcome_message_id=COALESCE(excluded.welcome_message_id, group_members.welcome_message_id),
-                tag_set_by_bot=COALESCE(excluded.tag_set_by_bot, group_members.tag_set_by_bot)
+                tag_set_by_bot=excluded.tag_set_by_bot
             """,
             (
                 chat_id, user.id, user.first_name or "", user.last_name or "", user.username or "",
                 role_key, role_name, tag, 1 if confirmed else 0, 1 if active else 0,
-                now(), welcome_message_id, ((1 if tag_set_by_bot else 0) if tag_set_by_bot is not None else None),
+                now(), welcome_message_id, 1 if tag_set_by_bot else 0,
             ),
         )
         conn.commit()
@@ -4491,91 +4490,93 @@ async def apply_member_tag(chat_id, user_id, desired_tag):
 
 
 async def sync_member_tag(chat_id, user_id, *, user=None, refresh_roster=False, expected_role=None, force=False):
-    """Read live Telegram tag without destructive role loss.
+    """Read Telegram's current member tag and update local state without mutating Telegram.
 
-    Unknown/empty tags never erase a previously known role. Roles are released
-    only on explicit release/reassignment or a real member leave event.
+    Important invariant: /syncroles is a read/adopt operation. It must NEVER clear and
+    recreate a tag that the bot already manages, and an unrecognised live tag must NEVER
+    erase a previously known role. This prevents a temporary Telegram/API mismatch from
+    destroying the saved role.
     """
     cache_key = (chat_id, user_id)
     now_mono = asyncio.get_running_loop().time()
     if not force and cache_key in MEMBER_TAG_SYNC_CACHE:
         if now_mono - MEMBER_TAG_SYNC_CACHE[cache_key] < MEMBER_TAG_SYNC_TTL_SECONDS:
             current = get_member(chat_id, user_id)
-            return role_for(current["role_name"]) if current and current["role_name"] else role_for_tag(current["tag"]) if current else None
+            if current and current["role_name"]:
+                return role_for(current["role_name"])
+            return role_for_tag(current["tag"]) if current else None
+
     try:
         member = await bot.get_chat_member(chat_id, user_id)
         MEMBER_TAG_SYNC_CACHE[cache_key] = now_mono
     except (TelegramForbiddenError, TelegramNotFound, TelegramBadRequest) as exc:
         logger.warning("Could not read member tag | chat=%s user=%s | %s", chat_id, user_id, exc)
         return None
-    actual_tag = (getattr(member, "tag", None) or "").strip()
+
+    actual_tag = (
+        getattr(member, "tag", None)
+        or getattr(member, "custom_title", None)
+        or ""
+    ).strip()
     target_user = user or getattr(member, "user", None)
-    previous = get_member(chat_id, target_user.id) if target_user else None
-    if target_user:
-        upsert_group_member(
-            chat_id, target_user,
-            active=(member.status in JOIN_ACTIVE_STATUSES),
-            tag=actual_tag,
-            confirmed=bool(previous["confirmed"]) if previous else False,
-        )
+    if not target_user:
+        return None
+
+    previous = get_member(chat_id, target_user.id)
+    active = member.status in JOIN_ACTIVE_STATUSES
+    upsert_group_member(
+        chat_id,
+        target_user,
+        active=active,
+        tag=actual_tag if actual_tag else (previous["tag"] if previous else None),
+        confirmed=bool(previous["confirmed"]) if previous else False,
+        role_key=previous["role_key"] if previous else None,
+        role_name=previous["role_name"] if previous else None,
+        tag_set_by_bot=bool(previous["tag_set_by_bot"]) if previous else False,
+    )
+
+    # A departed member is recorded as inactive, but their last role remains in
+    # history/DB so the owner can see what they had when they left.
+    if not active:
+        return role_for(previous["role_name"]) if previous and previous["role_name"] else role_for_tag(actual_tag)
+
     role = role_for_tag(actual_tag)
+    if role:
+        role_key = normalize_role(role["name"])
+        holder = group_db_op(lambda conn: conn.execute(
+            "SELECT user_id FROM role_state WHERE chat_id=? AND role_key=?", (chat_id, role_key)
+        ).fetchone())
+        if holder and holder["user_id"] not in (None, target_user.id):
+            logger.warning("Role conflict during sync | chat=%s role=%s owner=%s observed=%s", chat_id, role_key, holder["user_id"], target_user.id)
+            return role
 
-    def op(conn):
-        if not target_user or member.status not in JOIN_ACTIVE_STATUSES:
-            conn.commit()
-            return True
-
-        if role:
-            role_key = normalize_role(role["name"])
-            # Release only an older role of this same user when a different
-            # verified role is now present. Never clear on an unknown tag.
-            old_rows = conn.execute(
-                "SELECT role_key FROM role_state WHERE chat_id=? AND user_id=?",
-                (chat_id, target_user.id),
-            ).fetchall()
-            for old in old_rows:
-                if old["role_key"] != role_key:
-                    conn.execute(
-                        "UPDATE role_state SET user_id=NULL,status='free',bot_managed=0 WHERE chat_id=? AND role_key=? AND user_id=?",
-                        (chat_id, old["role_key"], target_user.id),
-                    )
-            holder = conn.execute(
-                "SELECT user_id FROM role_state WHERE chat_id=? AND role_key=?",
-                (chat_id, role_key),
-            ).fetchone()
-            if holder and holder["user_id"] not in (None, target_user.id):
-                conn.rollback()
-                return False
-            state = conn.execute(
-                "SELECT bot_managed FROM role_state WHERE chat_id=? AND role_key=?",
-                (chat_id, role_key),
-            ).fetchone()
-            managed = int(state["bot_managed"] or 0) if state else 0
+        previous_role = previous["role_name"] if previous else None
+        previous_tag = previous["tag"] if previous else None
+        def op(conn):
             conn.execute(
                 """INSERT INTO role_state(chat_id,role_key,role_name,user_id,status,legacy_marker,legacy_custom_emoji_id,bot_managed)
                    VALUES(?,?,?,?,?,?,?,?)
                    ON CONFLICT(chat_id,role_key) DO UPDATE SET
-                       user_id=excluded.user_id, role_name=excluded.role_name, status='taken'""",
+                       user_id=excluded.user_id, role_name=excluded.role_name,
+                       status='taken'""",
                 (chat_id, role_key, role["name"], target_user.id, STATUS_TAKEN,
-                 STATUS_MARKER[STATUS_TAKEN], CUSTOM_EMOJI_IDS[STATUS_TAKEN], managed),
+                 STATUS_MARKER[STATUS_TAKEN], CUSTOM_EMOJI_IDS[STATUS_TAKEN],
+                 1 if (previous and int(previous["tag_set_by_bot"] or 0)) else 0),
             )
             conn.execute(
-                "UPDATE group_members SET role_key=?,role_name=?,tag=?,active=1 WHERE chat_id=? AND user_id=?",
+                "UPDATE group_members SET role_key=?, role_name=?, tag=?, active=1 WHERE chat_id=? AND user_id=?",
                 (role_key, role["name"], actual_tag, chat_id, target_user.id),
             )
-        else:
-            # Preserve the known role and update only the factual current tag.
-            conn.execute(
-                "UPDATE group_members SET tag=?,active=1 WHERE chat_id=? AND user_id=?",
-                (actual_tag, chat_id, target_user.id),
-            )
-        conn.commit()
-        return True
+            conn.commit()
+        group_db_op(op)
+        if previous_role != role["name"] or previous_tag != actual_tag:
+            record_role_history(chat_id, target_user.id, role_key, role["name"], actual_tag, "synced")
+        return role
 
-    result = group_db_op(op)
-    if result and role and target_user and (not previous or previous["role_name"] != role["name"] or previous["tag"] != actual_tag):
-        record_role_history(chat_id, target_user.id, normalize_role(role["name"]), role["name"], actual_tag, "synced")
-    return role
+    # Unknown/empty tag: preserve a previously known role. Never blank it here.
+    if previous and previous["role_name"]:
+        return role_for(previous["role_name"])
+    return None
 
 
 async def adopt_external_roles(chat_id: int, user_ids: set[int]):
@@ -4707,10 +4708,6 @@ def role_for_tag(tag):
     normalized = _normalize_role_tag_value(raw)
     if not normalized:
         return None
-    compact_alias = normalized.replace(" ", "")
-    for alias, canonical in ROLE_TAG_ALIASES.items():
-        if compact_alias == _normalize_role_tag_value(alias).replace(" ", ""):
-            return role_for(canonical)
     for name, english, _region in ROLE_CATALOG:
         candidates = {
             _normalize_role_tag_value(make_tag(english)),
@@ -5157,7 +5154,15 @@ async def setrole_cmd(message: Message):
         role_text=remainder
     else:
         parts=remainder.split(maxsplit=1)
-        if len(parts)==2:
+        if len(parts)==1:
+            # Convenient admin shortcut: /setrole Ху Тао is parsed as the role
+            # when there is no explicit target. The newest pending participant is
+            # used, matching the existing `калл <роль>` workflow.
+            pending = latest_pending_member(message.chat.id)
+            if pending:
+                target = _user_object_from_row(pending)
+                role_text = remainder
+        elif len(parts)==2:
             target_text,role_text=parts
             if target_text.startswith("@"):
                 row=find_group_member(message.chat.id,target_text)
@@ -5436,29 +5441,29 @@ async def sync_roles_cmd(message: Message):
     if not is_group_admin_user(message):
         await message.reply("𝗔𝗖𝗖𝗘𝗦𝗦\n\nУ вас нет прав для этой команды.")
         return
-    chat_id = PRIMARY_CHAT_ID
 
+    chat_id = PRIMARY_CHAT_ID
     rows = group_db_op(lambda conn: conn.execute(
-        "SELECT user_id FROM participant_roster WHERE chat_id=? AND user_id IS NOT NULL", (chat_id,)
+        "SELECT user_id FROM participant_roster WHERE chat_id=? AND user_id IS NOT NULL",
+        (chat_id,),
     ).fetchall())
     known_ids = {int(r["user_id"]) for r in rows}
     gm_rows = group_db_op(lambda conn: conn.execute(
-        "SELECT user_id FROM group_members WHERE chat_id=?", (chat_id,)
+        "SELECT user_id FROM group_members WHERE chat_id=? AND user_id IS NOT NULL",
+        (chat_id,),
     ).fetchall())
     known_ids.update(int(r["user_id"]) for r in gm_rows)
 
-    admin_ids=set()
-    try:
-        admins = await bot.get_chat_administrators(chat_id)
-        for adm in admins:
-            if getattr(adm, "user", None):
-                admin_ids.add(int(adm.user.id))
-                note_roster_user(chat_id, adm.user)
-        known_ids.update(admin_ids)
-    except Exception:
-        logger.exception("Could not enumerate chat administrators | chat=%s", chat_id)
+    checked = recognized = adopted = preserved = without_role = skipped_admin = errors = 0
+    lines = ["𝗥𝗢𝗟𝗘 𝗦𝗬𝗡𝗖", ""]
 
-    checked=recognized=without_role=adopted=skipped_bot=skipped_admin=errors=0
+    # First run: adopt externally assigned regular-member tags by the agreed
+    # clear -> restore round trip. Later runs: bot-managed users are read only.
+    adoption = await adopt_external_roles(chat_id, known_ids)
+    adopted = len(adoption["adopted"])
+    skipped_admin = adoption["skipped_admin"]
+    errors += adoption["errors"]
+
     for user_id in sorted(known_ids):
         try:
             member = await bot.get_chat_member(chat_id, user_id)
@@ -5466,57 +5471,284 @@ async def sync_roles_cmd(message: Message):
                 mark_member_left(chat_id, user_id)
                 continue
             checked += 1
-            current=get_member(chat_id,user_id)
-            current_managed=bool(current and int(current["tag_set_by_bot"] or 0))
-            status=getattr(member,"status","")
-            actual_tag=(getattr(member,"tag",None) or "").strip()
-            role=role_for_tag(actual_tag)
+            role = await sync_member_tag(chat_id, user_id, user=getattr(member, "user", None), force=True)
+            current = get_member(chat_id, user_id)
             if role:
                 recognized += 1
-                if status in {"administrator","creator"}:
-                    skipped_admin += 1
-                elif not current_managed and actual_tag:
-                    # Adopt exactly once. On later syncs a bot-managed user is never rewritten.
-                    try:
-                        await bot.set_chat_member_tag(chat_id,user_id,tag="")
-                        restored=await bot.set_chat_member_tag(chat_id,user_id,tag=actual_tag)
-                        if not restored:
-                            raise RuntimeError("Telegram did not restore the original tag")
-                        adopted += 1
-                    except Exception:
-                        errors += 1
-                        logger.exception("Could not adopt external tag | chat=%s user=%s",chat_id,user_id)
-                await sync_member_tag(chat_id,user_id,user=member.user,force=True)
+                role_name = role["name"]
+            elif current and current["role_name"]:
+                preserved += 1
+                role_name = current["role_name"]
             else:
                 without_role += 1
-                # Never erase an existing role merely because the current tag
-                # is temporarily unknown.
-                await sync_member_tag(chat_id,user_id,user=member.user,force=True)
+                role_name = "роль не распознана"
+            username = getattr(member.user, "username", None) or (current["username"] if current else "")
+            uname = f"@{username}" if username else str(user_id)
+            lines.append(f"Роль участника — {role_name} — {uname}")
         except Exception:
             errors += 1
-            logger.exception("Role sync failed | chat=%s user=%s",chat_id,user_id)
+            logger.exception("Role sync failed | chat=%s user=%s", chat_id, user_id)
 
-    snapshot=role_snapshot_rows(chat_id)
-    lines=["𝗥𝗢𝗟𝗘 𝗦𝗬𝗡𝗖",""]
-    for row in snapshot:
-        uname=f"@{row['username']}" if row["username"] else (str(row["user_id"]) if row["user_id"] else "не определён")
-        role_name=row["role_name"] or "роль не распознана"
-        lines.append(f"Роль участника — {role_name} — {uname}")
-    snapshot_text="\n".join(lines)
-    for i in range(0,len(snapshot_text),3900):
-        with suppress(Exception):
-            await bot.send_message(ADMIN_ID,snapshot_text[i:i+3900])
+    # Keep the owner's DM as the durable human-readable snapshot. Do not send it
+    # to any other group: PRIMARY_CHAT_ID is the only managed group.
+    with suppress(Exception):
+        await bot.send_message(ADMIN_ID, "\n".join(lines)[:3900])
 
     await message.reply(
         "𝗥𝗢𝗟𝗘 𝗦𝗬𝗡𝗖\n\n"
-        f"Проверено Telegram-участников: {checked}\n"
+        f"Проверено участников: {checked}\n"
         f"Ролей распознано: {recognized}\n"
-        f"Новых тегов принято под управление: {adopted}\n"
-        f"Уже контролируются ботом: {skipped_bot}\n"
-        f"Администраторов проверено: {skipped_admin}\n"
-        f"Без распознанной роли: {without_role}\n"
+        f"Новых ролей принято: {adopted}\n"
+        f"Сохранённых ролей не тронуто: {preserved}\n"
+        f"Без роли: {without_role}\n"
+        f"Администраторов/создателей пропущено: {skipped_admin}\n"
         f"Ошибок проверки: {errors}"
     )
+
+
+async def member_info_cmd(message: Message):
+    if not _is_group_message(message):
+        return
+    if not is_group_admin_user(message):
+        return
+    target = message.reply_to_message.from_user if message.reply_to_message and message.reply_to_message.from_user else None
+    if not target:
+        parts = (message.text or "").split()
+        row = find_group_member(message.chat.id, parts[1]) if len(parts) == 2 and parts[1].startswith("@") else None
+    else:
+        row = get_member(message.chat.id, target.id)
+    if not row:
+        await message.reply("𝗠𝗘𝗠𝗕𝗘𝗥\n\nУчастник не найден.")
+        return
+    # Read the real Telegram member tag before showing role information.
+    # The local DB may know the participant but not yet know the tag->role mapping.
+    try:
+        await sync_member_tag(message.chat.id, int(row["user_id"]), force=True)
+        row = get_member(message.chat.id, int(row["user_id"])) or row
+    except Exception:
+        logger.exception("Live member-role sync failed | chat=%s user=%s", message.chat.id, row["user_id"])
+    await message.reply(
+        f"𝗠𝗘𝗠𝗕𝗘𝗥\n\n"
+        f"Участник: {('@'+row['username']) if row['username'] else row['first_name']}\n"
+        f"ID: {row['user_id']}\n"
+        f"Роль участника: {row['role_name'] or '—'}\n"
+        f"Тег: {row['tag'] or '—'}\n"
+        f"Подтверждение: {'да' if row['confirmed'] else 'нет'}\n"
+        f"Активен: {'да' if row['active'] else 'нет'}"
+    )
+
+
+
+# =========================================================
+# GAMES & WEEKLY SCHEDULE
+# =========================================================
+
+WEEKDAY_NAMES={0:"Понедельник",1:"Вторник",2:"Среда",3:"Четверг",4:"Пятница",5:"Суббота",6:"Воскресенье"}
+SCHEDULE_CYCLE_DAYS=[("Вторник",1),("Четверг",3),("Суббота",5),("Понедельник",0),("Среда",2),("Пятница",4),("Воскресенье",6)]
+SCHEDULE_DAY_TO_SLOT={name:i for i,(name,_) in enumerate(SCHEDULE_CYCLE_DAYS)}
+
+GAME_DEFINITIONS = [
+    ("Шпион", "Все участники, кроме одного, знают загаданную локацию. Игроки задают друг другу вопросы, пытаясь вычислить шпиона. Задача шпиона — понять локацию и назвать её.", ""),
+    ("Жених и невеста", "Ведущий выбирает жениха, остальные получают номера. Жених задаёт вопросы, невесты отвечают в личке ведущего. Жених выбирает, чей ответ выбивает участницу. Побеждает последняя оставшаяся невеста.", ""),
+    ("Правда или ложь", "Каждый участник рассказывает три факта о себе: два правдивых и один ложный. Остальные пытаются определить ложный факт и получают баллы за правильные ответы.", ""),
+    ("Мафия", "Игроки получают роли и делятся на мирных и мафию. Днём обсуждение и голосование, ночью действует мафия. Наш бот только собирает игроков и передаёт запуск MafiaAzBot.", "/start@MafiaAzBot"),
+    ("Снежный ком историй", "Первый игрок начинает историю одним предложением. Каждый следующий повторяет предыдущие предложения и добавляет своё. История постепенно превращается в общий абсурдный рассказ.", ""),
+    ("Чёрный ящик", "Ведущий объявляет, что в воображаемом чёрном ящике лежит предмет. Игроки задают наводящие вопросы, а ведущий описывает свойства, функции, историю или ассоциации предмета.", ""),
+    ("Бункер", "После катаклизма игроки пытаются попасть в бункер. Каждый получает случайные характеристики и постепенно раскрывает их, убеждая остальных, что именно он должен выжить.", ""),
+]
+
+DEFAULT_WEEKLY_SCHEDULE = [
+    (0, "20:00", "Шпион"),
+    (1, "20:00", "Жених и невеста"),
+    (2, "20:00", "Правда или ложь"),
+    (3, "20:00", "Мафия"),
+    (4, "20:00", "Снежный ком историй"),
+    (5, "20:00", "Чёрный ящик"),
+    (6, "20:00", "Бункер"),
+]
+
+def schedule_anchor():
+    return datetime.fromisoformat(SCHEDULE_ANCHOR_DATE).date()
+
+def cycle_slot_for_local(dt):
+    anchor=schedule_anchor()
+    days=(dt.date()-anchor).days
+    cycle_day=days % 14
+    if cycle_day % 2 != 0:
+        return None
+    slot=cycle_day // 2
+    if slot>6:
+        return None
+    return slot
+
+def next_cycle_slot(chat_id, after_local):
+    rows=group_db_op(lambda conn: conn.execute(
+        "SELECT * FROM schedule_cycle WHERE chat_id=? AND enabled=1",(chat_id,)
+    ).fetchall())
+    if not rows:
+        return None
+    best=None
+    for row in rows:
+        slot=int(row["slot_index"])
+        base=schedule_anchor()+timedelta(days=slot*2)
+        delta_days=(after_local.date()-base).days
+        cycles=max(0, (delta_days//14))
+        candidate_date=base+timedelta(days=cycles*14)
+        hour,minute=map(int,str(row["time_hm"]).split(":"))
+        candidate=datetime.combine(candidate_date, datetime.min.time()).replace(hour=hour,minute=minute)
+        if candidate <= after_local:
+            candidate += timedelta(days=14)
+        item=(candidate,slot,str(row["time_hm"]))
+        if best is None or item[0]<best[0]:
+            best=item
+    return best
+
+def ensure_default_schedule(chat_id):
+    existing=group_db_op(lambda conn: conn.execute(
+        "SELECT COUNT(*) AS c FROM schedule_cycle WHERE chat_id=? AND enabled=1",(chat_id,)
+    ).fetchone())
+    if existing and int(existing["c"])>0:
+        return
+    def op(conn):
+        for slot,time_hm,game_name in DEFAULT_WEEKLY_SCHEDULE:
+            conn.execute(
+                "INSERT OR IGNORE INTO schedule_cycle(chat_id,slot_index,time_hm,game_name,note,enabled) VALUES(?,?,?,?,?,1)",
+                (chat_id,slot,time_hm,game_name,"Базовый цикл через день · 20:00 МСК"),
+            )
+        conn.commit()
+    group_db_op(op)
+
+def schedule_text(chat_id):
+    ensure_default_schedule(chat_id)
+    rows=group_db_op(lambda conn: conn.execute(
+        "SELECT * FROM schedule_cycle WHERE chat_id=? AND enabled=1 ORDER BY slot_index",(chat_id,)
+    ).fetchall())
+    lines=["𝗦𝗖𝗛𝗘𝗗𝗨𝗟𝗘","","Игры · МСК",""]
+    for row in rows:
+        slot=int(row["slot_index"])
+        day_name=SCHEDULE_CYCLE_DAYS[slot][0] if 0<=slot<7 else str(slot)
+        lines.append(f"{day_name} · {row['time_hm']} — {row['game_name']}")
+    lines.extend([
+        "",
+        "После воскресенья цикл начинается со вторника.",
+        "Интерактивы проходят через день.",
+        "Расписание может изменяться.",
+        "О переносах и новых мероприятиях сообщается отдельно.",
+    ])
+    return "\n".join(lines)
+
+def set_schedule(chat_id,day_text,time_hm,game_name,note=""):
+    key=(day_text or "").strip().casefold()
+    slot=SCHEDULE_DAY_TO_SLOT.get(next((name for name,_ in SCHEDULE_CYCLE_DAYS if name.casefold()==key), ""))
+    if slot is None or not re.fullmatch(r'(?:[01]\d|2[0-3]):[0-5]\d',time_hm):
+        raise ValueError("INVALID_SCHEDULE")
+    group_db_op(lambda conn:(conn.execute(
+        "INSERT INTO schedule_cycle(chat_id,slot_index,time_hm,game_name,note,enabled) VALUES(?,?,?,?,?,1) ON CONFLICT(chat_id,slot_index) DO UPDATE SET time_hm=excluded.time_hm,game_name=excluded.game_name,note=excluded.note,enabled=1",
+        (chat_id,slot,time_hm,game_name,note),
+    ),conn.commit()))
+
+def delete_schedule(chat_id,day_text):
+    key=(day_text or "").strip().casefold()
+    name=next((name for name,_ in SCHEDULE_CYCLE_DAYS if name.casefold()==key),None)
+    if name is None:
+        return False
+    slot=SCHEDULE_DAY_TO_SLOT[name]
+    return group_db_op(lambda conn:(conn.execute("DELETE FROM schedule_cycle WHERE chat_id=? AND slot_index=?",(chat_id,slot)).rowcount>0,conn.commit())[0])
+
+
+def get_games(enabled_only=True):
+    sql="SELECT * FROM game_catalog"+(' WHERE enabled=1' if enabled_only else '')+" ORDER BY id"
+    return group_db_op(lambda conn: conn.execute(sql).fetchall())
+
+def get_game_by_id(game_id, enabled_only=False):
+    """Return a single game by id; used by poll callbacks and winner resolution."""
+    sql = "SELECT * FROM game_catalog WHERE id=?"
+    params = (int(game_id),)
+    if enabled_only:
+        sql += " AND enabled=1"
+    return group_db_op(lambda conn: conn.execute(sql, params).fetchone())
+
+def add_game(name, description="", launch_text=""):
+    name=(name or "").strip()
+    if not name: raise ValueError("EMPTY_GAME")
+    return group_db_op(lambda conn: (conn.execute("INSERT INTO game_catalog(name,description,launch_text,enabled,created_at,created_by) VALUES(?,?,?,?,?,?) ON CONFLICT(name) DO UPDATE SET description=excluded.description,launch_text=excluded.launch_text,enabled=1",(name,description,launch_text,1,now(),ADMIN_ID)),conn.commit(),True)[-1])
+
+def remove_game(name):
+    return group_db_op(lambda conn: (conn.execute("UPDATE game_catalog SET enabled=0 WHERE lower(name)=lower(?)",(name.strip(),)).rowcount>0, conn.commit())[0])
+
+def compact_game_name(name, limit=24):
+    value = str(name)
+    return value if len(value) <= limit else value[: limit - 1] + "…"
+
+def is_primary_chat(chat_id: int) -> bool:
+    """Allow game/rolemembership features only in the single configured primary chat.
+    If PRIMARY_CHAT_ID is unset, a single managed group is accepted as the fallback.
+    """
+    if not chat_id:
+        return False
+    if PRIMARY_CHAT_ID:
+        return int(chat_id) == PRIMARY_CHAT_ID
+    try:
+        rows = group_db_op(lambda conn: conn.execute(
+            "SELECT group_chat_id FROM managed_group ORDER BY group_chat_id"
+        ).fetchall())
+        ids = [int(r["group_chat_id"]) for r in rows]
+        return len(ids) == 1 and ids[0] == int(chat_id)
+    except Exception:
+        return False
+
+def require_primary_group(message: Message) -> bool:
+    return _is_group_message(message) and is_primary_chat(message.chat.id)
+
+def poll_games(poll) -> list:
+    raw = (poll["options_json"] or "").strip() if poll else ""
+    if not raw:
+        return get_games()
+    try:
+        ids = [int(x) for x in json.loads(raw)]
+    except Exception:
+        return get_games()
+    if not ids:
+        return get_games()
+    placeholders = ",".join("?" for _ in ids)
+    return group_db_op(lambda conn: conn.execute(
+        f"SELECT * FROM game_catalog WHERE enabled=1 AND id IN ({placeholders}) ORDER BY id", ids
+    ).fetchall())
+
+def user_mention(user_id: int, name: str, username: str | None = None) -> str:
+    if username:
+        return f"@{html.escape(username)}"
+    safe_name = html.escape(name or f"ID {user_id}")
+    return f'<a href="tg://user?id={int(user_id)}">{safe_name}</a>'
+
+def poll_voter_mentions(poll_id: int, game_id: int) -> list[str]:
+    rows = group_db_op(lambda conn: conn.execute(
+        """SELECT v.user_id, COALESCE(m.first_name, u.first_name, '') AS first_name,
+                  COALESCE(m.username, u.username, '') AS username
+             FROM game_poll_votes v
+             LEFT JOIN group_members m ON m.chat_id=(SELECT chat_id FROM game_polls WHERE id=?) AND m.user_id=v.user_id
+             LEFT JOIN users u ON u.user_id=v.user_id
+             WHERE v.poll_id=? AND v.game_id=? ORDER BY v.voted_at""",
+        (poll_id, poll_id, game_id)
+    ).fetchall())
+    return [user_mention(int(r["user_id"]), r["first_name"], r["username"]) for r in rows]
+
+
+def game_poll_keyboard(poll_id, games, current_vote=None):
+    rows = []
+    for game in games:
+        gid = int(game["id"])
+        label = compact_game_name(game["name"])
+        rows.append([
+            InlineKeyboardButton(text=label, callback_data=f"gp:v:{poll_id}:{gid}"),
+            InlineKeyboardButton(text="ℹ", callback_data=f"gp:i:{poll_id}:{gid}"),
+        ])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+def poll_duration_keyboard():
+    opts=[(15,"15 мин"),(30,"30 мин"),(60,"1 час"),(120,"2 часа"),(360,"6 часов"),(1440,"1 день"),(10080,"7 дней")]
+    return InlineKeyboardMarkup(inline_keyboard=[ [InlineKeyboardButton(text=l,callback_data=f"gp:d:{m}") for m,l in opts[i:i+2]] for i in range(0,len(opts),2) ]+[[InlineKeyboardButton(text="Отмена",callback_data="gp:cancel")]])
+
 
 @dp.message(Command("game_poll"))
 async def game_poll_cmd(message: Message):
