@@ -7376,7 +7376,7 @@ async def _spy_start_round(game_id):
     delivered = []
     for uid, role_name, is_spy in assignments:
         try:
-            await _spy_send_card(game_id, uid, location, role_name, is_spy)
+            await asyncio.wait_for(_spy_send_card(game_id, uid, location, role_name, is_spy), timeout=10)
             delivered.append(uid)
         except Exception:
             logger.exception("Spy secret card delivery failed | game=%s user=%s", game_id, uid)
@@ -7709,6 +7709,97 @@ async def spy_handle_deep_link(message: Message, game_id: int):
         )
 
 
+async def _spy_launch_game_task(game_id: int, chat_id: int, lobby_message_id: int):
+    """Reliable, non-blocking Spyfall launcher. Never runs inside callback handling."""
+    try:
+        game = _spy_get_game(game_id)
+        if not game or game["status"] != "STARTING":
+            return
+
+        players = _spy_players(game_id)
+        if len(players) < SPY_MIN_PLAYERS:
+            _spy_set_state(game_id, status="WAITING", phase="LOBBY", expires_at=None)
+            return
+
+        missing = _spy_missing_dm(game_id)
+        if missing:
+            names = ", ".join(_spy_display(p) for p in missing[:8])
+            more = f" и ещё {len(missing) - 8}" if len(missing) > 8 else ""
+            _spy_set_state(game_id, status="WAITING", phase="LOBBY", expires_at=None)
+            with suppress(Exception):
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=lobby_message_id,
+                    text="𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n❌ Игра не запущена.\n\n"
+                         f"Не подключили ЛС: {names}{more}\n\n"
+                         "Пусть эти участники снова нажмут «🎮 Участвовать»." ,
+                    reply_markup=_spy_lobby_keyboard(game_id, len(players) >= SPY_MIN_PLAYERS),
+                )
+            return
+
+        with suppress(Exception):
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=lobby_message_id,
+                text="𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n⏳ Подготавливаю игру…\n"
+                     "Раздаю секретные карточки участникам.",
+                reply_markup=None,
+            )
+
+        ok, msg = await asyncio.wait_for(_spy_start_round(game_id), timeout=45)
+        if not ok:
+            _spy_set_state(game_id, status="WAITING", phase="LOBBY", expires_at=None)
+            with suppress(Exception):
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=lobby_message_id,
+                    text="𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n❌ Игра не запущена.\n" + str(msg),
+                    reply_markup=_spy_lobby_keyboard(game_id, len(_spy_players(game_id)) >= SPY_MIN_PLAYERS),
+                )
+            return
+
+        with suppress(Exception):
+            await bot.unpin_chat_message(chat_id, lobby_message_id)
+
+        started = _spy_get_game(game_id)
+        order_rows = _spy_players(game_id)
+        order_text = "\n".join(f"{i}. {_spy_display(p)}" for i, p in enumerate(order_rows, 1))
+        with suppress(Exception):
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=lobby_message_id,
+                text="𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
+                     "Раунд начался.\n\n"
+                     "Очередность вопросов:\n" + order_text + "\n\n"
+                     "Новые участники больше не принимаются.",
+                reply_markup=_spy_group_controls(game_id),
+            )
+        if started and started["current_asker_id"]:
+            await _spy_prepare_turn_dm(game_id, int(started["current_asker_id"]))
+    except asyncio.TimeoutError:
+        logger.error("Spy launch timed out | game=%s", game_id)
+        _spy_set_state(game_id, status="WAITING", phase="LOBBY", expires_at=None, current_asker_id=None, current_target_id=None)
+        with suppress(Exception):
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=lobby_message_id,
+                text="𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n❌ Запуск занял слишком много времени и был отменён.\n"
+                     "Проверьте, что все участники открыли ЛС бота через кнопку «🎮 Участвовать».",
+                reply_markup=_spy_lobby_keyboard(game_id, len(_spy_players(game_id)) >= SPY_MIN_PLAYERS),
+            )
+    except Exception:
+        logger.exception("Spy launch task failed | game=%s", game_id)
+        _spy_set_state(game_id, status="WAITING", phase="LOBBY", expires_at=None, current_asker_id=None, current_target_id=None)
+        with suppress(Exception):
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=lobby_message_id,
+                text="𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n❌ При запуске произошла ошибка.\n"
+                     "Лобби возвращено в состояние ожидания — данные участников сохранены.",
+                reply_markup=_spy_lobby_keyboard(game_id, len(_spy_players(game_id)) >= SPY_MIN_PLAYERS),
+            )
+
+
 @dp.callback_query(F.data.startswith("sp:"))
 async def spy_callback(callback: CallbackQuery):
     parts = (callback.data or "").split(":")
@@ -7788,43 +7879,22 @@ async def spy_callback(callback: CallbackQuery):
         if game["status"] != "WAITING":
             await callback.answer("Игра уже запущена.", show_alert=True)
             return
-        # Lock the lobby into STARTING immediately so double-clicks cannot launch two rounds.
-        _spy_set_state(game_id, status="STARTING", phase="LOBBY")
-        await callback.answer("Запускаю игру…", show_alert=False)
+
         players = _spy_players(game_id)
         if len(players) < SPY_MIN_PLAYERS:
-            _spy_set_state(game_id, status="WAITING", phase="LOBBY")
             await callback.answer("Нужно минимум 3 участника.", show_alert=True)
             return
-        missing = _spy_missing_dm(game_id)
-        if missing:
-            _spy_set_state(game_id, status="WAITING", phase="LOBBY")
-            names = ", ".join(_spy_display(p) for p in missing[:8])
-            more = f" и ещё {len(missing) - 8}" if len(missing) > 8 else ""
-            await bot.send_message(int(game["chat_id"]), f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nНе удалось начать игру. ЛС не подключили: {names}{more}.")
-            return
-        ok, msg = await _spy_start_round(game_id)
-        if not ok:
-            _spy_set_state(game_id, status="WAITING", phase="LOBBY")
-            with suppress(Exception):
-                await callback.message.edit_reply_markup(reply_markup=_spy_lobby_keyboard(game_id, True))
-            await bot.send_message(int(game["chat_id"]), f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nИгра не запущена. {msg}")
-            return
-        with suppress(Exception):
-            await bot.unpin_chat_message(callback.message.chat.id, callback.message.message_id)
-        started = _spy_get_game(game_id)
-        order_rows = _spy_players(game_id)
-        order_text = "\n".join(f"{i}. {_spy_display(p)}" for i, p in enumerate(order_rows, 1))
-        with suppress(Exception):
-            await callback.message.edit_text(
-                "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
-                "Раунд начался.\n\n"
-                "Очередность вопросов:\n" + order_text + "\n\n"
-                "Новые участники больше не принимаются.",
-                reply_markup=_spy_group_controls(game_id),
-            )
-        started = _spy_get_game(game_id)
-        await _spy_prepare_turn_dm(game_id, int(started["current_asker_id"]))
+
+        # Lock before spawning the launch task. This makes the button idempotent
+        # even if Telegram delivers two clicks almost simultaneously.
+        _spy_set_state(game_id, status="STARTING", phase="LOBBY")
+        await callback.answer("Запускаю игру…", show_alert=False)
+
+        # Do not keep the Telegram callback open while sending secret DMs.
+        # Long network operations belong in a background task; otherwise the
+        # client can remain stuck on the loading state and a slow DM can block
+        # the whole launch handler.
+        asyncio.create_task(_spy_launch_game_task(game_id, int(callback.message.chat.id), int(callback.message.message_id)))
         return
 
     if action == "ask":
