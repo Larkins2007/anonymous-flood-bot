@@ -1,4 +1,4 @@
-# Justice Faite Bot
+# Justice Faite Bot — v31 Spyfix
 
 Telegram-бот на aiogram 3.x для основного чата: правила новых участников, роли/Telegram-теги, Mafia lobby, игровые голосования и расписание.
 
@@ -72,3 +72,7 @@ python bot.py
 
 ### Синхронизация ролей
 `/syncroles` проверяет сохранённых участников основного чата, читает их реальные Telegram-теги, сопоставляет их с каталогом из 148 ролей, принимает ранее выставленные чужим/старым ботом теги под управление и отправляет владельцу полный снимок «роль участника — роль — @username».
+
+
+## Spyfall
+`/spy` opens a locked lobby in the primary chat. Players join and must open the bot DM before the admin can start. The bot randomly chooses order, location and spy, sends secret cards by DM, drives question → yes/no answer → automatic next turn, then discussion and final suspect vote. No mid-game joins.
