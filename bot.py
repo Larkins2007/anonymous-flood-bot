@@ -4,6 +4,7 @@ import html
 import logging
 import os
 import re
+import random
 import signal
 import sqlite3
 import sys
@@ -37,6 +38,7 @@ from aiogram.types import (
     BotCommandScopeChat,
     BotCommandScopeDefault,
     BotCommandScopeAllGroupChats,
+    BotCommandScopeChatAdministrators,
     BotCommandScopeAllChatAdministrators,
     CallbackQuery,
     ChatMemberUpdated,
@@ -7362,80 +7364,83 @@ def _spy_start_round_sync(game_id):
     return assignments, None
 
 
-def _spy_reset_after_failed_start(game_id):
-    _spy_set_state(
-        game_id,
-        status="WAITING",
-        phase="LOBBY",
-        current_asker_id=None,
-        current_target_id=None,
-        expires_at=None,
-        turn_count=0,
-    )
-    group_db_op(lambda conn: (
-        conn.execute(
-            "UPDATE spy_players SET role_name='',is_spy=0,hints_used=0 WHERE game_id=?",
-            (int(game_id),),
-        ),
-        conn.commit(),
-    ))
+def _spy_format_start_error(stage, exc=None, details=None):
+    lines = [
+        f"Этап: {stage}",
+    ]
+    if exc is not None:
+        etype = type(exc).__name__
+        emsg = str(exc).strip() or "без дополнительного сообщения"
+        lines.append(f"Ошибка: {etype}: {emsg[:700]}")
+    if details:
+        lines.append("\nПодробности:")
+        lines.extend(f"• {d}" for d in details[:12])
+        if len(details) > 12:
+            lines.append(f"• …и ещё {len(details) - 12}")
+    return "\n".join(lines)
 
 
-def _spy_error_text(exc):
-    name = type(exc).__name__
-    text = str(exc).strip()
-    if text:
-        return f"{name}: {text}"
-    return name
+def _spy_preflight_start(game_id):
+    checks = []
+    game = _spy_get_game(game_id)
+    if not game:
+        checks.append("игра не найдена в базе")
+        return checks
+    players = _spy_players(game_id)
+    if len(players) < SPY_MIN_PLAYERS:
+        checks.append(f"недостаточно участников: {len(players)}/{SPY_MIN_PLAYERS}")
+    if not SPY_LOCATIONS:
+        checks.append("каталог локаций пуст")
+    if _spy_spy_count(len(players)) > len(players):
+        checks.append("некорректное количество шпионов")
+    return checks
+
+
+async def _spy_send_card_safe(game_id, uid, location, role_name, is_spy):
+    try:
+        await asyncio.wait_for(_spy_send_card(game_id, uid, location, role_name, is_spy), timeout=12)
+        return None
+    except Exception as exc:
+        player = _spy_player(game_id, uid)
+        who = _spy_display(player) if player else str(uid)
+        logger.exception("Spy secret card delivery failed | game=%s user=%s", game_id, uid)
+        return f"{who}: {type(exc).__name__}: {str(exc).strip() or 'без сообщения'}"
 
 
 async def _spy_start_round(game_id):
-    """Start Spyfall atomically: validate DM readiness, assign roles, then send DMs concurrently."""
+    preflight_errors = _spy_preflight_start(game_id)
+    if preflight_errors:
+        return False, _spy_format_start_error("предварительная проверка", details=preflight_errors)
+
     missing = _spy_missing_dm(game_id)
     if missing:
-        names = ", ".join(_spy_display(p) for p in missing[:8])
-        more = f" и ещё {len(missing) - 8}" if len(missing) > 8 else ""
-        return False, f"Сначала нажмите «🎮 Участвовать» для ЛС: {names}{more}"
+        names = [_spy_display(p) for p in missing]
+        return False, _spy_format_start_error(
+            "проверка личных сообщений",
+            details=[f"Не подключён ЛС: {name}" for name in names],
+        )
 
     assignments, error = _spy_start_round_sync(game_id)
     if error:
-        return False, error
+        return False, _spy_format_start_error("создание раунда", details=[error])
 
     game = _spy_get_game(game_id)
     location = game["location"] if game else ""
-
-    async def deliver(card):
-        uid, role_name, is_spy = card
-        try:
-            await asyncio.wait_for(
-                _spy_send_card(game_id, uid, location, role_name, is_spy),
-                timeout=10,
-            )
-            return uid, None
-        except Exception as exc:
-            logger.exception(
-                "Spy secret card delivery failed | game=%s user=%s",
-                game_id,
-                uid,
-            )
-            return uid, exc
-
-    # Never send cards sequentially: with 10 players, 10x10s would exceed the
-    # launch watchdog even though every individual DM is healthy.
-    results = await asyncio.gather(*(deliver(card) for card in assignments))
-    failures = [(uid, exc) for uid, exc in results if exc is not None]
-
+    # Deliver all secret cards concurrently so one slow player cannot consume the entire launch timeout.
+    tasks = [
+        _spy_send_card_safe(game_id, uid, location, role_name, is_spy)
+        for uid, role_name, is_spy in assignments
+    ]
+    results = await asyncio.gather(*tasks)
+    failures = [r for r in results if r]
     if failures:
-        _spy_reset_after_failed_start(game_id)
-        details = []
-        for uid, exc in failures[:5]:
-            player = _spy_player(game_id, uid)
-            details.append(f"{_spy_display(player)} — {_spy_error_text(exc)}")
-        if len(failures) > 5:
-            details.append(f"и ещё {len(failures) - 5}")
-        return False, "Не удалось отправить секретную карточку:\n" + "\n".join(details)
+        _spy_set_state(game_id, status="WAITING", phase="LOBBY", current_asker_id=None, current_target_id=None, expires_at=None)
+        group_db_op(lambda conn: (
+            conn.execute("UPDATE spy_players SET role_name='',is_spy=0,hints_used=0 WHERE game_id=?", (int(game_id),)),
+            conn.commit(),
+        ))
+        return False, _spy_format_start_error("раздача секретных карточек", details=failures)
 
-    # Secret cards were delivered successfully. Only now expose the round as PLAYING.
     _spy_set_state(game_id, status="PLAYING", phase="QUESTION")
     return True, "Игра началась."
 
@@ -7825,28 +7830,29 @@ async def _spy_launch_game_task(game_id: int, chat_id: int, lobby_message_id: in
             )
         if started and started["current_asker_id"]:
             await _spy_prepare_turn_dm(game_id, int(started["current_asker_id"]))
-    except asyncio.TimeoutError:
-        logger.error("Spy launch timed out | game=%s", game_id)
+    except asyncio.TimeoutError as exc:
+        logger.exception("Spy launch timed out | game=%s", game_id)
         _spy_set_state(game_id, status="WAITING", phase="LOBBY", expires_at=None, current_asker_id=None, current_target_id=None)
+        diagnostic = _spy_format_start_error("общий таймаут запуска", exc=exc, details=["Операция превысила 45 секунд.", "Карточки теперь отправляются параллельно, поэтому повторный запуск должен показать точную проблемную стадию."])
         with suppress(Exception):
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=lobby_message_id,
-                text="𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n❌ Запуск занял слишком много времени и был отменён.\n"
-                     "Проверьте, что все участники открыли ЛС бота через кнопку «🎮 Участвовать».",
+                text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n❌ Запуск занял слишком много времени и был отменён.\n\n"
+                      f"{diagnostic}"),
                 reply_markup=_spy_lobby_keyboard(game_id, len(_spy_players(game_id)) >= SPY_MIN_PLAYERS),
             )
     except Exception as exc:
         logger.exception("Spy launch task failed | game=%s", game_id)
-        _spy_reset_after_failed_start(game_id)
-        details = _spy_error_text(exc)
+        _spy_set_state(game_id, status="WAITING", phase="LOBBY", expires_at=None, current_asker_id=None, current_target_id=None)
+        diagnostic = _spy_format_start_error("необработанное исключение запуска", exc=exc)
         with suppress(Exception):
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=lobby_message_id,
-                text="𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n❌ При запуске произошла ошибка.\n"
-                     f"Причина: {details}\n\n"
-                     "Лобби возвращено в состояние ожидания — данные участников сохранены.",
+                text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n❌ При запуске произошла ошибка.\n\n"
+                      f"{diagnostic}\n\n"
+                      "Лобби возвращено в состояние ожидания — данные участников сохранены."),
                 reply_markup=_spy_lobby_keyboard(game_id, len(_spy_players(game_id)) >= SPY_MIN_PLAYERS),
             )
 
