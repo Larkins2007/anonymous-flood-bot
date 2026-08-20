@@ -646,9 +646,22 @@ def init_group_db():
                 current_asker_id INTEGER, current_target_id INTEGER,
                 phase TEXT NOT NULL DEFAULT 'LOBBY',
                 accusation_suspect_id INTEGER,
+                summary_sent_round INTEGER NOT NULL DEFAULT 0,
                 updated_at TEXT NOT NULL
             );
             CREATE INDEX IF NOT EXISTS idx_spy_games_chat_status ON spy_games(chat_id,status);
+            CREATE TABLE IF NOT EXISTS spy_turns (
+                game_id INTEGER NOT NULL,
+                turn_no INTEGER NOT NULL,
+                round_no INTEGER NOT NULL,
+                asker_id INTEGER NOT NULL,
+                target_id INTEGER NOT NULL,
+                question TEXT NOT NULL DEFAULT '',
+                answer TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                PRIMARY KEY(game_id, turn_no)
+            );
+            CREATE INDEX IF NOT EXISTS idx_spy_turns_game_round ON spy_turns(game_id, round_no, turn_no);
             CREATE TABLE IF NOT EXISTS spy_players (
                 game_id INTEGER NOT NULL, user_id INTEGER NOT NULL,
                 username TEXT NOT NULL DEFAULT '', display_name TEXT NOT NULL DEFAULT '',
@@ -7067,6 +7080,8 @@ def _spy_ensure_schema():
         if "hints_used" not in cols:
             conn.execute("ALTER TABLE spy_players ADD COLUMN hints_used INTEGER NOT NULL DEFAULT 0")
         game_cols = {r["name"] for r in conn.execute("PRAGMA table_info(spy_games)").fetchall()}
+        if "summary_sent_round" not in game_cols:
+            conn.execute("ALTER TABLE spy_games ADD COLUMN summary_sent_round INTEGER NOT NULL DEFAULT 0")
         wanted = {
             "turn_count": "INTEGER NOT NULL DEFAULT 0",
             "round_target": "INTEGER NOT NULL DEFAULT 2",
@@ -7213,6 +7228,58 @@ def _spy_vote_keyboard(game_id):
     ] for p in _spy_players(game_id)])
 
 
+def _spy_record_turn(game_id, turn_no, round_no, asker_id, target_id, question, answer=""):
+    def op(conn):
+        conn.execute(
+            "INSERT OR REPLACE INTO spy_turns(game_id,turn_no,round_no,asker_id,target_id,question,answer,created_at) VALUES(?,?,?,?,?,?,?,?)",
+            (int(game_id), int(turn_no), int(round_no), int(asker_id), int(target_id), str(question or ""), str(answer or ""), now()),
+        )
+        conn.commit()
+    group_db_op(op)
+
+
+def _spy_complete_turn_answer(game_id, turn_no, answer):
+    def op(conn):
+        conn.execute("UPDATE spy_turns SET answer=? WHERE game_id=? AND turn_no=?", (str(answer), int(game_id), int(turn_no)))
+        conn.commit()
+    group_db_op(op)
+
+
+def _spy_round_summary_text(game_id, round_no):
+    rows = group_db_op(lambda conn: conn.execute(
+        "SELECT * FROM spy_turns WHERE game_id=? AND round_no=? ORDER BY turn_no",
+        (int(game_id), int(round_no)),
+    ).fetchall())
+    if not rows:
+        return ""
+    lines = [f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ИТОГИ КРУГА {round_no}", "", "Вопросы и ответы по порядку:", ""]
+    for idx, row in enumerate(rows, 1):
+        asker = _spy_display(_spy_player(game_id, int(row["asker_id"])))
+        target = _spy_display(_spy_player(game_id, int(row["target_id"])))
+        q = str(row["question"] or "").replace("\n", " ").strip()
+        a = str(row["answer"] or "—").replace("\n", " ").strip()
+        lines.append(f"{idx}. {asker} → {target}")
+        lines.append(f"❓ {q}")
+        lines.append(f"💬 {a}")
+        if idx != len(rows):
+            lines.append("")
+    return "\n".join(lines)
+
+
+async def _spy_send_round_summary(game_id, round_no):
+    game = _spy_get_game(game_id)
+    if not game:
+        return
+    if int(game["summary_sent_round"] or 0) >= int(round_no):
+        return
+    text = _spy_round_summary_text(game_id, round_no)
+    if not text:
+        return
+    with suppress(Exception):
+        await bot.send_message(int(game["chat_id"]), text)
+    _spy_set_state(game_id, summary_sent_round=int(round_no))
+
+
 def _spy_set_state(game_id, **fields):
     if not fields:
         return
@@ -7300,7 +7367,9 @@ def _spy_reset_transient_state(game_id):
     group_db_op(lambda conn: (
         conn.execute("DELETE FROM spy_votes WHERE game_id=?", (int(game_id),)),
         conn.execute("DELETE FROM spy_guesses WHERE game_id=?", (int(game_id),)),
+        conn.execute("DELETE FROM spy_turns WHERE game_id=?", (int(game_id),)),
         conn.execute("UPDATE spy_players SET hints_used=0 WHERE game_id=?", (int(game_id),)),
+        conn.execute("UPDATE spy_games SET summary_sent_round=0 WHERE id=?", (int(game_id),)),
         conn.commit(),
     ))
 
@@ -7981,9 +8050,11 @@ async def spy_callback(callback: CallbackQuery):
             await callback.answer("Не удалось определить следующий ход.", show_alert=True)
             return
         answer = "Да" if value else "Нет"
+        current_turn_no = int(game["turn_count"] or 0) + 1
+        _spy_complete_turn_answer(game_id, current_turn_no, answer)
         with suppress(Exception):
             await bot.send_message(int(game["chat_id"]), f"💬 {_spy_display(target)} → {answer}")
-        new_count = int(game["turn_count"] or 0) + 1
+        new_count = current_turn_no
         with suppress(Exception):
             await callback.message.edit_reply_markup(reply_markup=None)
         _spy_set_state(
@@ -7995,8 +8066,15 @@ async def spy_callback(callback: CallbackQuery):
         )
         current = _spy_get_game(game_id)
         if current and new_count >= len(_spy_players(game_id)) * int(current["round_target"] or 2):
+            final_round = int(current["round_target"] or 2)
+            await _spy_send_round_summary(game_id, final_round)
             await _spy_start_discussion(game_id)
         else:
+            # If a round just ended, publish its compact transcript before starting the next one.
+            players_count = max(1, len(_spy_players(game_id)))
+            completed_round = new_count // players_count
+            if new_count % players_count == 0:
+                await _spy_send_round_summary(game_id, completed_round)
             await _spy_prepare_turn_dm(game_id, uid)
         await callback.answer("Ответ принят. Теперь твой ход.")
         return
@@ -8044,8 +8122,13 @@ async def spy_callback(callback: CallbackQuery):
             await callback.answer("Подсказка сейчас недоступна.", show_alert=True)
             return
         used = int(player["hints_used"] or 0)
+        current_round = 1 + (int(game["turn_count"] or 0) // max(1, len(_spy_players(game_id))))
         if used >= SPY_MAX_HINTS:
-            await callback.answer("Ты уже использовал обе подсказки.", show_alert=True)
+            await callback.answer("Все три подсказки уже использованы.", show_alert=True)
+            return
+        required_round = used + 1
+        if current_round < required_round:
+            await callback.answer(f"Эта подсказка откроется после завершения {required_round - 1}-го круга.", show_alert=True)
             return
         hints = SPY_LOCATIONS.get(str(game["location"] or ""), {}).get("hints", [])
         if used >= len(hints):
@@ -8154,6 +8237,9 @@ async def spy_private_text(message: Message):
         target = _spy_player(game["id"], int(game["current_target_id"] or 0))
         if not target or not int(target["active"] or 0):
             return
+        next_turn_no = int(game["turn_count"] or 0) + 1
+        round_no = ((next_turn_no - 1) // max(1, len(_spy_players(game["id"])))) + 1
+        _spy_record_turn(game["id"], next_turn_no, round_no, uid, int(target["user_id"]), text, "")
         await bot.send_message(
             int(game["chat_id"]),
             f"❓ {_spy_display(_spy_player(game['id'], uid))} → {_spy_display(target)}\n\n{text}",
