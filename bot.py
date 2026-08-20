@@ -6447,6 +6447,8 @@ async def setup_commands():
     ]
     base_admin = [
         *base_user,
+        BotCommand(command="spy_kick", description="Исключить участника из «Шпион»"),
+        BotCommand(command="spy_end", description="Досрочно завершить «Шпион»"),
         BotCommand(command="game_poll", description="Опрос на игру"),
         BotCommand(command="setrole", description="Назначить роль"),
         BotCommand(command="syncroles", description="Сверить и сохранить роли"),
@@ -7754,6 +7756,154 @@ async def _spy_finish_message(game_id, winner, reason, location_override=None):
                 f"Локация: {location}\n"
                 f"Шпион(ы): {spy_names}",
             )
+
+
+async def _spy_command_admin_ok(message: Message) -> bool:
+    """Spy admin commands are available only to the bot owner or group admins."""
+    if not message.from_user or message.chat.type not in {"group", "supergroup"}:
+        return False
+    if not is_primary_chat(message.chat.id):
+        return False
+    if message.from_user.id == ADMIN_ID:
+        return True
+    try:
+        member = await bot.get_chat_member(message.chat.id, message.from_user.id)
+        return getattr(member, "status", "") in {"administrator", "creator"}
+    except Exception:
+        logger.exception("Spy admin permission check failed | chat=%s user=%s", message.chat.id, message.from_user.id)
+        return False
+
+
+def _spy_command_arg(message: Message) -> str:
+    text = message.text or ""
+    parts = text.split(maxsplit=1)
+    return parts[1].strip() if len(parts) == 2 else ""
+
+
+def _spy_find_player_for_command(game_id: int, raw_target: str):
+    """Resolve /spy_kick target by reply, @username, numeric id or display name."""
+    target = (raw_target or "").strip()
+    if not target:
+        return None
+    if target.startswith("@"):
+        target = target[1:]
+    target_cf = target.casefold()
+    for player in _spy_players(game_id, active_only=False):
+        username = str(player["username"] or "").lstrip("@").casefold()
+        display = str(player["display_name"] or "").casefold()
+        if target_cf == username or target_cf == display:
+            return player
+        if target.isdigit() and int(player["user_id"]) == int(target):
+            return player
+    return None
+
+
+async def _spy_force_resume_after_kick(game_id: int, kicked_id: int):
+    """Repair the current turn after an admin removes a player mid-game."""
+    game = _spy_get_game(game_id)
+    if not game or game["status"] not in {"PLAYING", "DISCUSSION", "VOTING"}:
+        return
+
+    active = _spy_players(game_id, active_only=True)
+    if len(active) < SPY_MIN_PLAYERS:
+        await _spy_finish_message(game_id, "мирные игроки", "Игра остановлена: после кика осталось меньше 3 активных игроков.")
+        return
+
+    # If a player was voting, simply remove their vote. The remaining voters can continue.
+    if game["phase"] == "VOTING":
+        group_db_op(lambda conn: (
+            conn.execute("DELETE FROM spy_votes WHERE game_id=? AND voter_id=?", (int(game_id), int(kicked_id))),
+            conn.commit(),
+        ))
+        return
+
+    # Discussion can continue without the removed player; the recovery worker will handle its deadline.
+    if game["phase"] == "DISCUSSION":
+        return
+
+    # A kicked asker/target can leave the state pointing at a dead user. Start a clean turn
+    # from the first active player after the kicked player, preserving the existing round count.
+    asker_id = int(game["current_asker_id"] or 0)
+    target_id = int(game["current_target_id"] or 0)
+    if asker_id != kicked_id and target_id != kicked_id:
+        return
+
+    # Use the permanent turn order (including the kicked row) to find the
+    # first active player after the removed participant.
+    all_players = _spy_players(game_id, active_only=False)
+    next_asker = None
+    kicked_index = next((i for i, p in enumerate(all_players) if int(p["user_id"]) == int(kicked_id)), None)
+    if kicked_index is not None:
+        for step in range(1, len(all_players) + 1):
+            candidate = all_players[(kicked_index + step) % len(all_players)]
+            if int(candidate["active"] or 0):
+                next_asker = candidate
+                break
+    if not next_asker:
+        next_asker = active[0]
+    next_target = _spy_next_player(game_id, int(next_asker["user_id"]))
+    if not next_target:
+        return
+    _spy_set_state(
+        game_id,
+        phase="QUESTION",
+        current_asker_id=int(next_asker["user_id"]),
+        current_target_id=int(next_target["user_id"]),
+        expires_at=(datetime.now(timezone.utc) + timedelta(seconds=SPY_ROUND_SECONDS)).isoformat(),
+    )
+    await _spy_prepare_turn_dm(game_id, int(next_asker["user_id"]))
+
+
+@dp.message(Command("spy_kick"))
+async def spy_kick_cmd(message: Message):
+    if not await _spy_command_admin_ok(message):
+        return
+    game = _spy_open_game(message.chat.id)
+    if not game:
+        await message.reply("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nСейчас нет активной игры.")
+        return
+
+    raw = _spy_command_arg(message)
+    if not raw and message.reply_to_message and message.reply_to_message.from_user:
+        target_id = int(message.reply_to_message.from_user.id)
+        target = _spy_player(game["id"], target_id)
+    else:
+        target = _spy_find_player_for_command(game["id"], raw)
+
+    if not target or not int(target["active"] or 0):
+        await message.reply("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nНе удалось найти активного участника. Используй /spy_kick @username или ответь этой командой на сообщение участника.")
+        return
+    if int(target["user_id"]) == int(message.from_user.id):
+        await message.reply("Себя кикнуть этой командой нельзя.")
+        return
+
+    game_id = int(game["id"])
+    target_id = int(target["user_id"])
+    group_db_op(lambda conn: (
+        conn.execute("UPDATE spy_players SET active=0 WHERE game_id=? AND user_id=?", (game_id, target_id)),
+        conn.execute("DELETE FROM spy_votes WHERE game_id=? AND voter_id=?", (game_id, target_id)),
+        conn.commit(),
+    ))
+    with suppress(Exception):
+        await bot.send_message(message.chat.id, f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n🚫 {_spy_display(target)} исключён администратором из игры.")
+    await _spy_force_resume_after_kick(game_id, target_id)
+    await message.reply(f"Участник {_spy_display(target)} исключён. Состояние игры восстановлено.")
+
+
+@dp.message(Command("spy_end"))
+async def spy_end_cmd(message: Message):
+    if not await _spy_command_admin_ok(message):
+        return
+    game = _spy_open_game(message.chat.id)
+    if not game:
+        await message.reply("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nСейчас нет активной игры.")
+        return
+    await _spy_finish_message(
+        int(game["id"]),
+        "администратор",
+        f"Игра принудительно завершена администратором { _spy_display(_spy_player(game['id'], message.from_user.id)) }.",
+    )
+    await message.reply("Игра завершена. Все таймеры и активные этапы закрыты.")
 
 
 @dp.message(Command("spy"))
