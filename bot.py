@@ -6659,391 +6659,210 @@ SPY_DISCUSSION_SECONDS = 120
 SPY_FINAL_VOTE_SECONDS = 120
 SPY_FINAL_GUESS_SECONDS = 60
 SPY_MAX_VOTE_ROUNDS = 6
+SPY_INITIAL_QUESTION_ROUNDS = 2
+SPY_MAX_HINTS = 2
+SPY_GAME_LOCKS = {}
+
+
+def _spy_game_lock(game_id):
+    return SPY_GAME_LOCKS.setdefault(int(game_id), asyncio.Lock())
 
 # The spy game is intentionally self-contained.  It uses only the shared
 # database helpers and Bot instance; it does not alter roles, anonymous
 # feedback, game polls, MafiaAzBot, or any other subsystem.
-SPY_MAX_HINTS = 3
+
 
 # Каталог локаций Spyfall. В игре игроки не получают никаких профессий/ролей:
 # мирные знают только локацию, шпион — только то, что он шпион.
-# Для каждой локации есть три подсказки: от общей к более конкретной.
+# Для каждой локации есть две подсказки: сначала широкая, затем немного более конкретная.
 # aliases используются только для проверки догадки шпиона и не показываются игрокам.
 SPY_LOCATIONS = {
     "Аэропорт": {
-        "hints": [
-            "Здесь люди часто сверяются со временем и ждут своего отправления.",
-            "Здесь проверяют документы и вещи перед дальнейшей поездкой.",
-            "Отсюда можно улететь в другой город или страну.",
-        ],
+        "hints": ['Это место связано с поездками на большое расстояние.', 'Люди здесь часто ждут, проверяют время и перемещаются между зонами.'],
         "aliases": ["аэропорт", "аэропорте", "аэропорту", "airport"],
     },
     "Банк": {
-        "hints": [
-            "Здесь особенно важны деньги, документы и безопасность.",
-            "Люди приходят сюда для финансовых операций и консультаций.",
-            "Здесь есть места, где принимают и выдают деньги.",
-        ],
+        "hints": ['Это место связано с деньгами и официальными делами.', 'Посетители обычно приходят сюда по конкретному вопросу и ненадолго.'],
         "aliases": ["банк", "банке", "банку", "bank"],
     },
     "Больница": {
-        "hints": [
-            "Сюда приходят, когда нужна помощь специалиста.",
-            "Здесь могут проводить обследования и процедуры.",
-            "Здесь работают врачи и медицинский персонал.",
-        ],
+        "hints": ['Это место связано с помощью и заботой о здоровье.', 'Здесь люди чаще ждут, проходят процедуры или разговаривают со специалистами.'],
         "aliases": ["больница", "больнице", "больницу", "hospital"],
     },
     "Ресторан": {
-        "hints": [
-            "Сюда обычно приходят не только поговорить, но и что-то заказать.",
-            "Здесь важны меню, кухня и обслуживание.",
-            "Здесь один человек готовит, а другой ждёт свой заказ.",
-        ],
+        "hints": ['Это место связано с едой вне дома.', 'Посетители обычно проводят здесь некоторое время ради заказа и общения.'],
         "aliases": ["ресторан", "ресторане", "ресторану", "restaurant"],
     },
     "Казино": {
-        "hints": [
-            "Здесь люди готовы рисковать ради возможного выигрыша.",
-            "Здесь многое зависит от правил конкретной игры и удачи.",
-            "Здесь можно увидеть игровые столы и крупье.",
-        ],
+        "hints": ['Это место связано с развлечением, риском и удачей.', 'Люди приходят сюда ради игр, где результат заранее неизвестен.'],
         "aliases": ["казино", "казино", "casino"],
     },
     "Пляж": {
-        "hints": [
-            "Здесь большое значение имеют погода и свободное время.",
-            "Сюда часто приходят отдыхать, плавать или загорать.",
-            "Рядом обычно находится вода и берег.",
-        ],
+        "hints": ['Это место связано с отдыхом на открытом воздухе.', 'Погода здесь заметно влияет на то, чем люди могут заниматься.'],
         "aliases": ["пляж", "пляже", "пляжу", "beach"],
     },
     "Школа": {
-        "hints": [
-            "Здесь многое происходит по расписанию.",
-            "Здесь бывают уроки, перемены и задания.",
-            "Сюда регулярно приходят учиться дети и подростки.",
-        ],
+        "hints": ['Это место связано с обучением в установленном распорядке.', 'Здесь люди регулярно приходят на занятия и выполняют задания.'],
         "aliases": ["школа", "школе", "школу", "school"],
     },
     "Театр": {
-        "hints": [
-            "Перед началом здесь часто ждут определённого сигнала.",
-            "Здесь люди наблюдают за заранее подготовленным представлением.",
-            "Главное место действия здесь — сцена.",
-        ],
+        "hints": ['Это место связано с живым развлечением для зрителей.', 'Посетители приходят к определённому времени и наблюдают за действием.'],
         "aliases": ["театр", "театре", "театру", "theater", "theatre"],
     },
     "Космическая станция": {
-        "hints": [
-            "Обычный городской транспорт сюда не ходит.",
-            "Здесь особенно важны связь, техника и запас воздуха.",
-            "Это место находится за пределами привычной земной среды.",
-        ],
+        "hints": ['Это место находится далеко от привычной городской среды.', 'Здесь особенно важны техника, связь и строгие правила.'],
         "aliases": ["космическая станция", "космической станции", "космическую станцию", "космостанция", "космостанции", "space station"],
     },
     "Круизный лайнер": {
-        "hints": [
-            "Здесь люди могут одновременно путешествовать и отдыхать.",
-            "Здесь есть каюты, места для еды и развлечений.",
-            "Само место постоянно перемещается по воде.",
-        ],
+        "hints": ['Это место сочетает путешествие и отдых.', 'Люди могут жить, есть и развлекаться, продолжая перемещаться.'],
         "aliases": ["круизный лайнер", "круизном лайнере", "лайнер", "cruise ship"],
     },
     "Железнодорожный вокзал": {
-        "hints": [
-            "Здесь люди часто смотрят на расписание и время отправления.",
-            "Здесь встречают и провожают людей с багажом.",
-            "Главный транспорт отсюда отправляется по рельсам.",
-        ],
+        "hints": ['Это место связано с междугородними поездками.', 'Здесь часто сверяются с расписанием и ждут отправления или встречи.'],
         "aliases": ["железнодорожный вокзал", "жд вокзал", "жд вокзале", "вокзал", "вокзале", "вокзалу", "train station"],
     },
     "Тюрьма": {
-        "hints": [
-            "Свободно уйти отсюда обычно нельзя.",
-            "Здесь особенно важны охрана, правила и контроль.",
-            "Здесь содержат людей, лишённых свободы.",
-        ],
+        "hints": ['Это место связано с контролем и ограниченной свободой.', 'Здесь особенно важны правила, охрана и постоянный порядок.'],
         "aliases": ["тюрьма", "тюрьме", "тюрьму", "тюрьмы", "prison"],
     },
     "Полицейский участок": {
-        "hints": [
-            "Здесь работают люди, связанные с поддержанием порядка.",
-            "Сюда могут приходить для заявлений, допросов или оформления документов.",
-            "Здесь работают сотрудники полиции.",
-        ],
+        "hints": ['Это место связано с законом и поддержанием порядка.', 'Люди приходят сюда по официальным вопросам и обращениям.'],
         "aliases": ["полицейский участок", "полиция", "полицейском участке", "участок полиции", "police station"],
     },
     "Пожарная станция": {
-        "hints": [
-            "Здесь техника должна быть готова к очень быстрому выезду.",
-            "Здесь дежурят люди, которые реагируют на чрезвычайные ситуации.",
-            "Отсюда выезжают пожарные машины.",
-        ],
+        "hints": ['Это место связано с экстренной помощью.', 'Здесь всё организовано так, чтобы быстро отправиться на вызов.'],
         "aliases": ["пожарная станция", "пожарная часть", "пожарной части", "пожарка", "fire station"],
     },
     "Супермаркет": {
-        "hints": [
-            "Здесь люди обычно ходят между рядами и выбирают товары.",
-            "Здесь есть ценники, корзины или тележки.",
-            "В конце покупки обычно нужно оплатить выбранные товары.",
-        ],
+        "hints": ['Это место связано с покупками повседневных вещей.', 'Посетители сами выбирают нужное и затем рассчитываются за покупки.'],
         "aliases": ["супермаркет", "супермаркете", "магазин", "магазине", "supermarket", "grocery store"],
     },
     "Библиотека": {
-        "hints": [
-            "Здесь обычно стараются не шуметь.",
-            "Здесь можно искать нужную информацию среди большого количества материалов.",
-            "Главное, что здесь обычно берут, — книги.",
-        ],
+        "hints": ['Это место связано с чтением и поиском информации.', 'Здесь обычно спокойно, а посетители приходят за материалами или знаниями.'],
         "aliases": ["библиотека", "библиотеке", "библиотеку", "library"],
     },
     "Университет": {
-        "hints": [
-            "Здесь люди учатся не первый год после школы.",
-            "Здесь бывают лекции, семинары и экзамены.",
-            "Сюда приходят получать высшее образование.",
-        ],
+        "hints": ['Это место связано с высшим образованием.', 'Люди здесь проводят много времени на занятиях, обсуждениях и подготовке.'],
         "aliases": ["университет", "университете", "университету", "вуз", "вузе", "university"],
     },
     "Музей": {
-        "hints": [
-            "Здесь посетители обычно рассматривают то, что нельзя просто забрать с собой.",
-            "Здесь важны экспозиции и информация о них.",
-            "Здесь хранят и показывают исторические или культурные объекты.",
-        ],
+        "hints": ['Это место связано с культурой и наблюдением за экспозициями.', 'Посетители обычно двигаются по залам и рассматривают то, что нельзя просто взять.'],
         "aliases": ["музей", "музее", "музею", "museum"],
     },
     "Кинотеатр": {
-        "hints": [
-            "Здесь люди собираются в определённое время ради одного сеанса.",
-            "Перед началом обычно становится темнее.",
-            "Здесь смотрят фильм на большом экране.",
-        ],
+        "hints": ['Это место связано с просмотром развлечения в определённое время.', 'Перед началом внимание всех постепенно переключается на один источник.'],
         "aliases": ["кинотеатр", "кинотеатре", "кино", "cinema", "movie theater"],
     },
     "Торговый центр": {
-        "hints": [
-            "Здесь под одной крышей может находиться множество разных мест.",
-            "Здесь люди могут одновременно покупать вещи, есть и развлекаться.",
-            "Здесь обычно много магазинов на нескольких этажах.",
-        ],
+        "hints": ['Это место объединяет много разных занятий под одной крышей.', 'Посетители могут менять цель прямо по ходу визита.'],
         "aliases": ["торговый центр", "тц", "торговом центре", "торгцентре", "mall"],
     },
     "Фитнес-клуб": {
-        "hints": [
-            "Сюда приходят заниматься физической активностью.",
-            "Здесь можно увидеть тренажёры и спортивный инвентарь.",
-            "Здесь люди тренируются под музыку или с тренером.",
-        ],
+        "hints": ['Это место связано с регулярной физической активностью.', 'Люди приходят сюда поработать над формой и провести время с пользой.'],
         "aliases": ["фитнес клуб", "фитнес-клуб", "спортзал", "спортзале", "gym", "fitness club"],
     },
     "Стадион": {
-        "hints": [
-            "Здесь одновременно может находиться очень много зрителей.",
-            "Люди приходят сюда смотреть соревнования или выступления.",
-            "В центре обычно находится большое спортивное поле или площадка.",
-        ],
+        "hints": ['Это место связано с массовыми событиями и соревнованиями.', 'Здесь роли зрителей и участников обычно хорошо разделены.'],
         "aliases": ["стадион", "стадионе", "стадиону", "stadium"],
     },
     "Аквапарк": {
-        "hints": [
-            "Здесь вода является частью главных развлечений.",
-            "Здесь люди могут кататься с горок и плавать.",
-            "Здесь есть водные аттракционы и бассейны.",
-        ],
+        "hints": ['Это место связано с активным отдыхом.', 'В центре впечатлений здесь находится вода и несколько разных способов провести время.'],
         "aliases": ["аквапарк", "аквапарке", "аквапаркe", "water park"],
     },
     "Зоопарк": {
-        "hints": [
-            "Здесь посетители приходят смотреть на живых существ.",
-            "Здесь животных размещают в специально оборудованных пространствах.",
-            "Здесь можно увидеть животных из разных частей мира.",
-        ],
+        "hints": ['Это место связано с наблюдением за живыми существами.', 'Посетители перемещаются между разными зонами и задерживаются у интересных объектов.'],
         "aliases": ["зоопарк", "зоопарке", "зоопарку", "zoo"],
     },
     "Парк аттракционов": {
-        "hints": [
-            "Здесь люди приходят за развлечениями и сильными эмоциями.",
-            "Здесь можно провести целый день, переходя от одного аттракциона к другому.",
-            "Здесь есть карусели, горки и другие аттракционы.",
-        ],
+        "hints": ['Это место связано с развлечениями и сильными впечатлениями.', 'Люди переходят от одной активности к другой и могут провести здесь много часов.'],
         "aliases": ["парк аттракционов", "парк развлечений", "аттракционы", "amusement park", "theme park"],
     },
     "Отель": {
-        "hints": [
-            "Здесь люди могут остановиться на несколько дней.",
-            "Здесь важны бронирование, заселение и обслуживание.",
-            "Здесь гостям предоставляют отдельные номера для проживания.",
-        ],
+        "hints": ['Это место связано с временным проживанием.', 'Гости приходят сюда не только переночевать, но и получить обслуживание.'],
         "aliases": ["отель", "отеле", "отелю", "гостиница", "гостинице", "hotel"],
     },
     "Кемпинг": {
-        "hints": [
-            "Здесь люди временно живут ближе к природе.",
-            "Здесь пригодятся палатки, фонари и вещи для самостоятельного быта.",
-            "Здесь можно ночевать в палатке под открытым небом.",
-        ],
+        "hints": ['Это место связано с отдыхом ближе к природе.', 'Здесь многое зависит от погоды, самостоятельности и подготовки.'],
         "aliases": ["кемпинг", "кемпинге", "кемпингу", "camping"],
     },
     "Порт": {
-        "hints": [
-            "Здесь важны грузы, маршруты и расписание.",
-            "Здесь люди могут ждать прибытия или отправления транспорта.",
-            "Главный транспорт здесь связан с водой.",
-        ],
+        "hints": ['Это место связано с перевозками и маршрутами по воде.', 'Здесь важно ждать прибытия или отправления и следить за движением.'],
         "aliases": ["порт", "порту", "порту", "порте", "harbor", "port"],
     },
     "Метро": {
-        "hints": [
-            "Здесь люди часто спускаются под землю, чтобы быстрее добраться до нужного места.",
-            "Здесь важны линии, станции и пересадки.",
-            "По тоннелям здесь ходят поезда городского транспорта.",
-        ],
+        "hints": ['Это место связано с быстрым перемещением по городу.', 'Люди здесь ориентируются по линиям, станциям и пересадкам.'],
         "aliases": ["метро", "метро", "станция метро", "метрополитен", "subway"],
     },
     "Автосервис": {
-        "hints": [
-            "Сюда приезжают, когда с транспортом что-то не так.",
-            "Здесь работают с инструментами и деталями.",
-            "Здесь ремонтируют и обслуживают автомобили.",
-        ],
+        "hints": ['Это место связано с обслуживанием транспорта.', 'Посетитель обычно приходит сюда из-за конкретной технической проблемы или работы.'],
         "aliases": ["автосервис", "автосервисе", "сто", "сервис", "car service", "auto repair"],
     },
     "Строительная площадка": {
-        "hints": [
-            "Здесь всё может выглядеть временным и незавершённым.",
-            "Здесь нужны каски, техника и строительные материалы.",
-            "Здесь возводят или ремонтируют здания.",
-        ],
+        "hints": ['Это место связано с созданием или изменением зданий.', 'Здесь много временных решений, техники и задач, которые постоянно меняются.'],
         "aliases": ["строительная площадка", "стройка", "стройке", "строительстве", "construction site"],
     },
     "Ферма": {
-        "hints": [
-            "Здесь день часто начинается раньше, чем в городе.",
-            "Здесь важны земля, хозяйство и ежедневный уход.",
-            "Здесь выращивают растения или содержат сельскохозяйственных животных.",
-        ],
+        "hints": ['Это место связано с сельским хозяйством и ежедневным уходом.', 'Ритм дня здесь заметно зависит от природы и постоянной работы.'],
         "aliases": ["ферма", "ферме", "ферму", "farm"],
     },
     "Лаборатория": {
-        "hints": [
-            "Здесь важны точность, чистота и аккуратность.",
-            "Здесь проводят эксперименты и исследуют образцы.",
-            "Здесь работают с лабораторным оборудованием и пробами.",
-        ],
+        "hints": ['Это место связано с исследованиями и точностью.', 'Здесь многое делают по процедуре и внимательно следят за результатом.'],
         "aliases": ["лаборатория", "лаборатории", "лабораторию", "лаборатории", "laboratory", "lab"],
     },
     "Телестудия": {
-        "hints": [
-            "Здесь многое зависит от света, звука и времени.",
-            "Здесь люди работают перед камерами и микрофонами.",
-            "Здесь записывают или ведут телевизионные программы.",
-        ],
+        "hints": ['Это место связано с созданием медиаконтента.', 'Здесь многое зависит от времени, света, звука и подготовки людей.'],
         "aliases": ["телестудия", "телестудии", "телестудию", "студия", "tv studio"],
     },
     "Радиостанция": {
-        "hints": [
-            "Здесь особенно важны голос, звук и точное время.",
-            "Здесь ведущие работают с микрофонами и эфиром.",
-            "Отсюда передают радиопрограммы слушателям.",
-        ],
+        "hints": ['Это место связано с эфиром и передачей информации голосом.', 'Здесь особенно важны точность по времени и работа со звуком.'],
         "aliases": ["радиостанция", "радиостанции", "радиостанцию", "радио", "radio station"],
     },
     "Суд": {
-        "hints": [
-            "Здесь решения принимаются по установленной процедуре.",
-            "Здесь могут выступать стороны дела и свидетели.",
-            "Здесь рассматривают дела и выносят судебные решения.",
-        ],
+        "hints": ['Это место связано с официальным рассмотрением споров и решений.', 'Здесь важны порядок выступлений, документы и установленная процедура.'],
         "aliases": ["суд", "суде", "суду", "court"],
     },
     "Посольство": {
-        "hints": [
-            "Здесь особенно важны документы и официальные процедуры.",
-            "Сюда могут обращаться граждане своей страны за консульской помощью.",
-            "Это официальное представительство государства в другой стране.",
-        ],
+        "hints": ['Это место связано с официальными делами государства.', 'Посетители обычно приходят сюда по документальным или консульским вопросам.'],
         "aliases": ["посольство", "посольстве", "посольству", "embassy"],
     },
     "Кухня": {
-        "hints": [
-            "Здесь важны порядок, продукты и время.",
-            "Здесь постоянно что-то режут, смешивают или нагревают.",
-            "Здесь готовят еду.",
-        ],
+        "hints": ['Это место связано с приготовлением еды.', 'Здесь постоянно меняются задачи, но важны порядок, время и последовательность действий.'],
         "aliases": ["кухня", "кухне", "кухню", "kitchen"],
     },
     "Ночной клуб": {
-        "hints": [
-            "Здесь люди чаще приходят вечером или ночью.",
-            "Здесь важны музыка, свет и атмосфера.",
-            "Здесь танцуют под громкую музыку.",
-        ],
+        "hints": ['Это место связано с вечерними развлечениями.', 'Здесь люди приходят прежде всего за атмосферой, музыкой и общением.'],
         "aliases": ["ночной клуб", "клуб", "клубе", "ночном клубе", "nightclub", "night club"],
     },
     "Концертный зал": {
-        "hints": [
-            "Здесь люди собираются ради выступления.",
-            "Здесь важны сцена, звук и места для зрителей.",
-            "Здесь перед публикой выступают музыканты или исполнители.",
-        ],
+        "hints": ['Это место связано с живым музыкальным или сценическим событием.', 'Посетители собираются в определённое время и долго остаются зрителями.'],
         "aliases": ["концертный зал", "концертном зале", "концерт", "concert hall"],
     },
     "Психологический кабинет": {
-        "hints": [
-            "Здесь человек может долго разговаривать один на один со специалистом.",
-            "Здесь важны доверие, разговор и личные переживания.",
-            "Здесь психолог помогает человеку разобраться в его состоянии.",
-        ],
+        "hints": ['Это место связано с личным разговором и помощью специалиста.', 'Здесь важнее всего спокойная обстановка, доверие и беседа.'],
         "aliases": ["психологический кабинет", "кабинет психолога", "психолог", "psychologist office"],
     },
     "Салон красоты": {
-        "hints": [
-            "Здесь люди приходят изменить или привести в порядок свою внешность.",
-            "Здесь работают с волосами, кожей или ногтями.",
-            "Здесь могут стричь, красить волосы или делать маникюр.",
-        ],
+        "hints": ['Это место связано с уходом за внешностью.', 'Посетители обычно приходят ради конкретной процедуры и проводят здесь некоторое время.'],
         "aliases": ["салон красоты", "салоне красоты", "парикмахерская", "парикмахерской", "beauty salon"],
     },
     "Почта": {
-        "hints": [
-            "Здесь люди могут отправлять и получать вещи, не встречаясь лично.",
-            "Здесь важны адреса, посылки и отправления.",
-            "Здесь принимают и выдают письма и посылки.",
-        ],
+        "hints": ['Это место связано с отправкой и получением вещей или сообщений.', 'Здесь особенно важны адреса, очередность и оформление.'],
         "aliases": ["почта", "почте", "почту", "почтовое отделение", "post office"],
     },
     "Бассейн": {
-        "hints": [
-            "Здесь люди занимаются в воде независимо от погоды на улице.",
-            "Здесь важны дорожки, глубина и правила безопасности.",
-            "Здесь люди плавают в специально оборудованной чаше.",
-        ],
+        "hints": ['Это место связано с физической активностью и водой.', 'Здесь важны безопасность, правила и ограниченное пространство для занятий.'],
         "aliases": ["бассейн", "бассейне", "бассейну", "swimming pool", "pool"],
     },
     "Офис": {
-        "hints": [
-            "Здесь люди проводят много времени за рабочими задачами.",
-            "Здесь важны документы, компьютеры и встречи.",
-            "Здесь обычно работают сотрудники компании.",
-        ],
+        "hints": ['Это место связано с рабочими задачами и общением сотрудников.', 'Здесь люди проводят много времени за компьютерами, документами или встречами.'],
         "aliases": ["офис", "офисе", "офису", "office"],
     },
     "Склад": {
-        "hints": [
-            "Здесь предметы могут находиться дольше, чем в магазине.",
-            "Здесь важны коробки, учёт и порядок размещения.",
-            "Здесь хранят большие запасы товаров.",
-        ],
+        "hints": ['Это место связано с хранением и перемещением запасов.', 'Здесь главное — порядок, учёт и понимание, где что находится.'],
         "aliases": ["склад", "складе", "складу", "warehouse"],
     },
     "Рынок": {
-        "hints": [
-            "Здесь продавцы и покупатели постоянно торгуются и выбирают товары.",
-            "Здесь можно увидеть множество разных прилавков.",
-            "Здесь товары продают прямо на торговых местах.",
-        ],
+        "hints": ['Это место связано с покупками и торговлей.', 'Здесь посетители переходят между разными продавцами и сравнивают варианты.'],
         "aliases": ["рынок", "рынке", "рынку", "market", "bazaar"],
     },
 }
@@ -7088,6 +6907,9 @@ def _spy_ensure_schema():
             "turn_count": "INTEGER NOT NULL DEFAULT 0",
             "round_target": "INTEGER NOT NULL DEFAULT 2",
             "vote_round": "INTEGER NOT NULL DEFAULT 0",
+            "cycle_start_turn": "INTEGER NOT NULL DEFAULT 0",
+            "cycle_expected_turns": "INTEGER NOT NULL DEFAULT 0",
+            "vote_session": "INTEGER NOT NULL DEFAULT 0",
         }
         for name, definition in wanted.items():
             if name not in game_cols:
@@ -7179,11 +7001,12 @@ def _spy_lobby_text(game_id):
     return "\n".join(lines)
 
 
-def _spy_group_controls(game_id):
-    # Voting is intentionally available only after the full question cycle.
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📜 Правила", callback_data=f"sp:rules:{int(game_id)}")],
-    ])
+def _spy_group_controls(game_id, discussion=False):
+    rows = []
+    if discussion:
+        rows.append([InlineKeyboardButton(text="⏭ Закончить обсуждение", callback_data=f"sp:skip_discussion:{int(game_id)}")])
+    rows.append([InlineKeyboardButton(text="📜 Правила", callback_data=f"sp:rules:{int(game_id)}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _spy_guess_keyboard(game_id):
@@ -7204,10 +7027,10 @@ def _spy_question_keyboard(game_id, asker_id):
     ]])
 
 
-def _spy_answer_keyboard(game_id):
+def _spy_answer_keyboard(game_id, turn_no):
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Да", callback_data=f"sp:answer:{int(game_id)}:1"),
-        InlineKeyboardButton(text="❌ Нет", callback_data=f"sp:answer:{int(game_id)}:0"),
+        InlineKeyboardButton(text="✅ Да", callback_data=f"sp:answer:{int(game_id)}:{int(turn_no)}:1"),
+        InlineKeyboardButton(text="❌ Нет", callback_data=f"sp:answer:{int(game_id)}:{int(turn_no)}:0"),
     ]])
 
 
@@ -7224,10 +7047,26 @@ def _spy_secret_keyboard(game_id, is_spy, hints_used=0):
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
-def _spy_vote_keyboard(game_id):
-    return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"🕵️ {_spy_display(p)}", callback_data=f"sp:vote:{int(game_id)}:{int(p['user_id'])}")
-    ] for p in _spy_players(game_id)])
+def _spy_vote_keyboard(game_id, vote_session=None):
+    game = _spy_get_game(game_id)
+    if not game:
+        return InlineKeyboardMarkup(inline_keyboard=[])
+    session = int(game["vote_session"] or 0) if vote_session is None else int(vote_session)
+    rows = []
+    counts = group_db_op(lambda conn: conn.execute(
+        "SELECT suspect_id, COUNT(*) AS c FROM spy_votes WHERE game_id=? GROUP BY suspect_id",
+        (int(game_id),),
+    ).fetchall())
+    count_map = {int(r["suspect_id"]): int(r["c"]) for r in counts}
+    for p in _spy_players(game_id):
+        c = count_map.get(int(p["user_id"]), 0)
+        mark = "●" if c else "○"
+        suffix = f" · {c}" if c else ""
+        rows.append([InlineKeyboardButton(
+            text=f"{mark} {_spy_display(p)}{suffix}",
+            callback_data=f"sp:vote:{int(game_id)}:{session}:{int(p['user_id'])}",
+        )])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _spy_record_turn(game_id, turn_no, round_no, asker_id, target_id, question, answer=""):
@@ -7277,9 +7116,14 @@ async def _spy_send_round_summary(game_id, round_no):
     text = _spy_round_summary_text(game_id, round_no)
     if not text:
         return
-    with suppress(Exception):
+    sent_ok = False
+    try:
         await bot.send_message(int(game["chat_id"]), text)
-    _spy_set_state(game_id, summary_sent_round=int(round_no))
+        sent_ok = True
+    except Exception:
+        logger.exception("Spy round summary delivery failed | game=%s round=%s", game_id, round_no)
+    if sent_ok:
+        _spy_set_state(game_id, summary_sent_round=int(round_no))
 
 
 def _spy_set_state(game_id, **fields):
@@ -7288,7 +7132,8 @@ def _spy_set_state(game_id, **fields):
     allowed = {
         "status", "phase", "current_asker_id", "current_target_id", "expires_at",
         "accusation_suspect_id", "updated_at", "turn_count", "round_target",
-        "vote_round", "spy_user_id",
+        "vote_round", "spy_user_id", "cycle_start_turn", "cycle_expected_turns",
+        "vote_session",
     }
     clean = {k: v for k, v in fields.items() if k in allowed}
     clean["updated_at"] = now()
@@ -7345,10 +7190,16 @@ def _spy_join(game_id, user):
 
 
 def _spy_leave(game_id, user_id):
-    return group_db_op(lambda conn: (
-        conn.execute("DELETE FROM spy_players WHERE game_id=? AND user_id=?", (int(game_id), int(user_id))).rowcount > 0,
-        conn.commit(),
-    )[0])
+    def op(conn):
+        game = conn.execute("SELECT created_by,status FROM spy_games WHERE id=?", (int(game_id),)).fetchone()
+        removed = conn.execute("DELETE FROM spy_players WHERE game_id=? AND user_id=?", (int(game_id), int(user_id))).rowcount > 0
+        if removed and game and int(game["created_by"] or 0) == int(user_id):
+            successor = conn.execute("SELECT user_id FROM spy_players WHERE game_id=? ORDER BY turn_order, joined_at LIMIT 1", (int(game_id),)).fetchone()
+            if successor:
+                conn.execute("UPDATE spy_games SET created_by=?,updated_at=? WHERE id=?", (int(successor["user_id"]), now(), int(game_id)))
+        conn.commit()
+        return removed
+    return group_db_op(op)
 
 
 def _spy_mark_dm_ready(game_id, user_id):
@@ -7389,8 +7240,8 @@ def _spy_start_db(game_id, location, spy_ids, assignments, order):
                 (int(bool(is_spy)), idx, int(game_id), int(uid)),
             )
         conn.execute(
-            "UPDATE spy_games SET status='STARTING',phase='QUESTION',started_at=?,expires_at=?,location=?,spy_user_id=?,current_asker_id=?,current_target_id=?,turn_count=0,round_target=?,vote_round=0,accusation_suspect_id=NULL,updated_at=? WHERE id=?",
-            (now(), deadline, location, primary_spy, first, second, target_rounds, now(), int(game_id)),
+            "UPDATE spy_games SET status='STARTING',phase='QUESTION',started_at=?,expires_at=?,location=?,spy_user_id=?,current_asker_id=?,current_target_id=?,turn_count=0,round_target=?,vote_round=0,cycle_start_turn=0,cycle_expected_turns=?,vote_session=0,accusation_suspect_id=NULL,updated_at=? WHERE id=?",
+            (now(), deadline, location, primary_spy, first, second, len(assignments), now(), int(game_id)),
         )
         conn.commit()
     group_db_op(op)
@@ -7404,7 +7255,7 @@ async def _spy_send_card(game_id, user_id, location, role_name, is_spy):
             "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
             "🕵️ Ты — ШПИОН.\n\n"
             "Ты не знаешь локацию. Твоя задача — вычислить её по вопросам и ответам, не выдать себя и при необходимости попытаться угадать её.\n\n"
-            "У тебя есть до двух подсказок. Хорошей игры!"
+            "У тебя две подсказки: первая после полного круга вопросов, вторая — после следующего. Они дают направление, а не название места. Хорошей игры!"
         )
     else:
         text = (
@@ -7524,28 +7375,31 @@ async def _spy_prepare_turn_dm(game_id, asker_id):
     target = _spy_player(game_id, int(game["current_target_id"] or 0))
     if not asker or not target:
         return
+    turn_no = int(game["turn_count"] or 0) + 1
     await bot.send_message(
         int(asker_id),
         "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
         f"Твой ход.\nТы задаёшь вопрос: {_spy_display(target)}\n\n"
-        "Сформулируй вопрос, на который можно ответить только «Да» или «Нет».",
+        "Сформулируй вопрос на конце со знаком «?».\n"
+        "На него должно быть возможно ответить только «Да» или «Нет».",
         reply_markup=_spy_question_keyboard(game_id, asker_id),
     )
     with suppress(Exception):
-        await bot.send_message(
-            int(game["chat_id"]),
-            "𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ХОД\n\n"
-            f"Сейчас ходит {_spy_display(asker)}.\n"
-            f"Он задаёт вопрос {_spy_display(target)}.",
+        await bot.edit_message_text(
+            chat_id=int(game["chat_id"]),
+            message_id=int(game["lobby_message_id"]),
+            text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ХОД\n\n"
+                  f"Сейчас ходит {_spy_display(asker)}.\n"
+                  f"Вопрос: {_spy_display(target)}\n\n"
+                  f"Вопрос №{turn_no}.") if game["lobby_message_id"] else "",
             reply_markup=_spy_group_controls(game_id),
-        )
+        ) if game["lobby_message_id"] else None
 
 
 async def _spy_resume_question_cycle(game_id):
     active = _spy_players(game_id)
     if len(active) < 2:
         return False
-    # Preserve the original random order after eliminations.
     active_sorted = sorted(active, key=lambda p: int(p["turn_order"] or 0))
     current = _spy_get_game(game_id)
     asker_id = int(current["current_asker_id"] or 0) if current else 0
@@ -7558,12 +7412,15 @@ async def _spy_resume_question_cycle(game_id):
             break
     if not target:
         return False
+    turn_count = int(current["turn_count"] or 0) if current else 0
     _spy_set_state(
         game_id,
         status="PLAYING",
         phase="QUESTION",
         current_asker_id=asker_id,
         current_target_id=int(target["user_id"]),
+        cycle_start_turn=turn_count,
+        cycle_expected_turns=len(active_sorted),
         expires_at=(datetime.now(timezone.utc) + timedelta(seconds=SPY_ROUND_SECONDS)).isoformat(),
     )
     await _spy_prepare_turn_dm(game_id, asker_id)
@@ -7573,7 +7430,7 @@ async def _spy_resume_question_cycle(game_id):
 async def _spy_start_discussion(game_id):
     game = _spy_get_game(game_id)
     if not game or game["status"] != "PLAYING":
-        return
+        return False
     _spy_set_state(
         game_id,
         status="DISCUSSION",
@@ -7583,19 +7440,49 @@ async def _spy_start_discussion(game_id):
         expires_at=(datetime.now(timezone.utc) + timedelta(seconds=SPY_DISCUSSION_SECONDS)).isoformat(),
     )
     with suppress(Exception):
-        await bot.send_message(
-            int(game["chat_id"]),
-            "𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ОБСУЖДЕНИЕ\n\n"
-            "Вопросы закончены. У вас 2 минуты на обсуждение.\n\n"
-            "После обсуждения бот автоматически запустит итоговое голосование.",
-            reply_markup=_spy_group_controls(game_id),
-        )
+        control_id = game["lobby_message_id"]
+        if control_id:
+            await bot.edit_message_text(
+                chat_id=int(game["chat_id"]),
+                message_id=int(control_id),
+                text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ОБСУЖДЕНИЕ\n\n"
+                      "Вопросы закончены. У вас 2 минуты на обсуждение.\n\n"
+                      "Можно дождаться таймера или сразу перейти к голосованию."),
+                reply_markup=_spy_group_controls(game_id, discussion=True),
+            )
+    return True
+
+
+def _spy_vote_snapshot(game_id):
+    return group_db_op(lambda conn: conn.execute(
+        "SELECT suspect_id, COUNT(*) AS c FROM spy_votes WHERE game_id=? GROUP BY suspect_id ORDER BY c DESC, suspect_id",
+        (int(game_id),),
+    ).fetchall())
+
+
+def _spy_vote_result(game_id):
+    rows = _spy_vote_snapshot(game_id)
+    active_count = len(_spy_players(game_id))
+    total_votes = sum(int(r["c"]) for r in rows)
+    if not rows:
+        return {"winner": None, "tie": False, "majority": False, "total": 0, "active": active_count}
+    top = int(rows[0]["c"])
+    leaders = [int(r["suspect_id"]) for r in rows if int(r["c"]) == top]
+    majority = top > active_count / 2
+    return {
+        "winner": leaders[0] if majority and len(leaders) == 1 else None,
+        "tie": len(leaders) > 1,
+        "majority": majority and len(leaders) == 1,
+        "total": total_votes,
+        "active": active_count,
+    }
 
 
 async def _spy_start_vote(game_id):
     game = _spy_get_game(game_id)
     if not game or game["status"] not in {"PLAYING", "DISCUSSION"}:
         return False
+    session = int(game["vote_session"] or 0) + 1
     _spy_set_state(
         game_id,
         status="VOTING",
@@ -7604,18 +7491,26 @@ async def _spy_start_vote(game_id):
         current_target_id=None,
         expires_at=(datetime.now(timezone.utc) + timedelta(seconds=SPY_FINAL_VOTE_SECONDS)).isoformat(),
         accusation_suspect_id=None,
+        vote_session=session,
     )
     group_db_op(lambda conn: (
         conn.execute("DELETE FROM spy_votes WHERE game_id=?", (int(game_id),)),
         conn.commit(),
     ))
+    text = (
+        "𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ГОЛОСОВАНИЕ\n\n"
+        f"Раунд {int(game["vote_round"] or 0) + 1}/{SPY_MAX_VOTE_ROUNDS}.\n"
+        "Выберите подозреваемого. Голос можно изменить до завершения голосования.\n\n"
+        "○ — никто не голосовал\n● — есть голоса"
+    )
     with suppress(Exception):
-        await bot.send_message(
-            int(game["chat_id"]),
-            "𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ГОЛОСОВАНИЕ\n\n"
-            f"Выберите подозреваемого. Раунд {int(game['vote_round'] or 0) + 1}/{SPY_MAX_VOTE_ROUNDS}.",
-            reply_markup=_spy_vote_keyboard(game_id),
-        )
+        if game["lobby_message_id"]:
+            await bot.edit_message_text(
+                chat_id=int(game["chat_id"]),
+                message_id=int(game["lobby_message_id"]),
+                text=text,
+                reply_markup=_spy_vote_keyboard(game_id, session),
+            )
     return True
 
 
@@ -7646,35 +7541,44 @@ async def _spy_start_final_guess(game_id, reason="После шести раун
                 reply_markup=_spy_guess_keyboard(game_id),
             )
     with suppress(Exception):
-        await bot.send_message(
-            int(game["chat_id"]),
-            "𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ФИНАЛЬНАЯ ДОГАДКА\n\n"
-            "Оставшимся шпионам дано 60 секунд, чтобы назвать локацию.",
-        )
+        if game["lobby_message_id"]:
+            await bot.edit_message_text(
+                chat_id=int(game["chat_id"]),
+                message_id=int(game["lobby_message_id"]),
+                text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ФИНАЛЬНАЯ ДОГАДКА\n\n"
+                      "Оставшимся шпионам дано 60 секунд, чтобы назвать локацию."),
+                reply_markup=None,
+            )
 
 
-async def _spy_handle_vote_round_timeout(game_id):
+async def _spy_resolve_vote_session(game_id, vote_session):
     game = _spy_get_game(game_id)
-    if not game or game["status"] != "VOTING":
+    if not game or game["status"] != "VOTING" or game["phase"] != "VOTING" or int(game["vote_session"] or 0) != int(vote_session):
         return
-    active_count = len(_spy_players(game_id))
-    votes = group_db_op(lambda conn: conn.execute(
-        "SELECT suspect_id, COUNT(*) AS c FROM spy_votes WHERE game_id=? GROUP BY suspect_id ORDER BY c DESC, suspect_id",
-        (int(game_id),),
-    ).fetchall())
-    top = int(votes[0]["suspect_id"]) if votes else 0
-    top_count = int(votes[0]["c"]) if votes else 0
-    if top and top_count > active_count / 2:
-        await _spy_resolve_accusation(game_id, top)
+    result = _spy_vote_result(game_id)
+    if result["winner"] is not None:
+        await _spy_resolve_accusation(game_id, int(result["winner"]))
         return
     current_round = int(game["vote_round"] or 0) + 1
     _spy_set_state(game_id, vote_round=current_round)
     if current_round >= SPY_MAX_VOTE_ROUNDS:
         await _spy_start_final_guess(game_id)
-    else:
-        with suppress(Exception):
-            await bot.send_message(int(game["chat_id"]), "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nНедостаточно голосов для решения. Игра продолжается.")
-        await _spy_resume_question_cycle(game_id)
+        return
+    label = "Никто не набрал большинства." if not result["tie"] else "Получилась ничья — единого решения нет."
+    with suppress(Exception):
+        await bot.send_message(int(game["chat_id"]), f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n{label} Продолжаем игру.")
+    await _spy_resume_question_cycle(game_id)
+
+
+async def _spy_handle_vote_round_timeout(game_id, vote_session=None):
+    async with _spy_game_lock(game_id):
+        game = _spy_get_game(game_id)
+        if not game or game["status"] != "VOTING" or game["phase"] != "VOTING":
+            return
+        session = int(game["vote_session"] or 0) if vote_session is None else int(vote_session)
+        if int(game["vote_session"] or 0) != session:
+            return
+        await _spy_resolve_vote_session(game_id, session)
 
 
 async def _spy_resolve_accusation(game_id, suspect_id):
@@ -7694,12 +7598,15 @@ async def _spy_resolve_accusation(game_id, suspect_id):
             expires_at=(datetime.now(timezone.utc) + timedelta(seconds=SPY_FINAL_GUESS_SECONDS)).isoformat(),
         )
         with suppress(Exception):
-            await bot.send_message(
-                int(game["chat_id"]),
-                "𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ШПИОН РАСКРЫТ\n\n"
-                f"Подозреваемый: {_spy_display(suspect)}.\n"
-                "У него 60 секунд на последнюю попытку угадать локацию.",
-            )
+            if game["lobby_message_id"]:
+                await bot.edit_message_text(
+                    chat_id=int(game["chat_id"]),
+                    message_id=int(game["lobby_message_id"]),
+                    text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ШПИОН РАСКРЫТ\n\n"
+                          f"Подозреваемый: {_spy_display(suspect)}.\n"
+                          "У него 60 секунд на последнюю попытку угадать локацию."),
+                    reply_markup=None,
+                )
         with suppress(Exception):
             await bot.send_message(
                 int(suspect_id),
@@ -7739,6 +7646,18 @@ async def _spy_finish_message(game_id, winner, reason, location_override=None):
     spies = [p for p in players if int(p["is_spy"] or 0) == 1]
     spy_names = ", ".join(_spy_display(p) for p in spies) or "не определён"
     _spy_set_state(game_id, status="FINISHED", phase="FINISHED", current_asker_id=None, current_target_id=None, expires_at=None)
+    with suppress(Exception):
+        if game["lobby_message_id"]:
+            await bot.edit_message_text(
+                chat_id=int(game["chat_id"]),
+                message_id=int(game["lobby_message_id"]),
+                text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ИГРА ОКОНЧЕНА\n\n"
+                      f"Победитель: {winner}\n{reason}\n\n"
+                      f"Локация: {location}\nШпион(ы): {spy_names}"),
+                reply_markup=None,
+            )
+    with suppress(Exception):
+        await bot.unpin_chat_message(int(game["chat_id"]), int(game["lobby_message_id"])) if game["lobby_message_id"] else None
     with suppress(Exception):
         await bot.send_message(
             int(game["chat_id"]),
@@ -7812,7 +7731,7 @@ async def _spy_force_resume_after_kick(game_id: int, kicked_id: int):
     # If a player was voting, simply remove their vote. The remaining voters can continue.
     if game["phase"] == "VOTING":
         group_db_op(lambda conn: (
-            conn.execute("DELETE FROM spy_votes WHERE game_id=? AND voter_id=?", (int(game_id), int(kicked_id))),
+            conn.execute("DELETE FROM spy_votes WHERE game_id=? AND (voter_id=? OR suspect_id=?)", (int(game_id), int(kicked_id), int(kicked_id))),
             conn.commit(),
         ))
         return
@@ -8031,9 +7950,6 @@ async def _spy_launch_game_task(game_id: int, chat_id: int, lobby_message_id: in
                 )
             return
 
-        with suppress(Exception):
-            await bot.unpin_chat_message(chat_id, lobby_message_id)
-
         started = _spy_get_game(game_id)
         order_rows = _spy_players(game_id)
         order_text = "\n".join(f"{i}. {_spy_display(p)}" for i, p in enumerate(order_rows, 1))
@@ -8042,9 +7958,9 @@ async def _spy_launch_game_task(game_id: int, chat_id: int, lobby_message_id: in
                 chat_id=chat_id,
                 message_id=lobby_message_id,
                 text="𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
-                     "Раунд начался.\n\n"
+                     "Игра началась.\n\n"
                      "Очередность вопросов:\n" + order_text + "\n\n"
-                     "Новые участники больше не принимаются.",
+                     "Сообщение закреплено и будет показывать текущую фазу игры.",
                 reply_markup=_spy_group_controls(game_id),
             )
         if started and started["current_asker_id"]:
@@ -8173,168 +8089,248 @@ async def spy_callback(callback: CallbackQuery):
         asyncio.create_task(_spy_launch_game_task(game_id, int(callback.message.chat.id), int(callback.message.message_id)))
         return
 
+    if action == "skip_discussion":
+        if callback.message.chat.type not in {"group", "supergroup"}:
+            await callback.answer("Сейчас обсуждение не идёт.", show_alert=True)
+            return
+        async with _spy_game_lock(game_id):
+            current = _spy_get_game(game_id)
+            if not current or current["phase"] != "DISCUSSION":
+                await callback.answer("Сейчас обсуждение не идёт.", show_alert=True)
+                return
+            player = _spy_player(game_id, uid)
+            if not player or not int(player["active"] or 0):
+                await callback.answer("Ты не участник этой игры.", show_alert=True)
+                return
+            await _spy_start_vote(game_id)
+            await callback.answer("Переходим к голосованию.")
+        return
+
     if action == "ask":
-        if callback.message.chat.type != "private" or int(game["current_asker_id"] or 0) != uid or game["phase"] != "QUESTION":
+        if callback.message.chat.type != "private":
             await callback.answer("Сейчас не ваш ход.", show_alert=True)
             return
-        target = _spy_player(game_id, int(game["current_target_id"] or 0))
-        if not target:
-            await callback.answer("Цель не найдена.", show_alert=True)
-            return
-        _spy_set_state(game_id, phase="ASKING")
-        await callback.message.answer(
-            f"Напиши вопрос для {_spy_display(target)}.\n\n"
-            "Он должен быть связан с локацией и допускать ответ только «Да» или «Нет»."
-        )
-        await callback.answer("Жду вопрос.")
+        async with _spy_game_lock(game_id):
+            current = _spy_get_game(game_id)
+            if not current or int(current["current_asker_id"] or 0) != uid or current["phase"] != "QUESTION":
+                await callback.answer("Сейчас не ваш ход.", show_alert=True)
+                return
+            target = _spy_player(game_id, int(current["current_target_id"] or 0))
+            if not target:
+                await callback.answer("Цель не найдена.", show_alert=True)
+                return
+            _spy_set_state(game_id, phase="ASKING")
+            await callback.message.answer(
+                f"Напиши вопрос для {_spy_display(target)}.\n\n"
+                "Он должен быть связан с локацией и допускать ответ только «Да» или «Нет»."
+            )
+            await callback.answer("Жду вопрос.")
         return
 
     if action == "answer":
-        if callback.message.chat.type != "private" or game["phase"] != "ANSWERING" or int(game["current_target_id"] or 0) != uid:
+        if callback.message.chat.type != "private":
             await callback.answer("Сейчас не ваш ответ.", show_alert=True)
             return
-        value = len(parts) > 3 and parts[3] == "1"
-        target = _spy_player(game_id, uid)
-        next_target = _spy_next_player(game_id, uid)
-        if not target or not next_target:
-            await callback.answer("Не удалось определить следующий ход.", show_alert=True)
-            return
-        answer = "Да" if value else "Нет"
-        current_turn_no = int(game["turn_count"] or 0) + 1
-        _spy_complete_turn_answer(game_id, current_turn_no, answer)
-        with suppress(Exception):
-            await bot.send_message(int(game["chat_id"]), f"💬 {_spy_display(target)} → {answer}")
-        new_count = current_turn_no
-        with suppress(Exception):
-            await callback.message.edit_reply_markup(reply_markup=None)
-        _spy_set_state(
-            game_id,
-            phase="QUESTION",
-            current_asker_id=uid,
-            current_target_id=int(next_target["user_id"]),
-            turn_count=new_count,
-        )
-        current = _spy_get_game(game_id)
-        if current and new_count >= len(_spy_players(game_id)) * int(current["round_target"] or 2):
-            final_round = int(current["round_target"] or 2)
-            await _spy_send_round_summary(game_id, final_round)
-            await _spy_start_discussion(game_id)
-        else:
-            # If a round just ended, publish its compact transcript before starting the next one.
-            players_count = max(1, len(_spy_players(game_id)))
-            completed_round = new_count // players_count
-            if new_count % players_count == 0:
+        async with _spy_game_lock(game_id):
+            game = _spy_get_game(game_id)
+            if not game or game["phase"] != "ANSWERING" or int(game["current_target_id"] or 0) != uid:
+                await callback.answer("Сейчас не ваш ответ.", show_alert=True)
+                return
+            try:
+                callback_turn_no = int(parts[3])
+            except (ValueError, IndexError):
+                await callback.answer("Это устаревшая кнопка ответа.", show_alert=True)
+                return
+            expected_turn_no = int(game["turn_count"] or 0) + 1
+            if callback_turn_no != expected_turn_no:
+                await callback.answer("Это устаревшая кнопка ответа.", show_alert=True)
+                return
+            value = len(parts) > 4 and parts[4] == "1"
+            target = _spy_player(game_id, uid)
+            next_target = _spy_next_player(game_id, uid)
+            if not target or not next_target:
+                await callback.answer("Не удалось определить следующий ход.", show_alert=True)
+                return
+            answer = "Да" if value else "Нет"
+            _spy_complete_turn_answer(game_id, callback_turn_no, answer)
+            new_count = callback_turn_no
+            with suppress(Exception):
+                await bot.send_message(int(game["chat_id"]), f"💬 {_spy_display(target)} → {answer}")
+            with suppress(Exception):
+                await callback.message.edit_reply_markup(reply_markup=None)
+    
+            current = _spy_get_game(game_id)
+            cycle_start = int(current["cycle_start_turn"] or 0) if current else 0
+            expected = int(current["cycle_expected_turns"] or 0) if current else 0
+            _spy_set_state(
+                game_id,
+                phase="QUESTION",
+                current_asker_id=uid,
+                current_target_id=int(next_target["user_id"]),
+                turn_count=new_count,
+            )
+            current = _spy_get_game(game_id)
+            if current and expected > 0 and new_count - cycle_start >= expected:
+                players_count = max(1, len(_spy_players(game_id)))
+                completed_round = ((new_count - 1) // players_count) + 1
                 await _spy_send_round_summary(game_id, completed_round)
-            await _spy_prepare_turn_dm(game_id, uid)
-        await callback.answer("Ответ принят. Теперь твой ход.")
-        return
+                if int(current["vote_round"] or 0) == 0 and completed_round < SPY_INITIAL_QUESTION_ROUNDS:
+                    # First voting phase always comes only after two complete question circles.
+                    _spy_set_state(game_id, cycle_start_turn=new_count, cycle_expected_turns=players_count)
+                    await _spy_prepare_turn_dm(game_id, uid)
+                else:
+                    await _spy_start_discussion(game_id)
+            else:
+                await _spy_prepare_turn_dm(game_id, uid)
+            await callback.answer("Ответ принят. Теперь твой ход.")
+            return
 
     if action == "accuse":
         await callback.answer("Голосование появляется только после завершения полного цикла вопросов.", show_alert=True)
         return
 
     if action == "vote":
-        if callback.message.chat.type not in {"group", "supergroup"} or game["phase"] != "VOTING":
+        if callback.message.chat.type not in {"group", "supergroup"} or game["phase"] != "VOTING" or game["status"] != "VOTING":
             await callback.answer("Голосование сейчас недоступно.", show_alert=True)
             return
+        if len(parts) < 5:
+            await callback.answer("Эта кнопка голосования устарела.", show_alert=True)
+            return
+        try:
+            session = int(parts[3])
+            suspect_id = int(parts[4])
+        except (ValueError, TypeError):
+            await callback.answer("Некорректный голос.", show_alert=True)
+            return
+        if session != int(game["vote_session"] or 0):
+            await callback.answer("Это голосование уже закончилось.", show_alert=True)
+            return
         voter = _spy_player(game_id, uid)
-        suspect_id = int(parts[3]) if len(parts) > 3 else 0
         suspect = _spy_player(game_id, suspect_id)
         if not voter or not int(voter["active"] or 0) or not suspect or not int(suspect["active"] or 0) or suspect_id == uid:
             await callback.answer("Нельзя выбрать этого игрока.", show_alert=True)
             return
-        exists = group_db_op(lambda conn: conn.execute(
-            "SELECT 1 FROM spy_votes WHERE game_id=? AND voter_id=?",
-            (int(game_id), int(uid)),
-        ).fetchone())
-        if exists:
-            await callback.answer("Ты уже проголосовал.", show_alert=True)
-            return
-        group_db_op(lambda conn: (
-            conn.execute("INSERT INTO spy_votes(game_id,voter_id,suspect_id,created_at) VALUES(?,?,?,?)", (int(game_id), int(uid), int(suspect_id), now())),
-            conn.commit(),
-        ))
-        await callback.answer("Голос принят.")
-        active_count = len(_spy_players(game_id))
-        votes = group_db_op(lambda conn: conn.execute(
-            "SELECT suspect_id,COUNT(*) AS c FROM spy_votes WHERE game_id=? GROUP BY suspect_id ORDER BY c DESC,suspect_id",
-            (int(game_id),),
-        ).fetchall())
-        if votes and int(votes[0]["c"]) > active_count / 2:
-            await _spy_resolve_accusation(game_id, int(votes[0]["suspect_id"]))
-        elif active_count and sum(int(r["c"]) for r in votes) >= active_count:
-            await _spy_handle_vote_round_timeout(game_id)
+
+        async with _spy_game_lock(game_id):
+            # Re-read under the lock: a second fast click must never overwrite a newer state.
+            current = _spy_get_game(game_id)
+            if not current or current["status"] != "VOTING" or current["phase"] != "VOTING" or int(current["vote_session"] or 0) != session:
+                await callback.answer("Это голосование уже закончилось.", show_alert=True)
+                return
+
+            def cast_vote():
+                def op(conn):
+                    existing = conn.execute(
+                        "SELECT suspect_id FROM spy_votes WHERE game_id=? AND voter_id=?",
+                        (int(game_id), int(uid)),
+                    ).fetchone()
+                    if existing and int(existing["suspect_id"]) == suspect_id:
+                        conn.execute("DELETE FROM spy_votes WHERE game_id=? AND voter_id=?", (int(game_id), int(uid)))
+                        result = "removed"
+                    else:
+                        conn.execute(
+                            "INSERT OR REPLACE INTO spy_votes(game_id,voter_id,suspect_id,created_at) VALUES(?,?,?,?)",
+                            (int(game_id), int(uid), int(suspect_id), now()),
+                        )
+                        result = "set"
+                    conn.commit()
+                    return result
+                return group_db_op(op)
+
+            changed = cast_vote()
+            if changed == "removed":
+                await callback.answer("Голос снят.")
+            else:
+                await callback.answer(f"Голос за {_spy_display(suspect)} принят.")
+
+            current = _spy_get_game(game_id)
+            if current and current["phase"] == "VOTING" and current["status"] == "VOTING" and int(current["vote_session"] or 0) == session:
+                with suppress(Exception):
+                    await bot.edit_message_text(
+                        chat_id=int(current["chat_id"]),
+                        message_id=int(current["lobby_message_id"]),
+                        text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ГОЛОСОВАНИЕ\n\n"
+                              f"Раунд {int(current['vote_round'] or 0) + 1}/{SPY_MAX_VOTE_ROUNDS}.\n"
+                              "Выберите подозреваемого. Голос можно изменить до завершения голосования.\n\n"
+                              "○ — нет голосов\n● — есть голоса"),
+                        reply_markup=_spy_vote_keyboard(game_id, session),
+                    )
+                result = _spy_vote_result(game_id)
+                if result["total"] >= result["active"]:
+                    await _spy_resolve_vote_session(game_id, session)
         return
 
     if action == "hint":
-        player = _spy_player(game_id, uid)
-        if callback.message.chat.type != "private" or not player or not int(player["is_spy"] or 0) or not int(player["active"] or 0) or game["status"] != "PLAYING" or game["phase"] not in {"QUESTION", "ASKING", "ANSWERING", "DISCUSSION", "VOTING"}:
-            await callback.answer("Подсказка сейчас недоступна.", show_alert=True)
-            return
-        used = int(player["hints_used"] or 0)
-        current_round = 1 + (int(game["turn_count"] or 0) // max(1, len(_spy_players(game_id))))
-        if used >= SPY_MAX_HINTS:
-            await callback.answer("Все три подсказки уже использованы.", show_alert=True)
-            return
-        required_round = used + 1
-        if current_round < required_round:
-            await callback.answer(f"Эта подсказка откроется после завершения {required_round - 1}-го круга.", show_alert=True)
-            return
-        hints = SPY_LOCATIONS.get(str(game["location"] or ""), {}).get("hints", [])
-        if used >= len(hints):
-            await callback.answer("Для этой локации подсказки закончились.", show_alert=True)
-            return
-        hint = hints[used]
-        group_db_op(lambda conn: (
-            conn.execute("UPDATE spy_players SET hints_used=hints_used+1 WHERE game_id=? AND user_id=?", (int(game_id), int(uid))),
-            conn.commit(),
-        ))
-        current = _spy_player(game_id, uid)
-        await callback.message.answer(f"💡 Подсказка {used + 1}/{SPY_MAX_HINTS}\n\n{hint}", reply_markup=_spy_secret_keyboard(game_id, True, used + 1))
-        await callback.answer("Подсказка отправлена.")
-        return
-
-    if action == "guess":
-        player = _spy_player(game_id, uid)
-        if callback.message.chat.type != "private" or not player or not int(player["is_spy"] or 0) or not int(player["active"] or 0):
-            await callback.answer("Эта кнопка сейчас недоступна.", show_alert=True)
-            return
-        phase = str(game["phase"] or "")
-        if game["status"] == "PLAYING" and phase in {"QUESTION", "ASKING", "ANSWERING", "DISCUSSION", "VOTING"}:
-            exists = group_db_op(lambda conn: conn.execute(
-                "SELECT 1 FROM spy_guesses WHERE game_id=? AND user_id=? AND phase IN ('EARLY_PENDING','EARLY')",
-                (int(game_id), int(uid)),
-            ).fetchone())
-            if exists:
-                await callback.answer("Ты уже использовал досрочную попытку.", show_alert=True)
+        async with _spy_game_lock(game_id):
+            player = _spy_player(game_id, uid)
+            if callback.message.chat.type != "private" or not player or not int(player["is_spy"] or 0) or not int(player["active"] or 0) or game["status"] != "PLAYING" or game["phase"] not in {"QUESTION", "ASKING", "ANSWERING", "DISCUSSION", "VOTING"}:
+                await callback.answer("Подсказка сейчас недоступна.", show_alert=True)
                 return
+            used = int(player["hints_used"] or 0)
+            current_round = 1 + (int(game["turn_count"] or 0) // max(1, len(_spy_players(game_id))))
+            if used >= SPY_MAX_HINTS:
+                await callback.answer("Обе подсказки уже использованы.", show_alert=True)
+                return
+            required_round = used + 1
+            if current_round < required_round:
+                await callback.answer(f"Эта подсказка откроется после завершения {required_round - 1}-го круга.", show_alert=True)
+                return
+            hints = SPY_LOCATIONS.get(str(game["location"] or ""), {}).get("hints", [])
+            if used >= len(hints):
+                await callback.answer("Для этой локации подсказки закончились.", show_alert=True)
+                return
+            hint = hints[used]
             group_db_op(lambda conn: (
-                conn.execute("INSERT OR REPLACE INTO spy_guesses(game_id,user_id,phase,guess,created_at) VALUES(?,?,?,?,?)", (int(game_id), int(uid), "EARLY_PENDING", "", now())),
+                conn.execute("UPDATE spy_players SET hints_used=hints_used+1 WHERE game_id=? AND user_id=?", (int(game_id), int(uid))),
                 conn.commit(),
             ))
-            await callback.message.answer("🎯 Напиши название локации одним сообщением. Это будет твоя досрочная попытка.")
-            await callback.answer("Жду твою догадку.")
+            current = _spy_player(game_id, uid)
+            await callback.message.answer(f"💡 Подсказка {used + 1}/{SPY_MAX_HINTS}\n\n{hint}", reply_markup=_spy_secret_keyboard(game_id, True, used + 1))
+            await callback.answer("Подсказка отправлена.")
             return
-        if phase == "GUESS":
-            if int(game["accusation_suspect_id"] or 0) != uid:
-                await callback.answer("Эта попытка сейчас не для тебя.", show_alert=True)
+
+    if action == "guess":
+        async with _spy_game_lock(game_id):
+            player = _spy_player(game_id, uid)
+            if callback.message.chat.type != "private" or not player or not int(player["is_spy"] or 0) or not int(player["active"] or 0):
+                await callback.answer("Эта кнопка сейчас недоступна.", show_alert=True)
                 return
-            await callback.message.answer("🎯 Напиши название локации одним сообщением. У тебя 60 секунд.")
-            await callback.answer("Жду твою догадку.")
-            return
-        if phase == "FINAL_GUESS":
-            already_final = group_db_op(lambda conn: conn.execute(
-                "SELECT 1 FROM spy_guesses WHERE game_id=? AND user_id=? AND phase='FINAL'",
-                (int(game_id), int(uid)),
-            ).fetchone())
-            if already_final:
-                await callback.answer("Ты уже использовал финальную попытку.", show_alert=True)
+            phase = str(game["phase"] or "")
+            if game["status"] == "PLAYING" and phase in {"QUESTION", "ASKING", "ANSWERING", "DISCUSSION", "VOTING"}:
+                exists = group_db_op(lambda conn: conn.execute(
+                    "SELECT 1 FROM spy_guesses WHERE game_id=? AND user_id=? AND phase IN ('EARLY_PENDING','EARLY')",
+                    (int(game_id), int(uid)),
+                ).fetchone())
+                if exists:
+                    await callback.answer("Ты уже использовал досрочную попытку.", show_alert=True)
+                    return
+                group_db_op(lambda conn: (
+                    conn.execute("INSERT OR REPLACE INTO spy_guesses(game_id,user_id,phase,guess,created_at) VALUES(?,?,?,?,?)", (int(game_id), int(uid), "EARLY_PENDING", "", now())),
+                    conn.commit(),
+                ))
+                await callback.message.answer("🎯 Напиши название локации одним сообщением. Это будет твоя досрочная попытка.")
+                await callback.answer("Жду твою догадку.")
                 return
-            await callback.message.answer("🎯 Напиши название локации одним сообщением. У тебя 60 секунд.")
-            await callback.answer("Жду твою догадку.")
+            if phase == "GUESS":
+                if int(game["accusation_suspect_id"] or 0) != uid:
+                    await callback.answer("Эта попытка сейчас не для тебя.", show_alert=True)
+                    return
+                await callback.message.answer("🎯 Напиши название локации одним сообщением. У тебя 60 секунд.")
+                await callback.answer("Жду твою догадку.")
+                return
+            if phase == "FINAL_GUESS":
+                already_final = group_db_op(lambda conn: conn.execute(
+                    "SELECT 1 FROM spy_guesses WHERE game_id=? AND user_id=? AND phase='FINAL'",
+                    (int(game_id), int(uid)),
+                ).fetchone())
+                if already_final:
+                    await callback.answer("Ты уже использовал финальную попытку.", show_alert=True)
+                    return
+                await callback.message.answer("🎯 Напиши название локации одним сообщением. У тебя 60 секунд.")
+                await callback.answer("Жду твою догадку.")
+                return
+            await callback.answer("Угадывание сейчас недоступно.", show_alert=True)
             return
-        await callback.answer("Угадывание сейчас недоступно.", show_alert=True)
-        return
 
     await callback.answer()
 
@@ -8379,84 +8375,92 @@ async def spy_private_text(message: Message):
             await message.answer("❌ Неверно. Досрочная попытка исчерпана. Игра продолжается.")
         return
 
-    if game["phase"] == "ASKING" and int(game["current_asker_id"] or 0) == uid:
-        text = message.text.strip()
-        if not text or len(text) > 300 or "?" not in text:
-            await message.answer("Напиши один короткий вопрос со знаком «?», на который можно ответить только «Да» или «Нет».")
+    async with _spy_game_lock(game["id"]):
+        game = _spy_get_game(game["id"])
+        if not game or game["phase"] != "ASKING" or int(game["current_asker_id"] or 0) != uid:
             return
-        target = _spy_player(game["id"], int(game["current_target_id"] or 0))
-        if not target or not int(target["active"] or 0):
-            return
-        next_turn_no = int(game["turn_count"] or 0) + 1
-        round_no = ((next_turn_no - 1) // max(1, len(_spy_players(game["id"])))) + 1
-        _spy_record_turn(game["id"], next_turn_no, round_no, uid, int(target["user_id"]), text, "")
-        await bot.send_message(
-            int(game["chat_id"]),
-            f"❓ {_spy_display(_spy_player(game['id'], uid))} → {_spy_display(target)}\n\n{text}",
-        )
-        _spy_set_state(game["id"], phase="ANSWERING")
-        await bot.send_message(
-            int(target["user_id"]),
-            "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
-            f"Тебе задали вопрос:\n\n«{text}»\n\n"
-            "Выбери ответ:",
-            reply_markup=_spy_answer_keyboard(game["id"]),
-        )
-        return
-
-    if game["phase"] in {"GUESS", "FINAL_GUESS"}:
-        player = _spy_player(game["id"], uid)
-        if not player or not int(player["is_spy"] or 0) or not int(player["active"] or 0):
-            return
-        if game["phase"] == "GUESS" and int(game["accusation_suspect_id"] or 0) != uid:
-            return
-        if game["phase"] == "FINAL_GUESS":
-            already = group_db_op(lambda conn: conn.execute(
-                "SELECT 1 FROM spy_guesses WHERE game_id=? AND user_id=? AND phase='FINAL'",
-                (int(game["id"]), int(uid)),
-            ).fetchone())
-            if already:
-                await message.answer("Ты уже использовал финальную попытку.")
+        if game["phase"] == "ASKING" and int(game["current_asker_id"] or 0) == uid:
+            text = message.text.strip()
+            if not text or len(text) > 300 or not text.rstrip().endswith("?"):
+                await message.answer("Напиши один короткий вопрос и поставь «?» именно в самом конце. На него должен быть возможен ответ только «Да» или «Нет».")
                 return
-        guess = unicodedata.normalize("NFKC", message.text.strip()).casefold()
-        location = str(game["location"] or "")
-        correct = _spy_location_guess_matches(message.text.strip(), location)
-        if game["phase"] == "GUESS":
-            if correct:
-                await _spy_finish_message(game["id"], "шпионы", f"{_spy_display(player)} угадал локацию: {game['location']}")
+            target = _spy_player(game["id"], int(game["current_target_id"] or 0))
+            if not target or not int(target["active"] or 0):
+                return
+            next_turn_no = int(game["turn_count"] or 0) + 1
+            round_no = ((next_turn_no - 1) // max(1, len(_spy_players(game["id"])))) + 1
+            _spy_record_turn(game["id"], next_turn_no, round_no, uid, int(target["user_id"]), text, "")
+            await bot.send_message(
+                int(game["chat_id"]),
+                f"❓ {_spy_display(_spy_player(game['id'], uid))} → {_spy_display(target)}\n\n{text}",
+            )
+            _spy_set_state(game["id"], phase="ANSWERING")
+            await bot.send_message(
+                int(target["user_id"]),
+                "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
+                f"Тебе задали вопрос:\n\n«{text}»\n\n"
+                "Выбери ответ:",
+                reply_markup=_spy_answer_keyboard(game["id"], next_turn_no),
+            )
+            return
+
+    async with _spy_game_lock(game["id"]):
+        game = _spy_get_game(game["id"])
+        if not game or game["phase"] not in {"GUESS", "FINAL_GUESS"}:
+            return
+        if game["phase"] in {"GUESS", "FINAL_GUESS"}:
+            player = _spy_player(game["id"], uid)
+            if not player or not int(player["is_spy"] or 0) or not int(player["active"] or 0):
+                return
+            if game["phase"] == "GUESS" and int(game["accusation_suspect_id"] or 0) != uid:
+                return
+            if game["phase"] == "FINAL_GUESS":
+                already = group_db_op(lambda conn: conn.execute(
+                    "SELECT 1 FROM spy_guesses WHERE game_id=? AND user_id=? AND phase='FINAL'",
+                    (int(game["id"]), int(uid)),
+                ).fetchone())
+                if already:
+                    await message.answer("Ты уже использовал финальную попытку.")
+                    return
+            guess = unicodedata.normalize("NFKC", message.text.strip()).casefold()
+            location = str(game["location"] or "")
+            correct = _spy_location_guess_matches(message.text.strip(), location)
+            if game["phase"] == "GUESS":
+                if correct:
+                    await _spy_finish_message(game["id"], "шпионы", f"{_spy_display(player)} угадал локацию: {game['location']}")
+                else:
+                    group_db_op(lambda conn: (
+                        conn.execute("UPDATE spy_players SET active=0 WHERE game_id=? AND user_id=?", (int(game["id"]), int(uid))),
+                        conn.commit(),
+                    ))
+                    remaining = _spy_spies(game["id"], active_only=True)
+                    if remaining and len(remaining) >= len([p for p in _spy_players(game["id"]) if int(p["is_spy"] or 0) == 0]):
+                        await _spy_finish_message(game["id"], "шпионы", "Шпионов стало не меньше, чем мирных игроков.")
+                    elif remaining and int(game["vote_round"] or 0) >= SPY_MAX_VOTE_ROUNDS:
+                        await message.answer("❌ Шпион не угадал. Начинается финальная догадка оставшихся шпионов.")
+                        await _spy_start_final_guess(game["id"], reason="Один из раскрытых шпионов ошибся после шестого раунда")
+                    elif remaining:
+                        await message.answer("❌ Неверно. Твоя последняя попытка закончена, но другие шпионы продолжают игру.")
+                        await _spy_resume_question_cycle(game["id"])
+                    else:
+                        await _spy_finish_message(game["id"], "мирные игроки", f"Шпион не угадал локацию. Правильная локация: {game['location']}")
             else:
                 group_db_op(lambda conn: (
-                    conn.execute("UPDATE spy_players SET active=0 WHERE game_id=? AND user_id=?", (int(game["id"]), int(uid))),
+                    conn.execute("INSERT OR REPLACE INTO spy_guesses(game_id,user_id,phase,guess,created_at) VALUES(?,?,?,?,?)", (int(game["id"]), int(uid), "FINAL", message.text.strip(), now())),
                     conn.commit(),
                 ))
-                remaining = _spy_spies(game["id"], active_only=True)
-                if remaining and len(remaining) >= len([p for p in _spy_players(game["id"]) if int(p["is_spy"] or 0) == 0]):
-                    await _spy_finish_message(game["id"], "шпионы", "Шпионов стало не меньше, чем мирных игроков.")
-                elif remaining and int(game["vote_round"] or 0) >= SPY_MAX_VOTE_ROUNDS:
-                    await message.answer("❌ Шпион не угадал. Начинается финальная догадка оставшихся шпионов.")
-                    await _spy_start_final_guess(game["id"], reason="Один из раскрытых шпионов ошибся после шестого раунда")
-                elif remaining:
-                    await message.answer("❌ Неверно. Твоя последняя попытка закончена, но другие шпионы продолжают игру.")
-                    await _spy_resume_question_cycle(game["id"])
+                if correct:
+                    await _spy_finish_message(game["id"], "шпионы", f"{_spy_display(player)} угадал локацию: {game['location']}")
                 else:
-                    await _spy_finish_message(game["id"], "мирные игроки", f"Шпион не угадал локацию. Правильная локация: {game['location']}")
-        else:
-            group_db_op(lambda conn: (
-                conn.execute("INSERT OR REPLACE INTO spy_guesses(game_id,user_id,phase,guess,created_at) VALUES(?,?,?,?,?)", (int(game["id"]), int(uid), "FINAL", message.text.strip(), now())),
-                conn.commit(),
-            ))
-            if correct:
-                await _spy_finish_message(game["id"], "шпионы", f"{_spy_display(player)} угадал локацию: {game['location']}")
-            else:
-                active_spies = _spy_spies(game["id"], active_only=True)
-                attempted = group_db_op(lambda conn: conn.execute(
-                    "SELECT COUNT(*) AS c FROM spy_guesses WHERE game_id=? AND phase='FINAL'",
-                    (int(game["id"]),),
-                ).fetchone())["c"]
-                if not active_spies or int(attempted) >= len(active_spies):
-                    await _spy_finish_message(game["id"], "мирные игроки", f"Шпионы не угадали локацию. Правильная локация: {game['location']}")
-                else:
-                    await message.answer("❌ Неверно. Если останутся попытки других шпионов, они продолжают финальную догадку.")
+                    active_spies = _spy_spies(game["id"], active_only=True)
+                    attempted = group_db_op(lambda conn: conn.execute(
+                        "SELECT COUNT(*) AS c FROM spy_guesses WHERE game_id=? AND phase='FINAL'",
+                        (int(game["id"]),),
+                    ).fetchone())["c"]
+                    if not active_spies or int(attempted) >= len(active_spies):
+                        await _spy_finish_message(game["id"], "мирные игроки", f"Шпионы не угадали локацию. Правильная локация: {game['location']}")
+                    else:
+                        await message.answer("❌ Неверно. Если останутся попытки других шпионов, они продолжают финальную догадку.")
 
 
 async def _spy_recovery_worker():
@@ -8477,30 +8481,40 @@ async def _spy_recovery_worker():
                     if expires > current:
                         continue
                     gid = int(game["id"])
-                    if game["phase"] in {"QUESTION", "ASKING", "ANSWERING"}:
-                        await _spy_start_discussion(gid)
-                    elif game["phase"] == "DISCUSSION":
-                        await _spy_start_vote(gid)
-                    elif game["phase"] == "VOTING":
-                        await _spy_handle_vote_round_timeout(gid)
-                    elif game["phase"] == "GUESS":
-                        suspect_id = int(game["accusation_suspect_id"] or 0)
-                        suspect = _spy_player(gid, suspect_id)
-                        if suspect and int(suspect["active"] or 0) and int(suspect["is_spy"] or 0):
-                            group_db_op(lambda conn: (
-                                conn.execute("UPDATE spy_players SET active=0 WHERE game_id=? AND user_id=?", (gid, suspect_id)),
-                                conn.commit(),
-                            ))
-                        remaining = _spy_spies(gid, active_only=True)
-                        civilians = len([p for p in _spy_players(gid) if int(p["is_spy"] or 0) == 0])
-                        if not remaining:
-                            await _spy_finish_message(gid, "мирные игроки", "Шпион не успел угадать локацию.")
-                        elif len(remaining) >= civilians:
-                            await _spy_finish_message(gid, "шпионы", "Шпионов стало не меньше, чем мирных игроков.")
-                        else:
-                            await _spy_resume_question_cycle(gid)
-                    elif game["phase"] == "FINAL_GUESS":
-                        await _spy_finish_message(gid, "мирные игроки", f"Шпионы не успели угадать локацию. Правильная локация: {game['location']}")
+                    async with _spy_game_lock(gid):
+                        current_game = _spy_get_game(gid)
+                        if not current_game or not current_game["expires_at"]:
+                            continue
+                        expires2 = datetime.fromisoformat(str(current_game["expires_at"]))
+                        if expires2.tzinfo is None:
+                            expires2 = expires2.replace(tzinfo=timezone.utc)
+                        if expires2 > datetime.now(timezone.utc):
+                            continue
+                        phase = str(current_game["phase"] or "")
+                        if phase in {"QUESTION", "ASKING", "ANSWERING"}:
+                            await _spy_start_discussion(gid)
+                        elif phase == "DISCUSSION":
+                            await _spy_start_vote(gid)
+                        elif phase == "VOTING":
+                            await _spy_resolve_vote_session(gid, int(current_game["vote_session"] or 0))
+                        elif phase == "GUESS":
+                            suspect_id = int(current_game["accusation_suspect_id"] or 0)
+                            suspect = _spy_player(gid, suspect_id)
+                            if suspect and int(suspect["active"] or 0) and int(suspect["is_spy"] or 0):
+                                group_db_op(lambda conn: (
+                                    conn.execute("UPDATE spy_players SET active=0 WHERE game_id=? AND user_id=?", (gid, suspect_id)),
+                                    conn.commit(),
+                                ))
+                            remaining = _spy_spies(gid, active_only=True)
+                            civilians = len([p for p in _spy_players(gid) if int(p["is_spy"] or 0) == 0])
+                            if not remaining:
+                                await _spy_finish_message(gid, "мирные игроки", "Шпион не успел угадать локацию.")
+                            elif len(remaining) >= civilians:
+                                await _spy_finish_message(gid, "шпионы", "Шпионов стало не меньше, чем мирных игроков.")
+                            else:
+                                await _spy_resume_question_cycle(gid)
+                        elif phase == "FINAL_GUESS":
+                            await _spy_finish_message(gid, "мирные игроки", f"Шпионы не успели угадать локацию. Правильная локация: {current_game['location']}")
                 except Exception:
                     logger.exception("Spy recovery expiry failed | game=%s", game["id"])
         except asyncio.CancelledError:
