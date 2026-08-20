@@ -75,4 +75,4 @@ python bot.py
 
 
 ## Spyfall
-`/spy` opens a locked lobby in the primary chat. Players join and must open the bot DM before the admin can start. The bot randomly chooses order, location and spy, sends secret cards by DM, drives question → yes/no answer → automatic next turn, then discussion and final suspect vote. No mid-game joins.
+`/spy` opens a locked lobby in the primary chat. Players join and must open the bot DM before the admin can start. The bot randomly chooses order, location and spy, sends secret cards by DM, drives question → yes/no answer → automatic next turn, then discussion and final suspect vote. The Spyfall catalog contains 47 locations with 3 progressive hints each; location guesses accept common aliases and natural forms such as «в аэропорту». No mid-game joins.

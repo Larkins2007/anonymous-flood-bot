@@ -5476,6 +5476,8 @@ def cycle_slot_for_local(dt):
     return slot
 
 def next_cycle_slot(chat_id, after_local):
+    if after_local.tzinfo is None:
+        after_local = after_local.replace(tzinfo=timezone.utc)
     rows=group_db_op(lambda conn: conn.execute(
         "SELECT * FROM schedule_cycle WHERE chat_id=? AND enabled=1",(chat_id,)
     ).fetchall())
@@ -7091,7 +7093,7 @@ def _spy_get_game(game_id):
 
 def _spy_open_game(chat_id):
     return group_db_op(lambda conn: conn.execute(
-        "SELECT * FROM spy_games WHERE chat_id=? AND status IN ('WAITING','PLAYING','DISCUSSION','VOTING') ORDER BY id DESC LIMIT 1",
+        "SELECT * FROM spy_games WHERE chat_id=? AND status IN ('WAITING','STARTING','PLAYING','DISCUSSION','VOTING') ORDER BY id DESC LIMIT 1",
         (int(chat_id),),
     ).fetchone())
 
@@ -7314,7 +7316,7 @@ def _spy_start_db(game_id, location, spy_ids, assignments, order):
                 (int(bool(is_spy)), idx, int(game_id), int(uid)),
             )
         conn.execute(
-            "UPDATE spy_games SET status='PLAYING',phase='QUESTION',started_at=?,expires_at=?,location=?,spy_user_id=?,current_asker_id=?,current_target_id=?,turn_count=0,round_target=?,vote_round=0,accusation_suspect_id=NULL,updated_at=? WHERE id=?",
+            "UPDATE spy_games SET status='STARTING',phase='QUESTION',started_at=?,expires_at=?,location=?,spy_user_id=?,current_asker_id=?,current_target_id=?,turn_count=0,round_target=?,vote_round=0,accusation_suspect_id=NULL,updated_at=? WHERE id=?",
             (now(), deadline, location, primary_spy, first, second, target_rounds, now(), int(game_id)),
         )
         conn.commit()
@@ -7384,6 +7386,8 @@ async def _spy_start_round(game_id):
                 conn.commit(),
             ))
             return False, f"Не удалось отправить секретную карточку {_spy_display(_spy_player(game_id, uid))}. Игра не запущена."
+    # Secret cards were delivered successfully. Only now expose the round as PLAYING.
+    _spy_set_state(game_id, status="PLAYING", phase="QUESTION")
     return True, "Игра началась."
 
 
@@ -7670,8 +7674,12 @@ async def spy_handle_deep_link(message: Message, game_id: int):
             return
     except Exception:
         logger.debug("Spy membership lookup failed | game=%s user=%s", game_id, message.from_user.id, exc_info=True)
+    existed = _spy_player(game_id, message.from_user.id)
     ok, text = _spy_join(game_id, message.from_user)
     if ok:
+        # Deep-link join is intentionally silent in the group: the lobby message
+        # itself is the single source of participant count/list. Repeated taps
+        # must never spam the chat with “X подключился”.
         _spy_mark_dm_ready(game_id, message.from_user.id)
         updated_game = _spy_get_game(game_id)
         players = _spy_players(game_id)
@@ -7683,14 +7691,22 @@ async def spy_handle_deep_link(message: Message, game_id: int):
                     text=_spy_lobby_text(game_id),
                     reply_markup=_spy_lobby_keyboard(game_id, len(players) >= SPY_MIN_PLAYERS),
                 )
-        with suppress(Exception):
-            await bot.send_message(
-                int(game["chat_id"]),
-                f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n{_spy_display(_spy_player(game_id, message.from_user.id))} подключился. Участники: {len(players)}/{SPY_MAX_PLAYERS}",
+        if existed:
+            await message.answer(
+                "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n✅ Ты уже участвуешь в этом лобби.\n"
+                "Повторное нажатие ничего не меняет. ЛС подключён."
             )
-        await message.answer("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n✅ Ты подключён к игре.\nВернись в чат — после старта твоя секретная карточка придёт сюда.")
+        else:
+            await message.answer(
+                "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n✅ Ты подключён к игре.\n"
+                "Вернись в чат — после старта твоя секретная карточка придёт сюда."
+            )
     else:
-        await message.answer(f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n{text}")
+        await message.answer(
+            "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n" + (
+                "✅ Ты уже участвуешь в этом лобби. Повторное нажатие ничего не меняет." if existed else text
+            )
+        )
 
 
 @dp.callback_query(F.data.startswith("sp:"))
@@ -7766,22 +7782,33 @@ async def spy_callback(callback: CallbackQuery):
         if uid not in {int(game["created_by"]), int(ADMIN_ID)}:
             await callback.answer("Начать игру может только ведущий или администратор.", show_alert=True)
             return
+        if game["status"] == "STARTING":
+            await callback.answer("Игра уже запускается…", show_alert=False)
+            return
         if game["status"] != "WAITING":
             await callback.answer("Игра уже запущена.", show_alert=True)
             return
+        # Lock the lobby into STARTING immediately so double-clicks cannot launch two rounds.
+        _spy_set_state(game_id, status="STARTING", phase="LOBBY")
+        await callback.answer("Запускаю игру…", show_alert=False)
         players = _spy_players(game_id)
         if len(players) < SPY_MIN_PLAYERS:
+            _spy_set_state(game_id, status="WAITING", phase="LOBBY")
             await callback.answer("Нужно минимум 3 участника.", show_alert=True)
             return
         missing = _spy_missing_dm(game_id)
         if missing:
+            _spy_set_state(game_id, status="WAITING", phase="LOBBY")
             names = ", ".join(_spy_display(p) for p in missing[:8])
             more = f" и ещё {len(missing) - 8}" if len(missing) > 8 else ""
-            await callback.answer(f"Сначала нажмите «🎮 Участвовать»: {names}{more}", show_alert=True)
+            await bot.send_message(int(game["chat_id"]), f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nНе удалось начать игру. ЛС не подключили: {names}{more}.")
             return
         ok, msg = await _spy_start_round(game_id)
         if not ok:
-            await callback.answer(msg, show_alert=True)
+            _spy_set_state(game_id, status="WAITING", phase="LOBBY")
+            with suppress(Exception):
+                await callback.message.edit_reply_markup(reply_markup=_spy_lobby_keyboard(game_id, True))
+            await bot.send_message(int(game["chat_id"]), f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nИгра не запущена. {msg}")
             return
         with suppress(Exception):
             await bot.unpin_chat_message(callback.message.chat.id, callback.message.message_id)
@@ -7798,7 +7825,6 @@ async def spy_callback(callback: CallbackQuery):
             )
         started = _spy_get_game(game_id)
         await _spy_prepare_turn_dm(game_id, int(started["current_asker_id"]))
-        await callback.answer("Игра началась.")
         return
 
     if action == "ask":
