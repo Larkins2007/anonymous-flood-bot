@@ -7195,7 +7195,7 @@ async def main():
     seed_default_games()
     migrate_group_state()
 
-    asyncio.create_task(spy_recovery_worker())
+    asyncio.create_task(_spy_recovery_worker())
 
     DELIVERY_QUEUE = asyncio.Queue()
     BROADCAST_QUEUE = asyncio.Queue()
