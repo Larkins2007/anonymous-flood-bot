@@ -6627,33 +6627,44 @@ async def polling_loop():
 
 
 # =========================================================
-# SPYFALL — SELF-CONTAINED GAME MODULE
-# =========================================================
-# External rules checked against current Spyfall rule guides: one hidden spy,
-# shared location for non-spies, one-question/one-answer turns, an 8-minute
-# round, optional accusation, and a spy win on timeout or successful location
-# guess. The bot implements an online-friendly variant where questions and
-# answers are written to the bot in private chat, then published to the group.
+# SPYFALL — managed round-robin Telegram module
+# Source behavior: classic Spyfall flow (hidden spy, shared location, one-question
+# turns, no immediate retaliation, accusation, spy location guess) adapted to a
+# bot-led group/DM game. The bot controls the turn order and yes/no answers.
 
 SPY_MIN_PLAYERS = 3
 SPY_MAX_PLAYERS = 10
 SPY_ROUND_SECONDS = 8 * 60
-SPY_VOTE_SECONDS = 90
-
+SPY_DISCUSSION_SECONDS = 120
+SPY_FINAL_VOTE_SECONDS = 120
 SPY_LOCATIONS = {
     "Аэропорт": ["Пилот", "Стюард", "Пассажир", "Диспетчер", "Охранник", "Механик", "Таможенник", "Работник багажа", "VIP-гость", "Турист"],
+    "Банк": ["Кассир", "Клиент", "Охранник", "Инкассатор", "Менеджер", "Финансист", "Стажёр", "Проверяющий", "Посетитель", "Владелец"],
     "Больница": ["Врач", "Медсестра", "Пациент", "Хирург", "Посетитель", "Санитар", "Администратор", "Лаборант", "Охранник", "Стажёр"],
-    "Банк": ["Кассир", "Клиент", "Охранник", "Менеджер", "Инкассатор", "Владелец", "Стажёр", "Финансист", "Посетитель", "Проверяющий"],
-    "Пляж": ["Спасатель", "Сёрфер", "Турист", "Пловец", "Продавец", "Фотограф", "Инструктор", "Бармен", "Рыбак", "Работник пляжа"],
     "Ресторан": ["Шеф-повар", "Официант", "Клиент", "Бармен", "Критик", "Менеджер", "Курьер", "Владелец", "Стажёр", "Уборщик"],
     "Казино": ["Крупье", "Игрок", "Охранник", "VIP-гость", "Бармен", "Менеджер", "Дилер", "Вор", "Наблюдатель", "Уборщик"],
-    "Космическая станция": ["Командир", "Инженер", "Учёный", "Врач", "Астронавт", "Техник", "Пилот", "Исследователь", "Связист", "Турист"],
+    "Пляж": ["Спасатель", "Сёрфер", "Турист", "Пловец", "Продавец", "Фотограф", "Инструктор", "Бармен", "Рыбак", "Работник пляжа"],
     "Школа": ["Учитель", "Ученик", "Директор", "Охранник", "Родитель", "Завуч", "Уборщик", "Психолог", "Практикант", "Библиотекарь"],
-    "Круизный лайнер": ["Капитан", "Матрос", "Пассажир", "Повар", "Бармен", "Музыкант", "Механик", "Врач", "Аниматор", "Уборщик"],
     "Театр": ["Актёр", "Режиссёр", "Зритель", "Гример", "Кассир", "Костюмер", "Охранник", "Осветитель", "Критик", "Суфлёр"],
+    "Космическая станция": ["Командир", "Инженер", "Учёный", "Врач", "Астронавт", "Техник", "Пилот", "Исследователь", "Связист", "Турист"],
+    "Круизный лайнер": ["Капитан", "Матрос", "Пассажир", "Повар", "Бармен", "Музыкант", "Механик", "Врач", "Аниматор", "Уборщик"],
     "Железнодорожный вокзал": ["Машинист", "Пассажир", "Кассир", "Проводник", "Диспетчер", "Охранник", "Уборщик", "Турист", "Начальник станции", "Продавец"],
     "Тюрьма": ["Заключённый", "Охранник", "Начальник", "Адвокат", "Врач", "Посетитель", "Следователь", "Психолог", "Сотрудник", "Журналист"],
 }
+
+
+def _spy_ensure_schema():
+    def op(conn):
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(spy_players)").fetchall()}
+        if "turn_order" not in cols:
+            conn.execute("ALTER TABLE spy_players ADD COLUMN turn_order INTEGER NOT NULL DEFAULT 0")
+        game_cols = {r["name"] for r in conn.execute("PRAGMA table_info(spy_games)").fetchall()}
+        if "turn_count" not in game_cols:
+            conn.execute("ALTER TABLE spy_games ADD COLUMN turn_count INTEGER NOT NULL DEFAULT 0")
+        if "round_target" not in game_cols:
+            conn.execute("ALTER TABLE spy_games ADD COLUMN round_target INTEGER NOT NULL DEFAULT 2")
+        conn.commit()
+    group_db_op(op)
 
 
 def _spy_get_game(game_id):
@@ -6662,13 +6673,13 @@ def _spy_get_game(game_id):
 
 def _spy_open_game(chat_id):
     return group_db_op(lambda conn: conn.execute(
-        "SELECT * FROM spy_games WHERE chat_id=? AND status IN ('WAITING','PLAYING','VOTING') ORDER BY id DESC LIMIT 1", (chat_id,)
+        "SELECT * FROM spy_games WHERE chat_id=? AND status IN ('WAITING','PLAYING','DISCUSSION','VOTING') ORDER BY id DESC LIMIT 1", (int(chat_id),)
     ).fetchone())
 
 
 def _spy_players(game_id):
     return group_db_op(lambda conn: conn.execute(
-        "SELECT * FROM spy_players WHERE game_id=? AND active=1 ORDER BY joined_at", (int(game_id),)
+        "SELECT * FROM spy_players WHERE game_id=? AND active=1 ORDER BY turn_order, joined_at", (int(game_id),)
     ).fetchall())
 
 
@@ -6685,57 +6696,55 @@ def _spy_display(row):
 
 
 def _spy_lobby_keyboard(game_id, can_start=False):
-    buttons = [
-        [InlineKeyboardButton(text="🎮 Участвовать", callback_data=f"sp:join:{game_id}"),
-         InlineKeyboardButton(text="🚪 Выйти", callback_data=f"sp:leave:{game_id}")]
-    ]
+    rows = [[InlineKeyboardButton(text="🎮 Участвовать", callback_data=f"sp:join:{game_id}"),
+             InlineKeyboardButton(text="🚪 Выйти", callback_data=f"sp:leave:{game_id}")]]
     if can_start:
-        buttons.append([InlineKeyboardButton(text="▶️ Начать игру", callback_data=f"sp:start:{game_id}")])
-    buttons.append([InlineKeyboardButton(text="🔐 Открыть ЛС с ботом", url=f"https://t.me/{BOT_USERNAME}?start=spy_{int(game_id)}")])
-    buttons.append([InlineKeyboardButton(text="❌ Отменить", callback_data=f"sp:cancel:{game_id}")])
-    return InlineKeyboardMarkup(inline_keyboard=buttons)
+        rows.append([InlineKeyboardButton(text="▶️ Начать игру", callback_data=f"sp:start:{game_id}")])
+    rows.append([InlineKeyboardButton(text="🔐 Открыть ЛС с ботом", url=f"https://t.me/{BOT_USERNAME}?start=spy_{int(game_id)}")])
+    rows.append([InlineKeyboardButton(text="❌ Отменить", callback_data=f"sp:cancel:{game_id}")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def _spy_lobby_text(game_id):
-    game = _spy_get_game(game_id)
     players = _spy_players(game_id)
-    lines = [
-        "𝗦𝗣𝗬𝗙𝗔𝗟𝗟",
-        "",
-        "Собираем игроков для игры «Шпион». В игре будет одна тайная роль — Шпион.",
-        "",
-        f"Участники: {len(players)}/{SPY_MAX_PLAYERS}",
-        "Минимум для старта: 3",
-        "",
-    ]
-    if players:
-        for i, p in enumerate(players, 1):
-            lines.append(f"{i}. {_spy_display(p)}")
-    else:
-        lines.append("Пока никто не присоединился.")
-    lines += ["", "Нажмите «Участвовать», чтобы попасть в игру."]
+    lines = ["𝗦𝗣𝗬𝗙𝗔𝗟𝗟", "", "Нажмите «Участвовать», чтобы войти в игру.", "",
+             f"Участники: {len(players)}/{SPY_MAX_PLAYERS}", "Минимум: 3", ""]
+    lines += [f"{i}. {_spy_display(p)}" for i, p in enumerate(players, 1)] or ["Пока никто не присоединился."]
+    lines += ["", "После старта присоединиться уже нельзя."]
     return "\n".join(lines)
 
 
 def _spy_group_controls(game_id):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🕵️ Обвинить", callback_data=f"sp:accuse_menu:{game_id}")],
+        [InlineKeyboardButton(text="🕵️ Подозреваю игрока", callback_data=f"sp:accuse_menu:{game_id}"),
+         InlineKeyboardButton(text="ℹ️ Правила", callback_data=f"sp:rules:{game_id}")]
     ])
 
 
-def _spy_private_turn_keyboard(game_id, asker_id):
-    players = [p for p in _spy_players(game_id) if int(p["user_id"]) != int(asker_id)]
-    rows=[]
-    for p in players:
-        rows.append([InlineKeyboardButton(text=f"Задать вопрос: {_spy_display(p)}", callback_data=f"sp:target:{game_id}:{p['user_id']}")])
-    me=_spy_player(game_id, asker_id)
-    if me and int(me["is_spy"]):
+def _spy_question_keyboard(game_id, asker_id):
+    game = _spy_get_game(game_id)
+    players = _spy_players(game_id)
+    if not players or not game:
+        return InlineKeyboardMarkup(inline_keyboard=[])
+    target_id = int(game["current_target_id"] or 0)
+    target = _spy_player(game_id, target_id)
+    rows = []
+    if target:
+        rows.append([InlineKeyboardButton(text=f"❓ Задать вопрос {_spy_display(target)}", callback_data=f"sp:ask:{game_id}")])
+    if int(game["spy_user_id"] or 0) == int(asker_id):
         rows.append([InlineKeyboardButton(text="🎯 Я знаю локацию", callback_data=f"sp:guess:{game_id}")])
     return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
+def _spy_answer_keyboard(game_id):
+    return InlineKeyboardMarkup(inline_keyboard=[[
+        InlineKeyboardButton(text="✅ Да", callback_data=f"sp:answer:{game_id}:1"),
+        InlineKeyboardButton(text="❌ Нет", callback_data=f"sp:answer:{game_id}:0"),
+    ]])
+
+
 def _spy_accuse_keyboard(game_id, exclude_user_id=None):
-    rows=[]
+    rows = []
     for p in _spy_players(game_id):
         if exclude_user_id is not None and int(p["user_id"]) == int(exclude_user_id):
             continue
@@ -6745,421 +6754,421 @@ def _spy_accuse_keyboard(game_id, exclude_user_id=None):
 
 def _spy_vote_keyboard(game_id, suspect_id):
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text="✅ Да", callback_data=f"sp:vote:{game_id}:{suspect_id}:1"),
-        InlineKeyboardButton(text="❌ Нет", callback_data=f"sp:vote:{game_id}:{suspect_id}:0"),
+        InlineKeyboardButton(text="✅ Да, это шпион", callback_data=f"sp:vote:{game_id}:{suspect_id}:1"),
+        InlineKeyboardButton(text="❌ Нет", callback_data=f"sp:vote:{game_id}:{suspect_id}:0")
     ]])
-
-
-def _spy_deep_link(username, game_id):
-    return f"https://t.me/{username}?start=spy_{int(game_id)}" if username else None
-
-
-def _spy_current_status(game_id):
-    return group_db_op(lambda conn: conn.execute(
-        "SELECT phase,current_asker_id,current_target_id FROM spy_games WHERE id=?", (int(game_id),)
-    ).fetchone())
 
 
 def _spy_set_state(game_id, **fields):
     if not fields:
         return
-    allowed={"status","phase","current_asker_id","current_target_id","expires_at","accusation_suspect_id","updated_at"}
-    clean={k:v for k,v in fields.items() if k in allowed}
-    clean["updated_at"]=now()
-    sets=", ".join(f"{k}=?" for k in clean)
-    values=list(clean.values())+[int(game_id)]
-    def op(conn):
-        conn.execute(f"UPDATE spy_games SET {sets} WHERE id=?", values)
-        conn.commit()
-    group_db_op(op)
+    allowed = {"status", "phase", "current_asker_id", "current_target_id", "expires_at", "accusation_suspect_id", "updated_at"}
+    clean = {k: v for k, v in fields.items() if k in allowed}
+    clean["updated_at"] = now()
+    sets = ", ".join(f"{k}=?" for k in clean)
+    values = list(clean.values()) + [int(game_id)]
+    group_db_op(lambda conn: (conn.execute(f"UPDATE spy_games SET {sets} WHERE id=?", values), conn.commit()))
 
 
-async def _spy_send_card(user_id, location, role_name, is_spy, game_id):
-    if is_spy:
-        text=(
-            "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
-            "Ты — 🕵️ ШПИОН.\n\n"
-            "Ты не знаешь локацию. Слушай вопросы и ответы, попробуй понять, где находятся остальные, и не выдай себя."
-        )
-    else:
-        text=(
-            "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
-            "Раунд начался.\n\n"
-            f"Локация: {location}\n"
-            f"Твоя роль: {role_name}\n\n"
-            "Не показывай эту информацию другим игрокам. Отвечай так, чтобы доказать знание места, но не назвать его напрямую."
-        )
-    await bot.send_message(user_id, text)
+def _spy_next_player(game_id, user_id):
+    players = _spy_players(game_id)
+    if not players:
+        return None
+    for i, p in enumerate(players):
+        if int(p["user_id"]) == int(user_id):
+            return players[(i + 1) % len(players)]
+    return players[0]
+
+
+def _spy_round_target(player_count):
+    return 2 if player_count <= 5 else 3
 
 
 def _spy_create_game(chat_id, creator_id):
     return group_db_op(lambda conn: (conn.execute(
         "INSERT INTO spy_games(chat_id,created_by,created_at,status,phase,updated_at) VALUES(?,?,?,?,?,?)",
-        (chat_id,creator_id,now(),"WAITING","LOBBY",now())
+        (chat_id, creator_id, now(), "WAITING", "LOBBY", now())
     ), conn.commit(), conn.execute("SELECT * FROM spy_games WHERE id=last_insert_rowid()").fetchone())[-1])
 
 
 def _spy_join(game_id, user):
     if getattr(user, "is_bot", False):
         return False, "Боты не участвуют."
-    game=_spy_get_game(game_id)
+    game = _spy_get_game(game_id)
     if not game or game["status"] != "WAITING":
-        return False, "Лобби уже закрыто."
-    players=_spy_players(game_id)
-    existing=_spy_player(game_id,user.id)
-    if existing:
+        return False, "Игра уже началась. Войти больше нельзя."
+    players = _spy_players(game_id)
+    if _spy_player(game_id, user.id):
         return True, "Вы уже участвуете."
-    if len(players)>=SPY_MAX_PLAYERS:
+    if len(players) >= SPY_MAX_PLAYERS:
         return False, "Достигнут максимум — 10 участников."
-    def op(conn):
-        conn.execute("INSERT INTO spy_players(game_id,user_id,username,display_name,joined_at) VALUES(?,?,?,?,?)",
-                     (game_id,int(user.id),(user.username or "").lstrip("@"),user.first_name or "участник",now()))
-        conn.commit()
-    group_db_op(op)
+    group_db_op(lambda conn: (conn.execute(
+        "INSERT INTO spy_players(game_id,user_id,username,display_name,joined_at,turn_order) VALUES(?,?,?,?,?,0)",
+        (game_id, int(user.id), (user.username or "").lstrip("@"), user.first_name or "участник", now())
+    ), conn.commit()))
     return True, "Вы в игре."
 
 
-def _spy_leave(game_id,user_id):
-    return group_db_op(lambda conn:(conn.execute(
-        "DELETE FROM spy_players WHERE game_id=? AND user_id=?",(game_id,int(user_id))
-    ).rowcount>0,conn.commit())[0])
+def _spy_leave(game_id, user_id):
+    return group_db_op(lambda conn: (conn.execute(
+        "DELETE FROM spy_players WHERE game_id=? AND user_id=?", (game_id, int(user_id))
+    ).rowcount > 0, conn.commit())[0])
 
 
-def _spy_cancel(game_id):
-    return group_db_op(lambda conn:(conn.execute(
-        "UPDATE spy_games SET status='CANCELLED',updated_at=? WHERE id=? AND status='WAITING'",(now(),game_id)
-    ).rowcount>0,conn.commit())[0])
-
-
-def _spy_start_db(game_id, location, spy_id, assignments):
+def _spy_start_db(game_id, location, spy_id, assignments, order):
+    target_rounds = _spy_round_target(len(assignments))
     def op(conn):
-        for uid, role_name, is_spy in assignments:
-            conn.execute("UPDATE spy_players SET role_name=?,is_spy=1,active=1 WHERE game_id=? AND user_id=?",
-                         (role_name,int(game_id),int(uid)))
+        for idx, (uid, role_name, is_spy) in enumerate(assignments):
+            conn.execute("UPDATE spy_players SET role_name=?,is_spy=?,active=1,turn_order=? WHERE game_id=? AND user_id=?",
+                         (role_name, int(bool(is_spy)), idx, int(game_id), int(uid)))
+        first = order[0]
+        second = order[1 % len(order)]
         conn.execute(
-            "UPDATE spy_games SET status='PLAYING',phase='QUESTION',started_at=?,expires_at=?,location=?,spy_user_id=?,current_asker_id=?,current_target_id=NULL,updated_at=? WHERE id=?",
-            (now(),(datetime.now(timezone.utc)+timedelta(seconds=SPY_ROUND_SECONDS)).isoformat(),location,int(spy_id),int(assignments[0][0]),now(),int(game_id))
+            "UPDATE spy_games SET status='PLAYING',phase='QUESTION',started_at=?,expires_at=?,location=?,spy_user_id=?,current_asker_id=?,current_target_id=?,turn_count=0,round_target=?,updated_at=? WHERE id=?",
+            (now(), (datetime.now(timezone.utc) + timedelta(seconds=SPY_ROUND_SECONDS)).isoformat(), location,
+             int(spy_id), int(first), int(second), target_rounds, now(), int(game_id))
         )
         conn.commit()
     group_db_op(op)
 
 
-def _spy_abort_start(game_id):
-    def op(conn):
-        conn.execute("DELETE FROM spy_votes WHERE game_id=?", (int(game_id),))
-        conn.execute("UPDATE spy_players SET role_name='',is_spy=0 WHERE game_id=?", (int(game_id),))
-        conn.execute("UPDATE spy_games SET status='WAITING', phase='LOBBY', started_at=NULL, expires_at=NULL, location='', spy_user_id=NULL, current_asker_id=NULL, current_target_id=NULL, accusation_suspect_id=NULL, updated_at=? WHERE id=?", (now(), int(game_id)))
-        conn.commit()
-    group_db_op(op)
+async def _spy_send_card(user_id, location, role_name, is_spy):
+    if is_spy:
+        text = ("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nТы — 🕵️ ШПИОН.\n\n"
+                "Твоя задача — вычислить локацию, отвечать на вопросы и задавать их другим, не выдавая себя.\n\nХорошей игры!")
+    else:
+        text = ("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nРаунд начался.\n\n"
+                f"Локация: {location}\nТвоя роль: {role_name}\n\n"
+                "Не показывай эту информацию другим игрокам. Отвечай так, чтобы показать знание места, но не назвать его напрямую.\n\nХорошей игры!")
+    await bot.send_message(int(user_id), text)
 
 
-def _spy_vote_count(game_id,suspect_id):
-    rows=group_db_op(lambda conn: conn.execute(
-        "SELECT voter_id,suspect_id FROM spy_votes WHERE game_id=?",(game_id,)
-    ).fetchall())
-    yes=0; total=0
-    for r in rows:
-        total += 1
-        if int(r["suspect_id"]) == int(suspect_id):
-            yes += 1
-    return yes,total
-
-
-def _spy_clear_votes(game_id):
-    group_db_op(lambda conn:(conn.execute("DELETE FROM spy_votes WHERE game_id=?",(game_id,)),conn.commit()))
-
-
-def _spy_finish(game_id, winner, reason):
-    game=_spy_get_game(game_id)
-    players=_spy_players(game_id)
-    spy_id=int(game["spy_user_id"]) if game and game["spy_user_id"] else None
-    location=game["location"] if game else ""
-    group_db_op(lambda conn:(conn.execute(
-        "UPDATE spy_games SET status='FINISHED',phase='FINISHED',updated_at=? WHERE id=?",(now(),game_id)
-    ),conn.commit()))
-    return game,players,spy_id,location,winner,reason
-
-
-async def _spy_finish_message(game_id, winner, reason):
-    game,players,spy_id,location,winner,reason=_spy_finish(game_id,winner,reason)
-    if not game:
-        return
-    spy=_spy_player(game_id,spy_id) if spy_id else None
-    lines=[
-        "𝗦𝗣𝗬𝗙𝗔𝗟𝗟 — 𝗥𝗔𝗨𝗡𝗗 𝗢𝗩𝗘𝗥",
-        "",
-        f"Победили: {winner}",
-        f"Причина: {reason}",
-        f"Локация: {location}",
-        f"Шпион: {_spy_display(spy)}",
-        "",
-        "Спасибо за игру.",
-    ]
-    with suppress(Exception):
-        await bot.send_message(game["chat_id"], "\n".join(lines))
-    # Best-effort private reveal.
-    if spy_id:
-        with suppress(Exception):
-            await bot.send_message(spy_id, f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nРаунд завершён. Локация: {location}")
-
-
-async def _spy_prepare_turn_dm(game_id, asker_id):
-    game=_spy_get_game(game_id)
-    if not game or game["status"] != "PLAYING" or int(game["current_asker_id"] or 0)!=int(asker_id):
-        return
-    player=_spy_player(game_id,asker_id)
-    if not player:
-        return
-    await bot.send_message(
-        asker_id,
-        "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
-        f"Твой ход. Выбери, кому задать вопрос.\nТы играешь как: {player['role_name'] or ('ШПИОН' if player['is_spy'] else 'участник')}\n\n"
-        "После выбора цели бот попросит тебя написать вопрос.",
-        reply_markup=_spy_private_turn_keyboard(game_id,asker_id),
-    )
+def _spy_start_round_sync(game_id):
+    game = _spy_get_game(game_id)
+    players = _spy_players(game_id)
+    if not game or len(players) < SPY_MIN_PLAYERS:
+        return None, "Нужно минимум 3 участника."
+    location, role_pool = random.choice(list(SPY_LOCATIONS.items()))
+    order = [int(p["user_id"]) for p in players]
+    random.shuffle(order)
+    spy_id = random.choice(order)
+    roles = list(role_pool)
+    random.shuffle(roles)
+    assignments = []
+    ri = 0
+    for uid in order:
+        if uid == spy_id:
+            assignments.append((uid, "", True))
+        else:
+            assignments.append((uid, roles[ri % len(roles)], False))
+            ri += 1
+    _spy_start_db(game_id, location, spy_id, assignments, order)
+    return assignments, None
 
 
 async def _spy_start_round(game_id):
-    game=_spy_get_game(game_id)
-    players=_spy_players(game_id)
-    if not game or len(players)<SPY_MIN_PLAYERS:
-        return False,"Нужно минимум 3 игрока."
-    import random
-    location, role_pool = random.choice(list(SPY_LOCATIONS.items()))
-    spy=random.choice(players)
-    shuffled_roles=list(role_pool); random.shuffle(shuffled_roles)
-    assignments=[]; idx=0
-    for p in players:
-        if int(p["user_id"])==int(spy["user_id"]):
-            assignments.append((int(p["user_id"]),"ШПИОН",1))
-        else:
-            assignments.append((int(p["user_id"]),shuffled_roles[idx],0)); idx+=1
-    _spy_start_db(game_id,location,int(spy["user_id"]),assignments)
-    failures=[]
-    for uid,role_name,is_spy in assignments:
-        try:
-            await _spy_send_card(uid,location,role_name,bool(is_spy),game_id)
-        except Exception as exc:
-            failures.append((uid,repr(exc)))
-    if failures:
-        _spy_abort_start(game_id)
-        return False,"Не удалось отправить секретные карточки. Все участники должны хотя бы один раз открыть ЛС с ботом."
-    return True, "Игра началась."
+    try:
+        assignments, error = _spy_start_round_sync(game_id)
+        if error:
+            return False, error
+        for uid, role_name, is_spy in assignments:
+            try:
+                await _spy_send_card(uid, _spy_get_game(game_id)["location"], role_name, is_spy)
+            except Exception:
+                _spy_set_state(game_id, status="WAITING", phase="LOBBY", current_asker_id=None, current_target_id=None, expires_at=None)
+                group_db_op(lambda conn: (conn.execute("UPDATE spy_players SET role_name='',is_spy=0 WHERE game_id=?", (game_id,)), conn.commit()))
+                return False, "Не удалось отправить секретные карточки всем игрокам. Каждый участник должен открыть ЛС бота."
+        return True, "Игра началась."
+    except Exception:
+        logger.exception("Spy start failed")
+        return False, "Не удалось начать игру."
 
 
-async def spy_handle_deep_link(message: Message, game_id: int):
-    game=_spy_get_game(game_id)
-    if not game or game["status"] not in {"WAITING","PLAYING"}:
-        await message.answer("Эта игра уже закончилась или была отменена.")
+async def _spy_prepare_turn_dm(game_id, asker_id):
+    game = _spy_get_game(game_id)
+    asker = _spy_player(game_id, asker_id)
+    target = _spy_player(game_id, int(game["current_target_id"] or 0)) if game else None
+    if not game or not asker or not target:
         return
-    # Register user for the game if the lobby still accepts them.
-    if game["status"] == "WAITING":
-        ok,text=_spy_join(game_id,message.from_user)
-        await message.answer("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n" + (text or "Готово.") + "\n\nКогда ведущий начнёт игру, секретная карточка придёт сюда.")
-    else:
-        await message.answer("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nВы подключены к игре. Следите за сообщениями сюда — бот будет вести раунд.")
+    text = ("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
+            f"Сейчас ходит: {_spy_display(asker)}\n"
+            f"Тебе нужно задать вопрос: {_spy_display(target)}\n\n"
+            "Вопрос должен допускать ответ только «да» или «нет».")
+    await bot.send_message(int(asker_id), text, reply_markup=_spy_question_keyboard(game_id, asker_id))
+    with suppress(Exception):
+        await bot.send_message(int(game["chat_id"]),
+                               f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · Ход\n\n{_spy_display(asker)} задаёт вопрос {_spy_display(target)}.")
+
+
+async def _spy_start_discussion(game_id):
+    game = _spy_get_game(game_id)
+    if not game:
+        return
+    _spy_set_state(game_id, status="DISCUSSION", phase="DISCUSSION",
+                   expires_at=(datetime.now(timezone.utc) + timedelta(seconds=SPY_DISCUSSION_SECONDS)).isoformat())
+    with suppress(Exception):
+        await bot.send_message(int(game["chat_id"]),
+                               "𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ОБСУЖДЕНИЕ\n\nВопросы закончены. У вас 2 минуты на обсуждение. Не называйте локацию напрямую.",
+                               reply_markup=_spy_accuse_keyboard(game_id))
+
+
+async def _spy_finish_message(game_id, winner, reason):
+    game = _spy_get_game(game_id)
+    if not game:
+        return
+    players = _spy_players(game_id)
+    spy_id = int(game["spy_user_id"] or 0)
+    location = game["location"]
+    _spy_set_state(game_id, status="FINISHED", phase="FINISHED", current_asker_id=None, current_target_id=None)
+    spy = _spy_player(game_id, spy_id)
+    group_text = ("𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ФИНАЛ\n\n"
+                  f"Победитель: {winner}\n"
+                  f"Причина: {reason}\n\n"
+                  f"Локация: {location}\n"
+                  f"Шпион: {_spy_display(spy)}")
+    with suppress(Exception):
+        await bot.send_message(int(game["chat_id"]), group_text)
+    for p in players:
+        with suppress(Exception):
+            if int(p["user_id"]) == spy_id:
+                await bot.send_message(spy_id, f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nРаунд завершён.\nЛокация: {location}\nТы был шпионом.")
+            else:
+                await bot.send_message(int(p["user_id"]), f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nРаунд завершён.\nЛокация: {location}\nШпион: {_spy_display(spy)}")
+
+
+async def _spy_end_discussion_with_votes(game_id):
+    game = _spy_get_game(game_id)
+    if not game:
+        return
+    _spy_set_state(game_id, status="VOTING", phase="VOTING", expires_at=(datetime.now(timezone.utc) + timedelta(seconds=SPY_FINAL_VOTE_SECONDS)).isoformat())
+    with suppress(Exception):
+        await bot.send_message(int(game["chat_id"]),
+                               "𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ФИНАЛЬНОЕ ГОЛОСОВАНИЕ\n\nВыберите того, кого считаете шпионом.",
+                               reply_markup=_spy_accuse_keyboard(game_id))
 
 
 @dp.message(Command("spy"))
 async def spy_cmd(message: Message):
     if not require_primary_group(message):
         return
-    if not message.from_user or not is_group_admin_user(message):
-        await message.reply("𝗔𝗖𝗖𝗘𝗦𝗦\n\nЗапуск игры доступен администратору.")
+    if not is_group_admin_user(message):
         return
-    existing=_spy_open_game(message.chat.id)
+    existing = _spy_open_game(message.chat.id)
     if existing:
-        players=_spy_players(existing["id"])
-        if existing["status"]=="WAITING":
-            await message.reply(_spy_lobby_text(existing["id"]),reply_markup=_spy_lobby_keyboard(existing["id"],len(players)>=SPY_MIN_PLAYERS))
-        else:
-            await message.reply("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nСейчас уже идёт раунд.")
+        await message.reply("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nВ этом чате уже есть активная игра или лобби.",
+                            reply_markup=_spy_lobby_keyboard(existing["id"], len(_spy_players(existing["id"])) >= SPY_MIN_PLAYERS) if existing["status"] == "WAITING" else _spy_group_controls(existing["id"]))
         return
-    game=_spy_create_game(message.chat.id,message.from_user.id)
-    sent=await message.answer(_spy_lobby_text(game["id"]),reply_markup=_spy_lobby_keyboard(game["id"],False))
-    group_db_op(lambda conn:(conn.execute("UPDATE spy_games SET lobby_message_id=? WHERE id=?",(sent.message_id,game["id"])),conn.commit()))
+    game = _spy_create_game(message.chat.id, message.from_user.id)
+    sent = await message.answer(_spy_lobby_text(game["id"]), reply_markup=_spy_lobby_keyboard(game["id"], False))
     with suppress(Exception):
-        await bot.pin_chat_message(message.chat.id,sent.message_id,disable_notification=True)
+        await bot.pin_chat_message(message.chat.id, sent.message_id, disable_notification=True)
+    group_db_op(lambda conn: (conn.execute("UPDATE spy_games SET lobby_message_id=? WHERE id=?", (sent.message_id, game["id"])), conn.commit()))
+
+
+async def spy_handle_deep_link(message: Message, game_id: int):
+    game = _spy_get_game(game_id)
+    if not game or message.chat.type != "private" or not message.from_user:
+        return
+    ok, text = _spy_join(game_id, message.from_user)
+    await message.answer(f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n{text}")
+
+
+@dp.message(CommandStart(), F.chat.type == "private")
+async def spy_start_deep_link(message: Message):
+    text = message.text or ""
+    m = re.match(r"^/start\s+spy_(\d+)$", text, flags=re.IGNORECASE)
+    if m:
+        await spy_handle_deep_link(message, int(m.group(1)))
 
 
 @dp.callback_query(F.data.startswith("sp:"))
 async def spy_callback(callback: CallbackQuery):
-    if not callback.message or callback.message.chat.type not in {"group","supergroup","private"}:
+    parts = (callback.data or "").split(":")
+    if len(parts) < 3:
         await callback.answer(); return
-    parts=(callback.data or "").split(":")
-    action=parts[1] if len(parts)>1 else ""
-    try: game_id=int(parts[2])
-    except Exception:
-        await callback.answer("Некорректная игра.",show_alert=True); return
-    game=_spy_get_game(game_id)
+    try:
+        action = parts[1]; game_id = int(parts[2]); uid = int(callback.from_user.id)
+    except (ValueError, TypeError):
+        await callback.answer("Некорректное действие.", show_alert=True); return
+    game = _spy_get_game(game_id)
     if not game:
-        await callback.answer("Игра не найдена.",show_alert=True); return
-    uid=int(callback.from_user.id)
-
-    if action=="join":
-        if callback.message.chat.id != game["chat_id"]: await callback.answer("Не тот чат.",show_alert=True); return
-        ok,text=_spy_join(game_id,callback.from_user)
-        players=_spy_players(game_id)
+        await callback.answer("Игра не найдена.", show_alert=True); return
+    if action == "rules":
+        await callback.answer("Один вопрос → да/нет → следующий игрок задаёт вопрос. После 2–3 кругов — обсуждение и голосование. Шпион может в любой момент попытаться назвать локацию.", show_alert=True); return
+    if action == "join":
+        if callback.message.chat.id != game["chat_id"] or game["status"] != "WAITING":
+            await callback.answer("Игра уже началась.", show_alert=True); return
+        ok, text = _spy_join(game_id, callback.from_user)
+        players = _spy_players(game_id)
         await callback.answer(text or "Готово.")
         with suppress(Exception):
-            await callback.message.edit_text(_spy_lobby_text(game_id),reply_markup=_spy_lobby_keyboard(game_id,len(players)>=SPY_MIN_PLAYERS))
-        # Best-effort: let the participant know they must open the bot once if DM is unavailable.
-        with suppress(Exception):
-            await bot.send_message(uid,"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nВы зарегистрированы в игре. Дождитесь старта.")
+            await callback.message.edit_text(_spy_lobby_text(game_id), reply_markup=_spy_lobby_keyboard(game_id, len(players) >= SPY_MIN_PLAYERS))
         return
-    if action=="leave":
-        if callback.message.chat.id != game["chat_id"]: await callback.answer(); return
-        _spy_leave(game_id,uid)
-        players=_spy_players(game_id)
+    if action == "leave":
+        _spy_leave(game_id, uid)
+        players = _spy_players(game_id)
         await callback.answer("Вы вышли.")
-        with suppress(Exception): await callback.message.edit_text(_spy_lobby_text(game_id),reply_markup=_spy_lobby_keyboard(game_id,len(players)>=SPY_MIN_PLAYERS))
+        with suppress(Exception):
+            await callback.message.edit_text(_spy_lobby_text(game_id), reply_markup=_spy_lobby_keyboard(game_id, len(players) >= SPY_MIN_PLAYERS))
         return
-    if action=="cancel":
-        if uid!=int(game["created_by"]) and uid!=ADMIN_ID:
-            await callback.answer("Нет доступа.",show_alert=True); return
-        _spy_cancel(game_id)
-        with suppress(Exception): await callback.message.edit_text("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nЛобби отменено.",reply_markup=None)
-        await callback.answer("Лобби отменено.")
-        return
-    if action=="start":
-        if uid!=int(game["created_by"]) and uid!=ADMIN_ID:
-            await callback.answer("Начать игру может только ведущий или администратор.",show_alert=True); return
-        players=_spy_players(game_id)
-        if len(players)<SPY_MIN_PLAYERS:
-            await callback.answer("Нужно минимум 3 участника.",show_alert=True); return
-        ok,msg=await _spy_start_round(game_id)
+    if action == "cancel":
+        if uid != int(game["created_by"]) and uid != ADMIN_ID:
+            await callback.answer("Нет доступа.", show_alert=True); return
+        _spy_set_state(game_id, status="CANCELLED", phase="FINISHED")
+        with suppress(Exception): await callback.message.edit_text("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nЛобби отменено.", reply_markup=None)
+        with suppress(Exception): await bot.unpin_chat_message(callback.message.chat.id, callback.message.message_id)
+        await callback.answer("Лобби отменено."); return
+    if action == "start":
+        if uid != int(game["created_by"]) and uid != ADMIN_ID:
+            await callback.answer("Начать игру может только ведущий или администратор.", show_alert=True); return
+        if game["status"] != "WAITING":
+            await callback.answer("Игра уже запущена.", show_alert=True); return
+        players = _spy_players(game_id)
+        if len(players) < SPY_MIN_PLAYERS:
+            await callback.answer("Нужно минимум 3 участника.", show_alert=True); return
+        ok, msg = await _spy_start_round(game_id)
         if not ok:
-            await callback.answer(msg,show_alert=True)
-            return
-        _spy_set_state(game_id,phase="QUESTION")
-        with suppress(Exception):
-            await bot.unpin_chat_message(callback.message.chat.id, callback.message.message_id)
-        with suppress(Exception):
-            await callback.message.edit_text(
-                "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
-                f"Раунд начался. Время: 8 минут.\nПервый ход: {_spy_display(_spy_player(game_id, _spy_get_game(game_id)['current_asker_id']))}\n\n"
-                "Секретные роли отправлены в ЛС. Вопросы и ответы будут публиковаться ботом в общий чат.",
-                reply_markup=_spy_group_controls(game_id),
-            )
+            await callback.answer(msg, show_alert=True); return
+        with suppress(Exception): await bot.unpin_chat_message(callback.message.chat.id, callback.message.message_id)
+        with suppress(Exception): await callback.message.edit_text(
+            "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nРаунд начался.\nСписок игроков определён.\nСекретные роли отправлены в ЛС.\nИгра закрыта для новых участников.",
+            reply_markup=_spy_group_controls(game_id))
         await _spy_prepare_turn_dm(game_id, _spy_get_game(game_id)["current_asker_id"])
-        await callback.answer("Игра началась.")
-        return
-    if action=="target":
-        if callback.message.chat.type!="private" or len(parts)!=4: await callback.answer(); return
-        target_id=int(parts[3])
-        state=_spy_current_status(game_id)
-        if not state or state["phase"]!="QUESTION" or int(state["current_asker_id"] or 0)!=uid:
-            await callback.answer("Сейчас не ваш ход.",show_alert=True); return
-        target=_spy_player(game_id,target_id)
+        await callback.answer("Игра началась."); return
+    if action == "ask":
+        if callback.message.chat.type != "private" or int(game["current_asker_id"] or 0) != uid or game["phase"] != "QUESTION":
+            await callback.answer("Сейчас не ваш ход.", show_alert=True); return
+        target = _spy_player(game_id, int(game["current_target_id"] or 0))
         if not target:
-            await callback.answer("Игрок не найден.",show_alert=True); return
-        _spy_set_state(game_id,phase="ASKING",current_target_id=target_id)
-        await callback.message.answer(f"Задай вопрос для {_spy_display(target)}.\n\nНапиши его обычным сообщением сюда, в ЛС боту.")
-        with suppress(Exception): await bot.send_message(target_id,"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nТебе сейчас зададут вопрос. Ожидай сообщение бота.")
-        await callback.answer("Цель выбрана.")
-        return
-    if action=="guess":
-        if callback.message.chat.type!="private" or uid!=int(game["spy_user_id"] or 0):
-            await callback.answer("Эта кнопка только для шпиона.",show_alert=True); return
-        _spy_set_state(game_id,phase="GUESS")
+            await callback.answer("Цель не найдена.", show_alert=True); return
+        _spy_set_state(game_id, phase="ASKING")
+        await callback.message.answer(f"Напиши ОДИН вопрос для {_spy_display(target)}. На него должен быть возможен ответ только «да» или «нет».")
+        await callback.answer("Ход подтверждён."); return
+    if action == "answer":
+        if callback.message.chat.type != "private" or game["phase"] != "ANSWERING" or int(game["current_target_id"] or 0) != uid:
+            await callback.answer("Сейчас не ваш ответ.", show_alert=True); return
+        val = parts[3] == "1" if len(parts) > 3 else False
+        asker = _spy_player(game_id, int(game["current_asker_id"] or 0))
+        target = _spy_player(game_id, uid)
+        ans = "Да" if val else "Нет"
+        with suppress(Exception): await bot.send_message(int(game["chat_id"]), f"💬 {_spy_display(target)} → {ans}")
+        next_asker = target
+        next_target = _spy_next_player(game_id, uid)
+        group_db_op(lambda conn: (
+            conn.execute("UPDATE spy_games SET current_asker_id=?, current_target_id=?, phase='QUESTION', turn_count=turn_count+1, updated_at=? WHERE id=?",
+                         (int(next_asker["user_id"]), int(next_target["user_id"]), now(), game_id)), conn.commit()))
+        with suppress(Exception):
+            await callback.message.edit_reply_markup(reply_markup=None)
+        updated = _spy_get_game(game_id)
+        if int(updated["turn_count"] or 0) >= len(_spy_players(game_id)) * int(updated["round_target"] or 2):
+            await _spy_start_discussion(game_id)
+        else:
+            await _spy_prepare_turn_dm(game_id, int(next_asker["user_id"]))
+            with suppress(Exception):
+                await bot.send_message(int(game["chat_id"]), f"➡️ Следующий ход: {_spy_display(next_asker)} → {_spy_display(next_target)}")
+        await callback.answer("Ответ принят. Следующий ход запущен."); return
+    if action == "guess":
+        if callback.message.chat.type != "private" or uid != int(game["spy_user_id"] or 0) or game["status"] != "PLAYING":
+            await callback.answer("Эта кнопка доступна только шпиону.", show_alert=True); return
+        _spy_set_state(game_id, phase="GUESS")
         await callback.message.answer("Напиши название локации одним сообщением.")
-        await callback.answer()
-        return
-    if action=="accuse_menu":
-        await callback.answer("Выбери подозреваемого в следующем сообщении.")
-        with suppress(Exception): await callback.message.answer("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nКого обвиняешь?",reply_markup=_spy_accuse_keyboard(game_id,uid))
-        return
-    if action=="accuse":
-        if callback.message.chat.type not in {"group","supergroup"}: await callback.answer(); return
-        suspect_id=int(parts[3])
-        if not _spy_player(game_id,uid) or not _spy_player(game_id,suspect_id): await callback.answer("Участник не найден.",show_alert=True); return
-        if uid==suspect_id: await callback.answer("Нельзя обвинить себя.",show_alert=True); return
-        _spy_clear_votes(game_id)
-        _spy_set_state(game_id,phase="VOTING",accusation_suspect_id=suspect_id)
-        await callback.message.answer(f"𝗩𝗢𝗧𝗘\n\nПодозреваемый: {_spy_display(_spy_player(game_id,suspect_id))}\nКаждый участник голосует один раз.",reply_markup=_spy_vote_keyboard(game_id,suspect_id))
-        await callback.answer("Голосование началось.")
-        return
-    if action=="vote":
-        suspect_id=int(parts[3]); yes=parts[4]=="1"
-        state=_spy_current_status(game_id)
-        if not state or state["phase"]!="VOTING": await callback.answer("Голосование уже закрыто.",show_alert=True); return
-        if not _spy_player(game_id,uid) or uid==suspect_id: await callback.answer("Недоступно.",show_alert=True); return
-        group_db_op(lambda conn:(conn.execute("INSERT OR REPLACE INTO spy_votes(game_id,voter_id,suspect_id,created_at) VALUES(?,?,?,?)",(game_id,uid,suspect_id if yes else -1,now())),conn.commit()))
-        yes_votes,total_votes=_spy_vote_count(game_id,suspect_id)
-        needed=(len(_spy_players(game_id))-1)//2+1
-        await callback.answer("Голос принят.")
-        if yes_votes>=needed:
-            suspect=_spy_player(game_id,suspect_id)
-            if suspect and int(suspect["is_spy"]):
-                await _spy_finish_message(game_id,"остальные игроки",f"Шпион найден: {_spy_display(suspect)}")
+        await callback.answer(); return
+    if action == "accuse_menu":
+        if game["phase"] not in {"PLAYING", "DISCUSSION", "VOTING"}:
+            await callback.answer("Сейчас нельзя обвинять.", show_alert=True); return
+        await callback.message.answer("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nКого подозреваешь?", reply_markup=_spy_accuse_keyboard(game_id, uid))
+        await callback.answer(); return
+    if action == "accuse":
+        if not _spy_player(game_id, uid):
+            await callback.answer("Ты не участник этой игры.", show_alert=True); return
+        suspect_id = int(parts[3])
+        if suspect_id == uid:
+            await callback.answer("Нельзя выбрать себя.", show_alert=True); return
+        _spy_set_state(game_id, phase="VOTING", status="VOTING", accusation_suspect_id=suspect_id,
+                       expires_at=(datetime.now(timezone.utc)+timedelta(seconds=SPY_FINAL_VOTE_SECONDS)).isoformat())
+        group_db_op(lambda conn: (conn.execute("DELETE FROM spy_votes WHERE game_id=?", (game_id,)), conn.commit()))
+        await callback.message.answer(f"𝗩𝗢𝗧𝗘\n\nПодозреваемый: {_spy_display(_spy_player(game_id, suspect_id))}", reply_markup=_spy_vote_keyboard(game_id, suspect_id))
+        await callback.answer("Голосование началось."); return
+    if action == "vote":
+        suspect_id = int(parts[3]); yes = parts[4] == "1"
+        if game["phase"] != "VOTING" or uid == suspect_id or not _spy_player(game_id, uid):
+            await callback.answer("Недоступно.", show_alert=True); return
+        group_db_op(lambda conn: (conn.execute("INSERT OR REPLACE INTO spy_votes(game_id,voter_id,suspect_id,created_at) VALUES(?,?,?,?)", (game_id, uid, suspect_id if yes else -1, now())), conn.commit()))
+        players = _spy_players(game_id)
+        votes = group_db_op(lambda conn: conn.execute("SELECT voter_id,suspect_id FROM spy_votes WHERE game_id=?", (game_id,)).fetchall())
+        eligible = len(players) - 1
+        yes_count = sum(1 for r in votes if int(r["suspect_id"]) == suspect_id)
+        if yes_count > eligible / 2 or len(votes) >= eligible:
+            suspect = _spy_player(game_id, suspect_id)
+            if yes_count > eligible / 2:
+                if int(suspect["is_spy"]):
+                    await _spy_finish_message(game_id, "мирные игроки", f"Шпион найден: {_spy_display(suspect)}")
+                else:
+                    await _spy_finish_message(game_id, "шпион", f"Обвинён невиновный: {_spy_display(suspect)}")
             else:
-                await _spy_finish_message(game_id,"шпион",f"Обвинён невиновный: {_spy_display(suspect)}")
-        elif total_votes>=len(_spy_players(game_id))-1:
-            _spy_set_state(game_id,phase="QUESTION",accusation_suspect_id=None)
-            await bot.send_message(game["chat_id"],"𝗩𝗢𝗧𝗘\n\nБольшинства нет. Раунд продолжается.")
+                await _spy_finish_message(game_id, "шпион", "Большинства за обвинение нет.")
+        else:
+            await callback.answer("Голос принят.")
         return
+    await callback.answer()
 
 
-@dp.message(F.chat.type=="private", F.text)
+@dp.message(F.chat.type == "private", F.text)
 async def spy_private_text(message: Message):
     if not message.from_user or not message.text or message.text.startswith("/"):
         return
-    # Do not interfere with existing FSM-driven anonymous/admin flows.
-    if not is_primary_chat(PRIMARY_CHAT_ID):
-        return
-    games=group_db_op(lambda conn: conn.execute(
-        "SELECT * FROM spy_games WHERE status='PLAYING' AND (current_asker_id=? OR spy_user_id=?) ORDER BY id DESC LIMIT 1",
-        (message.from_user.id,message.from_user.id)
+    games = group_db_op(lambda conn: conn.execute(
+        "SELECT * FROM spy_games WHERE status IN ('PLAYING','DISCUSSION','VOTING') AND (current_asker_id=? OR current_target_id=? OR spy_user_id=?) ORDER BY id DESC LIMIT 1",
+        (message.from_user.id, message.from_user.id, message.from_user.id)
     ).fetchone())
     if not games:
         return
-    game=games
-    uid=int(message.from_user.id)
-    phase=game["phase"]
-    if phase=="ASKING" and int(game["current_asker_id"] or 0)==uid:
-        target=_spy_player(game["id"],int(game["current_target_id"] or 0))
+    game = games; uid = int(message.from_user.id)
+    if game["phase"] == "ASKING" and int(game["current_asker_id"] or 0) == uid:
+        text = (message.text or "").strip()
+        if not text or not text.endswith("?"):
+            await message.answer("Пожалуйста, напиши один вопрос, который можно ответить только «да» или «нет».")
+            return
+        target = _spy_player(game["id"], int(game["current_target_id"] or 0))
         if not target:
             return
-        question=(message.text or "").strip()
-        if not question:
-            return
-        await bot.send_message(game["chat_id"],f"❓ {_spy_display(_spy_player(game['id'],uid))} → {_spy_display(target)}\n\n{question}")
-        _spy_set_state(game["id"],phase="ANSWERING")
-        with suppress(Exception): await bot.send_message(target["user_id"],"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nНапиши ответ на вопрос одним сообщением сюда, в ЛС боту.")
+        await bot.send_message(int(game["chat_id"]), f"❓ {_spy_display(_spy_player(game['id'], uid))} → {_spy_display(target)}\n\n{text}")
+        _spy_set_state(game["id"], phase="ANSWERING")
+        await bot.send_message(int(target["user_id"]), "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nТебе задали вопрос. Ответь кнопкой:", reply_markup=_spy_answer_keyboard(game["id"]))
         return
-    if phase=="ANSWERING" and int(game["current_target_id"] or 0)==uid:
-        answer=(message.text or "").strip()
-        if not answer:
-            return
-        asker=_spy_player(game["id"],int(game["current_asker_id"] or 0))
-        await bot.send_message(game["chat_id"],f"💬 {_spy_display(_spy_player(game['id'],uid))}\n\n{answer}")
-        _spy_set_state(game["id"],phase="QUESTION",current_asker_id=uid,current_target_id=None)
-        await _spy_prepare_turn_dm(game["id"],uid)
-        return
-    if phase=="GUESS" and int(game["spy_user_id"] or 0)==uid:
-        guess=(message.text or "").strip()
-        if unicodedata.normalize("NFKC",guess).casefold()==unicodedata.normalize("NFKC",game["location"]).casefold():
-            await _spy_finish_message(game["id"],"шпион",f"Шпион правильно назвал локацию: {game['location']}")
+    if game["phase"] == "GUESS" and int(game["spy_user_id"] or 0) == uid:
+        guess = (message.text or "").strip()
+        if unicodedata.normalize("NFKC", guess).casefold() == unicodedata.normalize("NFKC", game["location"]).casefold():
+            await _spy_finish_message(game["id"], "шпион", f"Шпион правильно назвал локацию: {game['location']}")
         else:
-            await _spy_finish_message(game["id"],"остальные игроки",f"Шпион ошибся с локацией. Его вариант: {guess}")
-        return
+            await _spy_finish_message(game["id"], "мирные игроки", f"Шпион ошибся с локацией. Его вариант: {guess}")
 
 
 async def _spy_recovery_worker():
     await asyncio.sleep(5)
     while True:
         try:
-            games=group_db_op(lambda conn: conn.execute("SELECT * FROM spy_games WHERE status='PLAYING'").fetchall())
-            now_dt=datetime.now(timezone.utc)
+            games = group_db_op(lambda conn: conn.execute("SELECT * FROM spy_games WHERE status IN ('PLAYING','DISCUSSION','VOTING')").fetchall())
+            now_dt = datetime.now(timezone.utc)
             for game in games:
-                if game["expires_at"]:
-                    try:
-                        expires=datetime.fromisoformat(game["expires_at"])
-                        if expires.tzinfo is None: expires=expires.replace(tzinfo=timezone.utc)
-                        if expires<=now_dt:
-                            await _spy_finish_message(int(game["id"]),"шпион", "Время раунда вышло.")
-                    except Exception:
-                        logger.exception("Spy recovery expiry failed | game=%s",game["id"])
+                if not game["expires_at"]:
+                    continue
+                try:
+                    expires = datetime.fromisoformat(game["expires_at"])
+                    if expires.tzinfo is None:
+                        expires = expires.replace(tzinfo=timezone.utc)
+                    if expires > now_dt:
+                        continue
+                    if game["phase"] == "PLAYING" or game["phase"] in {"QUESTION", "ASKING", "ANSWERING"}:
+                        await _spy_start_discussion(int(game["id"]))
+                    elif game["phase"] == "DISCUSSION":
+                        await _spy_end_discussion_with_votes(int(game["id"]))
+                    elif game["phase"] == "VOTING":
+                        await _spy_finish_message(int(game["id"]), "шпион", "Время голосования вышло.")
+                except Exception:
+                    logger.exception("Spy recovery expiry failed | game=%s", game["id"])
+        except asyncio.CancelledError:
+            raise
         except Exception:
             logger.exception("Spy recovery worker failed")
         await asyncio.sleep(5)
@@ -7195,6 +7204,7 @@ async def main():
     seed_default_games()
     migrate_group_state()
 
+    _spy_ensure_schema()
     asyncio.create_task(_spy_recovery_worker())
 
     DELIVERY_QUEUE = asyncio.Queue()
