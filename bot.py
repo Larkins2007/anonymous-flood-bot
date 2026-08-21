@@ -7015,15 +7015,20 @@ def _spy_guess_keyboard(game_id):
     ]])
 
 
-def _spy_question_keyboard(game_id, asker_id):
+def _spy_question_keyboard(game_id, asker_id, turn_no=None):
     game = _spy_get_game(game_id)
     if not game or game["phase"] != "QUESTION" or int(game["current_asker_id"] or 0) != int(asker_id):
         return InlineKeyboardMarkup(inline_keyboard=[])
     target = _spy_player(game_id, int(game["current_target_id"] or 0))
     if not target:
         return InlineKeyboardMarkup(inline_keyboard=[])
+    if turn_no is None:
+        turn_no = int(game["turn_count"] or 0) + 1
     return InlineKeyboardMarkup(inline_keyboard=[[
-        InlineKeyboardButton(text=f"❓ Задать вопрос {_spy_display(target)}", callback_data=f"sp:ask:{int(game_id)}")
+        InlineKeyboardButton(
+            text=f"❓ Задать вопрос {_spy_display(target)}",
+            callback_data=f"sp:ask:{int(game_id)}:{int(turn_no)}",
+        )
     ]])
 
 
@@ -7108,22 +7113,28 @@ def _spy_round_summary_text(game_id, round_no):
 
 
 async def _spy_send_round_summary(game_id, round_no):
+    """Send only the essential round event to the group. Full Q&A stays out of chat."""
     game = _spy_get_game(game_id)
     if not game:
         return
     if int(game["summary_sent_round"] or 0) >= int(round_no):
         return
-    text = _spy_round_summary_text(game_id, round_no)
-    if not text:
-        return
-    sent_ok = False
+    row = group_db_op(lambda conn: conn.execute(
+        "SELECT COUNT(*) AS c FROM spy_turns WHERE game_id=? AND round_no=?",
+        (int(game_id), int(round_no)),
+    ).fetchone())
+    count = int(row["c"] or 0) if row else 0
     try:
-        await bot.send_message(int(game["chat_id"]), text)
-        sent_ok = True
+        await bot.send_message(
+            int(game["chat_id"]),
+            f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · КРУГ {round_no} ЗАВЕРШЁН\n\n"
+            f"Вопросов сыграно: {count}.\n"
+            "Переходим к следующему этапу.",
+        )
     except Exception:
-        logger.exception("Spy round summary delivery failed | game=%s round=%s", game_id, round_no)
-    if sent_ok:
-        _spy_set_state(game_id, summary_sent_round=int(round_no))
+        logger.exception("Spy round event delivery failed | game=%s round=%s", game_id, round_no)
+        return
+    _spy_set_state(game_id, summary_sent_round=int(round_no))
 
 
 def _spy_set_state(game_id, **fields):
@@ -7382,7 +7393,7 @@ async def _spy_prepare_turn_dm(game_id, asker_id):
         f"Твой ход.\nТы задаёшь вопрос: {_spy_display(target)}\n\n"
         "Сформулируй вопрос на конце со знаком «?».\n"
         "На него должно быть возможно ответить только «Да» или «Нет».",
-        reply_markup=_spy_question_keyboard(game_id, asker_id),
+        reply_markup=_spy_question_keyboard(game_id, asker_id, turn_no),
     )
     with suppress(Exception):
         await bot.edit_message_text(
@@ -7455,7 +7466,12 @@ async def _spy_start_discussion(game_id):
 
 def _spy_vote_snapshot(game_id):
     return group_db_op(lambda conn: conn.execute(
-        "SELECT suspect_id, COUNT(*) AS c FROM spy_votes WHERE game_id=? GROUP BY suspect_id ORDER BY c DESC, suspect_id",
+        """SELECT v.suspect_id, COUNT(*) AS c
+             FROM spy_votes v
+             JOIN spy_players voter ON voter.game_id=v.game_id AND voter.user_id=v.voter_id
+             JOIN spy_players suspect ON suspect.game_id=v.game_id AND suspect.user_id=v.suspect_id
+            WHERE v.game_id=? AND voter.active=1 AND suspect.active=1
+            GROUP BY v.suspect_id ORDER BY c DESC, v.suspect_id""",
         (int(game_id),),
     ).fetchall())
 
@@ -7468,11 +7484,12 @@ def _spy_vote_result(game_id):
         return {"winner": None, "tie": False, "majority": False, "total": 0, "active": active_count}
     top = int(rows[0]["c"])
     leaders = [int(r["suspect_id"]) for r in rows if int(r["c"]) == top]
-    majority = top > active_count / 2
+    majority = top * 2 > active_count
+    winner = leaders[0] if len(leaders) == 1 and majority else None
     return {
-        "winner": leaders[0] if majority and len(leaders) == 1 else None,
-        "tie": len(leaders) > 1,
-        "majority": majority and len(leaders) == 1,
+        "winner": winner,
+        "tie": len(leaders) > 1 or (not majority and len(leaders) == 1),
+        "majority": winner is not None,
         "total": total_votes,
         "active": active_count,
     }
@@ -7718,56 +7735,134 @@ def _spy_find_player_for_command(game_id: int, raw_target: str):
 
 
 async def _spy_force_resume_after_kick(game_id: int, kicked_id: int):
-    """Repair the current turn after an admin removes a player mid-game."""
+    """Rebuild all transient game state after an admin removes an active player.
+
+    The permanent turn order is preserved, while the current question cycle is
+    restarted from a valid active player whenever the removed participant was part
+    of the in-flight turn. This prevents stale current_asker/current_target IDs and
+    mismatched cycle_expected_turns after the active player count changes.
+    """
     game = _spy_get_game(game_id)
     if not game or game["status"] not in {"PLAYING", "DISCUSSION", "VOTING"}:
         return
 
     active = _spy_players(game_id, active_only=True)
     if len(active) < SPY_MIN_PLAYERS:
-        await _spy_finish_message(game_id, "мирные игроки", "Игра остановлена: после кика осталось меньше 3 активных игроков.")
+        await _spy_finish_message(
+            game_id,
+            "мирные игроки",
+            "Игра остановлена: после кика осталось меньше 3 активных игроков.",
+        )
         return
 
-    # If a player was voting, simply remove their vote. The remaining voters can continue.
-    if game["phase"] == "VOTING":
+    phase = str(game["phase"] or "")
+
+    # Voting: remove the kicked participant everywhere. If everyone who remains
+    # has already voted, resolve immediately instead of waiting for the timer.
+    if phase == "VOTING":
         group_db_op(lambda conn: (
-            conn.execute("DELETE FROM spy_votes WHERE game_id=? AND (voter_id=? OR suspect_id=?)", (int(game_id), int(kicked_id), int(kicked_id))),
+            conn.execute(
+                "DELETE FROM spy_votes WHERE game_id=? AND (voter_id=? OR suspect_id=?)",
+                (int(game_id), int(kicked_id), int(kicked_id)),
+            ),
             conn.commit(),
         ))
+        current = _spy_get_game(game_id)
+        result = _spy_vote_result(game_id)
+        if (
+            current
+            and current["status"] == "VOTING"
+            and current["phase"] == "VOTING"
+            and int(current["vote_session"] or 0) == int(game["vote_session"] or 0)
+            and result["total"] >= result["active"]
+        ):
+            await _spy_resolve_vote_session(game_id, int(current["vote_session"] or 0))
+        else:
+            # Refresh the pinned control message so removed candidates disappear.
+            with suppress(Exception):
+                if current and current["lobby_message_id"]:
+                    await bot.edit_message_text(
+                        chat_id=int(current["chat_id"]),
+                        message_id=int(current["lobby_message_id"]),
+                        text=(
+                            "𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ГОЛОСОВАНИЕ\n\n"
+                            f"Раунд {int(current['vote_round'] or 0) + 1}/{SPY_MAX_VOTE_ROUNDS}.\n"
+                            "Выберите подозреваемого. Голос можно изменить до завершения голосования.\n\n"
+                            "○ — нет голосов\n● — есть голоса"
+                        ),
+                        reply_markup=_spy_vote_keyboard(game_id, int(current["vote_session"] or 0)),
+                    )
         return
 
-    # Discussion can continue without the removed player; the recovery worker will handle its deadline.
-    if game["phase"] == "DISCUSSION":
+    # Discussion has no turn owner, so the remaining discussion is still valid.
+    if phase == "DISCUSSION":
         return
 
-    # A kicked asker/target can leave the state pointing at a dead user. Start a clean turn
-    # from the first active player after the kicked player, preserving the existing round count.
+    # During the reveal/final-guess phases a non-spy admin kick can change the
+    # win condition. Re-evaluate it immediately instead of leaving a dead game.
+    if phase == "GUESS":
+        current = _spy_get_game(game_id)
+        remaining_spies = _spy_spies(game_id, active_only=True)
+        civilians = len([p for p in _spy_players(game_id) if int(p["is_spy"] or 0) == 0])
+        if not remaining_spies:
+            await _spy_finish_message(game_id, "мирные игроки", "После исключения активных шпионов не осталось.")
+        elif len(remaining_spies) >= civilians:
+            await _spy_finish_message(game_id, "шпионы", "После исключения шпионов стало не меньше, чем мирных игроков.")
+        return
+
+    if phase == "FINAL_GUESS":
+        remaining_spies = _spy_spies(game_id, active_only=True)
+        civilians = len([p for p in _spy_players(game_id) if int(p["is_spy"] or 0) == 0])
+        if not remaining_spies:
+            await _spy_finish_message(game_id, "мирные игроки", "Активных шпионов не осталось.")
+        elif len(remaining_spies) >= civilians:
+            await _spy_finish_message(game_id, "шпионы", "После исключения шпионов стало не меньше, чем мирных игроков.")
+        return
+
     asker_id = int(game["current_asker_id"] or 0)
     target_id = int(game["current_target_id"] or 0)
-    if asker_id != kicked_id and target_id != kicked_id:
+    if kicked_id not in {asker_id, target_id}:
         return
 
-    # Use the permanent turn order (including the kicked row) to find the
-    # first active player after the removed participant.
-    all_players = _spy_players(game_id, active_only=False)
-    next_asker = None
-    kicked_index = next((i for i, p in enumerate(all_players) if int(p["user_id"]) == int(kicked_id)), None)
-    if kicked_index is not None:
+    # Cancel the unfinished turn. Nothing is counted until an answer is accepted.
+    # This is important for ANSWERING: a removed target must not leave an asker
+    # waiting on a dead callback forever.
+    if asker_id == kicked_id:
+        anchor_id = int(kicked_id)
+        next_asker = None
+        all_players = _spy_players(game_id, active_only=False)
+        try:
+            anchor_index = next(i for i, p in enumerate(all_players) if int(p["user_id"]) == anchor_id)
+        except StopIteration:
+            anchor_index = -1
         for step in range(1, len(all_players) + 1):
-            candidate = all_players[(kicked_index + step) % len(all_players)]
+            candidate = all_players[(anchor_index + step) % len(all_players)]
             if int(candidate["active"] or 0):
                 next_asker = candidate
                 break
-    if not next_asker:
-        next_asker = active[0]
+    else:
+        # The asker survives, so let the same asker start a fresh question to
+        # the next active player. The previously pending question is discarded.
+        next_asker = _spy_player(game_id, asker_id)
+
+    if not next_asker or not int(next_asker["active"] or 0):
+        return
+
     next_target = _spy_next_player(game_id, int(next_asker["user_id"]))
     if not next_target:
         return
+
+    current_count = int(game["turn_count"] or 0)
+    # Rebase the current cycle to the new active roster. This avoids a stale
+    # 5-player expectation surviving after the game has become a 4-player game.
     _spy_set_state(
         game_id,
+        status="PLAYING",
         phase="QUESTION",
         current_asker_id=int(next_asker["user_id"]),
         current_target_id=int(next_target["user_id"]),
+        cycle_start_turn=current_count,
+        cycle_expected_turns=len(active),
         expires_at=(datetime.now(timezone.utc) + timedelta(seconds=SPY_ROUND_SECONDS)).isoformat(),
     )
     await _spy_prepare_turn_dm(game_id, int(next_asker["user_id"]))
@@ -7798,9 +7893,23 @@ async def spy_kick_cmd(message: Message):
 
     game_id = int(game["id"])
     target_id = int(target["user_id"])
+    was_spy = int(target["is_spy"] or 0) == 1
+
+    if was_spy and game["status"] in {"PLAYING", "DISCUSSION", "VOTING"}:
+        with suppress(Exception):
+            await bot.send_message(
+                message.chat.id,
+                "𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ШПИОН РАСКРЫТ\n\n"
+                f"Администратор исключил {_spy_display(target)}.\n"
+                "Это оказался шпион. Ему даётся 60 секунд на последнюю попытку угадать локацию.",
+            )
+        await _spy_resolve_accusation(game_id, target_id)
+        await message.reply(f"{_spy_display(target)} оказался шпионом. Запущена финальная попытка угадать локацию.")
+        return
+
     group_db_op(lambda conn: (
         conn.execute("UPDATE spy_players SET active=0 WHERE game_id=? AND user_id=?", (game_id, target_id)),
-        conn.execute("DELETE FROM spy_votes WHERE game_id=? AND voter_id=?", (game_id, target_id)),
+        conn.execute("DELETE FROM spy_votes WHERE game_id=? AND (voter_id=? OR suspect_id=?)", (game_id, target_id, target_id)),
         conn.commit(),
     ))
     with suppress(Exception):
@@ -8112,12 +8221,24 @@ async def spy_callback(callback: CallbackQuery):
             return
         async with _spy_game_lock(game_id):
             current = _spy_get_game(game_id)
-            if not current or int(current["current_asker_id"] or 0) != uid or current["phase"] != "QUESTION":
-                await callback.answer("Сейчас не ваш ход.", show_alert=True)
+            try:
+                callback_turn_no = int(parts[3])
+            except (ValueError, IndexError):
+                await callback.answer("Эта кнопка устарела. Открой последнее сообщение о ходе.", show_alert=True)
+                return
+            expected_turn_no = int(current["turn_count"] or 0) + 1 if current else 0
+            if (
+                not current
+                or int(current["current_asker_id"] or 0) != uid
+                or current["phase"] != "QUESTION"
+                or callback_turn_no != expected_turn_no
+            ):
+                await callback.answer("Сейчас не ваш ход. Открой последнее сообщение о ходе.", show_alert=True)
                 return
             target = _spy_player(game_id, int(current["current_target_id"] or 0))
-            if not target:
-                await callback.answer("Цель не найдена.", show_alert=True)
+            if not target or not int(target["active"] or 0):
+                await callback.answer("Цель больше не участвует. Ход будет перестроен.", show_alert=True)
+                await _spy_force_resume_after_kick(game_id, int(current["current_target_id"] or 0))
                 return
             _spy_set_state(game_id, phase="ASKING")
             await callback.message.answer(
@@ -8154,8 +8275,7 @@ async def spy_callback(callback: CallbackQuery):
             answer = "Да" if value else "Нет"
             _spy_complete_turn_answer(game_id, callback_turn_no, answer)
             new_count = callback_turn_no
-            with suppress(Exception):
-                await bot.send_message(int(game["chat_id"]), f"💬 {_spy_display(target)} → {answer}")
+            # Answer is private game data; the pinned panel/round state is enough for the group.
             with suppress(Exception):
                 await callback.message.edit_reply_markup(reply_markup=None)
     
@@ -8468,7 +8588,7 @@ async def _spy_recovery_worker():
     while True:
         try:
             games = group_db_op(lambda conn: conn.execute(
-                "SELECT * FROM spy_games WHERE status IN ('PLAYING','DISCUSSION','VOTING')"
+                "SELECT * FROM spy_games WHERE status IN ('STARTING','PLAYING','DISCUSSION','VOTING')"
             ).fetchall())
             current = datetime.now(timezone.utc)
             for game in games:
@@ -8491,6 +8611,27 @@ async def _spy_recovery_worker():
                         if expires2 > datetime.now(timezone.utc):
                             continue
                         phase = str(current_game["phase"] or "")
+                        if current_game["status"] == "STARTING":
+                            # A process restart can leave a launcher stuck after
+                            # some secret cards were delivered. Never resume a
+                            # half-started game with inconsistent roles. Return it
+                            # to the lobby so the administrator can start cleanly.
+                            _spy_set_state(
+                                gid,
+                                status="WAITING",
+                                phase="LOBBY",
+                                expires_at=None,
+                                current_asker_id=None,
+                                current_target_id=None,
+                            )
+                            group_db_op(lambda conn: (
+                                conn.execute(
+                                    "UPDATE spy_players SET role_name='',is_spy=0,hints_used=0 WHERE game_id=?",
+                                    (gid,),
+                                ),
+                                conn.commit(),
+                            ))
+                            continue
                         if phase in {"QUESTION", "ASKING", "ANSWERING"}:
                             await _spy_start_discussion(gid)
                         elif phase == "DISCUSSION":
