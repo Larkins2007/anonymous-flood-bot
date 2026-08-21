@@ -7241,7 +7241,7 @@ def _spy_start_db(game_id, location, spy_ids, assignments, order):
             )
         conn.execute(
             "UPDATE spy_games SET status='STARTING',phase='QUESTION',started_at=?,expires_at=?,location=?,spy_user_id=?,current_asker_id=?,current_target_id=?,turn_count=0,round_target=?,vote_round=0,cycle_start_turn=0,cycle_expected_turns=?,vote_session=0,accusation_suspect_id=NULL,updated_at=? WHERE id=?",
-            (now(), deadline, location, primary_spy, first, second, len(assignments), now(), int(game_id)),
+            (now(), deadline, location, primary_spy, first, second, len(assignments), len(assignments), now(), int(game_id)),
         )
         conn.commit()
     group_db_op(op)
