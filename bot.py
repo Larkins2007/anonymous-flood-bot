@@ -744,7 +744,7 @@ async def update_role_snapshot(chat_id: int):
         tag=row["tag"] or ""
         if uname.lower()=="@justice_faite_bot": continue
         visible.append(f"Роль участника — {role_name} — {uname}" + (f" — {tag}" if tag else ""))
-    lines=["𝗥𝗢𝗟𝗘 𝗦𝗡𝗔𝗣𝗦𝗛𝗢𝗧","",f"Основной чат: {chat_id}",f"Участников в базе: {len(visible)}",""]+ (visible or ["Пока нет сохранённых участников."])
+    lines=["༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Снимок ролей","",f"Основной чат: {chat_id}",f"Участников в базе: {len(visible)}",""]+ (visible or ["Пока нет сохранённых участников."])
     text="\n".join(lines)[:3900]
     state=group_db_op(lambda conn: conn.execute("SELECT owner_message_id FROM role_snapshot_state WHERE chat_id=?",(chat_id,)).fetchone())
     mid=state["owner_message_id"] if state else None
@@ -1595,6 +1595,13 @@ def main_kb():
         [InlineKeyboardButton(text="✦ Как это работает", callback_data="u:info")],
     ])
 
+def member_main_kb():
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🌸 Justice Faite", callback_data="u:info")],
+        [InlineKeyboardButton(text="🤫 Анонимная связь", callback_data="u:send")],
+        [InlineKeyboardButton(text="⚠ Жалоба", callback_data="u:report")],
+    ])
+
 def cancel_kb():
     return InlineKeyboardMarkup(
         inline_keyboard=[
@@ -1772,9 +1779,9 @@ def home_text():
     return (
         f"{title('Justice Faite')}\n\n"
         "Добро пожаловать.\n\n"
-        f"{bullet('🚪 Для вступления нажмите «Хочу вступить».')}\n"
-        f"{bullet('🤫 Для анонимной связи используйте отдельное действие.')}\n"
-        f"{bullet('⚠ Для обращения по нарушению используйте жалобу.')}\n\n"
+        f"{bullet('🚪 Новичок — начните с «Хочу вступить».')}\n"
+        f"{bullet('🤫 Анонимная связь — сообщение администрации без раскрытия автора.')}\n"
+        f"{bullet('⚠ Жалоба — обращение по нарушению правил.')}\n\n"
         f"{divider()}\n"
         "♡ Выберите действие"
     )
@@ -1822,11 +1829,15 @@ async def start(
         )
         return
 
+    is_member = False
+    with suppress(Exception):
+        cm = await bot.get_chat_member(PRIMARY_CHAT_ID, message.from_user.id)
+        is_member = _chat_member_is_active(cm)
     await send_screen(
         message,
         state,
         home_text(),
-        main_kb(),
+        member_main_kb() if is_member else main_kb(),
     )
 
 @dp.message(Command("anon"), F.chat.type == "private")
@@ -4837,7 +4848,7 @@ async def group_confirm(callback: CallbackQuery):
     with suppress(Exception):
         await bot.send_message(
             ADMIN_ID,
-            "𝗥𝗨𝗟𝗘𝗦 𝗖𝗢𝗡𝗙𝗜𝗥𝗠𝗘𝗗\n\n"
+            "༺ 𓆩 ✧ 𓆪 ༻\n\n📜 Правила подтверждены\n\n"
             f"Участник: {username}\n"
             f"ID: {target_user_id}\n"
             "Подтвердил(а) ознакомление с правилами флуда.\n"
@@ -4860,7 +4871,7 @@ async def group_confirm(callback: CallbackQuery):
     await callback.answer("Правила подтверждены. Роль участника назначается отдельно.")
 
 
-@dp.message(F.chat.type.in_({"group", "supergroup"}), F.text.regexp(r"(?is)^\s*(?!/)(?!калл(?:\s|$)).+"))
+@dp.message(F.chat.type.in_({"group", "supergroup"}), F.from_user.is_bot == False, F.text.regexp(r"(?is)^\s*(?!/)(?!калл(?:\s|$))(?!рестники(?:\s|$))(?!выдать\s+рест(?:\s|$)).+"))
 async def group_passive_member_sync(message: Message):
     if not is_primary_chat(message.chat.id):
         return
@@ -4888,7 +4899,7 @@ async def group_passive_member_sync(message: Message):
         logger.debug("Passive member sync failed | chat=%s user=%s", message.chat.id, message.from_user.id, exc_info=True)
 
 
-@dp.message(F.chat.type.in_({"group", "supergroup"}), F.text.regexp(r"(?iu)^\s*калл\s+.+$"))
+@dp.message(F.chat.type.in_({"group", "supergroup"}), F.from_user.is_bot == False, F.text.regexp(r"(?iu)^\s*калл\s+.+$"))
 async def call_assign_role(message: Message):
     """The ONLY role/tag assignment trigger: `калл <роль>`.
     It targets the single newest pending member, sets the Telegram tag, marks
@@ -4902,7 +4913,7 @@ async def call_assign_role(message: Message):
 
     pending = latest_pending_member(message.chat.id)
     if not pending:
-        await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nНе найден новый участник без назначенной роли.")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nНе найден новый участник без назначенной роли.")
         return
 
     if role is None:
@@ -4911,13 +4922,13 @@ async def call_assign_role(message: Message):
         except Exception:
             role = None
     if not role:
-        await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nДля последнего кандидата не сохранена желаемая роль. Укажите её после команды «калл».")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nДля последнего кандидата не сохранена желаемая роль. Укажите её после команды «калл».")
         return
 
     try:
         target_member = await bot.get_chat_member(message.chat.id, pending["user_id"])
         if not _chat_member_is_active(target_member):
-            await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nУчастник уже не находится в чате.")
+            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nУчастник уже не находится в чате.")
             return
         target = target_member.user
 
@@ -4941,7 +4952,7 @@ async def call_assign_role(message: Message):
         with suppress(Exception):
             await bot.send_message(
                 ADMIN_ID,
-                "𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗘𝗗\n\n"
+                "༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Роль назначена\n\n"
                 f"Участник: {username}\n"
                 f"Роль: {role['name']}\n"
                 f"Тег: {actual or tag}\n"
@@ -4956,12 +4967,12 @@ async def call_assign_role(message: Message):
         )
     except ValueError as exc:
         if str(exc) == "ROLE_OCCUPIED":
-            await message.reply("𝗥𝗢𝗟𝗘 𝗢𝗖𝗖𝗨𝗣𝗜𝗘𝗗\n\nЭта роль уже занята.")
+            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Роль занята\n\nЭта роль уже занята.")
         else:
             logger.exception("Kall role assignment failed")
     except Exception:
         logger.exception("Kall role assignment failed")
-        await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nНе удалось назначить роль.")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nНе удалось назначить роль.")
 
 
 async def resolve_bind_target(chat_id, target_text):
@@ -4988,7 +4999,7 @@ async def bind_role_from_private_admin(message: Message):
     parts = raw.split(maxsplit=3)
     if len(parts) < 4:
         await message.reply(
-            "𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\n"
+            "༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\n"
             "Формат:\n"
             "/bindrole CHAT_ID USER_ID РОЛЬ\n\n"
             "Пример:\n"
@@ -5002,21 +5013,21 @@ async def bind_role_from_private_admin(message: Message):
         chat_obj = await bot.get_chat(chat_raw)
         chat_id = int(chat_obj.id)
     except Exception:
-        await message.reply("𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nНе удалось найти этот чат. Укажи корректный CHAT_ID.")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nНе удалось найти этот чат. Укажи корректный CHAT_ID.")
         return
 
     if not is_primary_chat(chat_id):
-        await message.reply("𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nЭтот чат не является основным чатом бота.")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nЭтот чат не является основным чатом бота.")
         return
     role = role_for(role_text)
     if not role:
-        await message.reply(f"𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nРоль «{role_text}» не найдена в каталоге 148 ролей.")
+        await message.reply(f"༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nРоль «{role_text}» не найдена в каталоге 148 ролей.")
         return
 
     target = await resolve_bind_target(chat_id, target_raw)
     if not target:
         await message.reply(
-            "𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\n"
+            "༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\n"
             "Участник не найден. Он должен находиться в чате или уже быть сохранён в базе.\n"
             "Используй USER_ID или @username."
         )
@@ -5025,7 +5036,7 @@ async def bind_role_from_private_admin(message: Message):
     try:
         cm = await bot.get_chat_member(chat_id, target.id)
         if not _chat_member_is_active(cm):
-            await message.reply("𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nЭтот пользователь сейчас не является участником чата.")
+            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nЭтот пользователь сейчас не является участником чата.")
             return
         target = cm.user
     except Exception:
@@ -5037,13 +5048,13 @@ async def bind_role_from_private_admin(message: Message):
         ok, actual = await apply_member_tag(chat_id, target.id, tag)
         if not ok:
             release_role_assignment(chat_id, target.id, role_key)
-            await message.reply("𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nTelegram не разрешил установить тег. Изменение откатано.")
+            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nTelegram не разрешил установить тег. Изменение откатано.")
             return
         finalize_role_assignment(chat_id, target.id, role_key, actual or tag)
         await lift_member_restriction(chat_id, target.id)
         await send_or_edit_welcome(chat_id, target.id)
         await message.reply(
-            "𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\n"
+            "༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\n"
             f"Участник: {display_username_for_group(target)}\n"
             f"ID: {target.id}\n"
             f"Роль: {role['name']}\n"
@@ -5052,13 +5063,13 @@ async def bind_role_from_private_admin(message: Message):
         )
     except ValueError as exc:
         if str(exc) == "ROLE_OCCUPIED":
-            await message.reply("𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nЭта роль уже занята в указанном чате.")
+            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nЭта роль уже занята в указанном чате.")
         else:
             logger.exception("Private bind role failed")
-            await message.reply("𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nНе удалось привязать роль.")
+            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nНе удалось привязать роль.")
     except Exception:
         logger.exception("Private bind role failed")
-        await message.reply("𝗕𝗜𝗡𝗗 𝗥𝗢𝗟𝗘\n\nНе удалось привязать роль. Подробность записана в лог.")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nНе удалось привязать роль. Подробность записана в лог.")
 
 
 @dp.message(Command("bindrole"), F.chat.type == "private")
@@ -5127,11 +5138,11 @@ async def setrole_cmd(message: Message):
             elif target_text.lstrip("-").isdigit():
                 with suppress(Exception): target=(await bot.get_chat_member(message.chat.id,int(target_text))).user
     if not target or not role_text:
-        await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nОтветьте на сообщение участника: /setrole Роль\nИли: /setrole @username Роль")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nОтветьте на сообщение участника: /setrole Роль\nИли: /setrole @username Роль")
         return
     role=role_for(role_text)
     if not role:
-        await message.reply(f"𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nРоль «{role_text}» не найдена в каталоге 148 ролей.")
+        await message.reply(f"༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nРоль «{role_text}» не найдена в каталоге 148 ролей.")
         return
     try:
         cm=await bot.get_chat_member(message.chat.id,target.id)
@@ -5146,15 +5157,15 @@ async def setrole_cmd(message: Message):
         confirm_member(message.chat.id,target.id)
         lifted=await lift_member_restriction(message.chat.id,target.id)
         await message.reply(f"✅ Назначено\n{display_username_for_group(target)}\nРоль: {role['name']}\nТег: {actual or tag}\nОграничение снято: {'да' if lifted else 'нет'}")
-        with suppress(Exception): await bot.send_message(ADMIN_ID,f"𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗘𝗗\n\nУчастник: {display_username_for_group(target)}\nРоль участника: {role['name']}\nТег: {actual or tag}")
+        with suppress(Exception): await bot.send_message(ADMIN_ID,f"༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Роль назначена\n\nУчастник: {display_username_for_group(target)}\nРоль участника: {role['name']}\nТег: {actual or tag}")
     except ValueError as exc:
-        await message.reply("𝗥𝗢𝗟𝗘 𝗢𝗖𝗖𝗨𝗣𝗜𝗘𝗗\n\nЭта роль уже занята." if str(exc)=="ROLE_OCCUPIED" else "𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nНе удалось назначить роль.")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Роль занята\n\nЭта роль уже занята." if str(exc)=="ROLE_OCCUPIED" else "༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nНе удалось назначить роль.")
     except RuntimeError as exc:
         msg="Участник сейчас не в чате." if str(exc)=="NOT_MEMBER" else "Telegram не разрешил установить тег. Назначение отменено."
-        await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\n"+msg)
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\n"+msg)
     except Exception:
         logger.exception("setrole failed")
-        await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nНе удалось назначить роль.")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nНе удалось назначить роль.")
 
 
 def _normalize_custom_command_name(value: str) -> str:
@@ -5259,9 +5270,9 @@ async def manage_commands_cmd(message: Message):
         return
     rows = get_custom_commands()
     if not rows:
-        text = "𝗖𝗢𝗠𝗠𝗔𝗡𝗗 𝗠𝗔𝗡𝗔𝗚𝗘𝗥\n\nПока нет пользовательских команд.\n\nИспользуйте /addcommand для добавления."
+        text = "༺ 𓆩 ✧ 𓆪 ༻\n\n⚙️ Управление командами\n\nПока нет пользовательских команд.\n\nИспользуйте /addcommand для добавления."
     else:
-        lines = ["𝗖𝗢𝗠𝗠𝗔𝗡𝗗 𝗠𝗔𝗡𝗔𝗚𝗘𝗥", "", "Ваши пользовательские команды:", ""]
+        lines = ["༺ 𓆩 ✧ 𓆪 ༻\n\n⚙️ Управление командами", "", "Ваши пользовательские команды:", ""]
         for row in rows:
             lines.append(f"/{row['command']} — {row['description']} [{row['scope']}]")
         lines += ["", "/addcommand — добавить или изменить", "/delcommand <команда> — удалить", "/commands — показать полный список"]
@@ -5276,7 +5287,7 @@ async def addcommand_cmd(message: Message):
     raw = (message.text or "").split(maxsplit=1)
     if len(raw) < 2 or "|" not in raw[1]:
         await message.reply(
-            "𝗔𝗗𝗗 𝗖𝗢𝗠𝗠𝗔𝗡𝗗\n\n"
+            "༺ 𓆩 ✧ 𓆪 ༻\n\n⚙️ Добавление команды\n\n"
             "Формат:\n"
             "/addcommand имя | описание | ответ | область\n\n"
             "Область: all / group / admin / private\n\n"
@@ -5291,7 +5302,7 @@ async def addcommand_cmd(message: Message):
     try:
         name = save_custom_command(parts[0], parts[1], parts[2], parts[3], message.from_user.id)
         await setup_commands()
-        await message.reply(f"𝗖𝗢𝗠𝗠𝗔𝗡𝗗 𝗦𝗔𝗩𝗘𝗗\n\n/{name} сохранена и добавлена в меню.")
+        await message.reply(f"༺ 𓆩 ✧ 𓆪 ༻\n\n✅ Команда сохранена\n\n/{name} сохранена и добавлена в меню.")
     except ValueError as exc:
         messages = {
             "INVALID_COMMAND": "Название команды должно быть на английском: a-z, 0-9, _. Максимум 32 символа.",
@@ -5300,10 +5311,10 @@ async def addcommand_cmd(message: Message):
             "EMPTY_VALUE": "Описание и ответ не могут быть пустыми.",
             "RESPONSE_TOO_LONG": "Ответ слишком длинный.",
         }
-        await message.reply(f"𝗘𝗥𝗥𝗢𝗥\n\n{messages.get(str(exc), 'Не удалось сохранить команду.')}")
+        await message.reply(f"༺ 𓆩 ✧ 𓆪 ༻\n\n⚠️ Ошибка\n\n{messages.get(str(exc), 'Не удалось сохранить команду.')}")
     except Exception:
         logger.exception("Custom command save failed")
-        await message.reply("𝗘𝗥𝗥𝗢𝗥\n\nНе удалось сохранить команду.")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n⚠️ Ошибка\n\nНе удалось сохранить команду.")
 
 
 @dp.message(Command("delcommand"))
@@ -5323,7 +5334,7 @@ async def delcommand_cmd(message: Message):
         await message.reply("Такой пользовательской команды нет.")
         return
     await setup_commands()
-    await message.reply("𝗖𝗢𝗠𝗠𝗔𝗡𝗗 𝗥𝗘𝗠𝗢𝗩𝗘𝗗\n\nКоманда удалена.")
+    await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🗑 Команда удалена\n\nКоманда удалена.")
 
 
 @dp.message(Command("commands"))
@@ -5331,7 +5342,7 @@ async def commands_cmd(message: Message):
     if message.chat.type != "private" or not message.from_user or message.from_user.id != ADMIN_ID:
         return
     rows = get_custom_commands()
-    lines = ["𝗖𝗢𝗠𝗠𝗔𝗡𝗗𝗦", "", "Встроенные:", "/help", "/mafia", "/mafia_leave", "/game_poll", "/spy", "/setrole", "/syncroles", ]
+    lines = ["༺ 𓆩 ✧ 𓆪 ༻\n\n⚙️ Команды", "", "Встроенные:", "/help", "/mafia", "/mafia_leave", "/game_poll", "/spy", "/setrole", "/syncroles", ]
     lines += ["", "Пользовательские:"]
     if rows:
         for row in rows:
@@ -5353,22 +5364,33 @@ async def help_cmd(message: Message):
             section("Личные функции"),
             bullet("/start — вход в Justice Faite и главное меню"),
             bullet("/anon — анонимно написать администрации"),
-            bullet("/jf_birthday — указать или изменить свой день рождения"),
-            bullet("/jf_birthdays — посмотреть дни рождения участников"),
         ]
+        is_member = False
+        if message.from_user:
+            try:
+                cm = await bot.get_chat_member(PRIMARY_CHAT_ID, message.from_user.id)
+                is_member = _chat_member_is_active(cm)
+            except Exception:
+                is_member = False
+        if is_member:
+            lines += [
+                "", section("🎂 Дни рождения"),
+                bullet("/jf_birthday — ♡ сохранить или изменить свою дату"),
+                bullet("/jf_birthdays — ✦ ближайшие дни рождения участников"),
+            ]
         if message.from_user and message.from_user.id == ADMIN_ID:
             lines += [
                 "", section("Владелец · только это ЛС"),
                 bullet("/jf_applications — активные заявки на вступление"),
-                bullet("/jf_awards — кандидаты на достижения"),
+                bullet("/jf_awards — проверить олдов и автоматически выдать награды через Ирис"),
                 bullet("/jf_award — выдать достижение"),
-                bullet("/jf_iris_sync — подготовить выдачу наград через Ирис"),
+                bullet("/jf_iris_sync — повторить автоматическую выдачу через Ирис"),
                 bullet("/jf_dashboard — сводка Justice Faite"),
                 bullet("/jf_warn — выдать предупреждение"),
                 bullet("/jf_warnings — история предупреждений"),
                 bullet("/jf_warn_remove — снять предупреждение"),
-                bullet("/jf_rest — поставить или продлить рест"),
-                bullet("/jf_restlist — текущий рест"),
+                bullet("/rest — оформить или продлить рест"),
+                bullet("/jf_restlist — список рестников (владельцу)"),
                 bullet("/roles_audit — аудит ролей"),
                 bullet("/bindrole — привязать роль"),
                 bullet("/manage_commands — управление пользовательскими командами"),
@@ -5387,17 +5409,18 @@ async def help_cmd(message: Message):
         title("Команды флуда"),
         "",
         section("Игры"),
-        bullet("/mafia — открыть лобби MafiaAzBot"),
-        bullet("/mafia_leave — выйти из лобби"),
-        bullet("/spy — запустить игру «Шпион»"),
+        bullet("/mafia — 🎭 открыть игровое лобби"),
+        bullet("/mafia_leave — 🚪 покинуть игровое лобби"),
+        bullet("/spy — 🕵️ запустить игру «Шпион»"),
+        bullet("рестники — 🥹 показать участников на ресте"),
     ]
     if is_group_admin_user(message):
         lines += [
             "", section("Администрирование"),
-            bullet("/setrole — назначить роль участнику"),
-            bullet("/syncroles — синхронизировать роли"),
-            bullet("/game_poll — создать опрос на игру"),
-            bullet("/spy_kick — исключить из «Шпион»"),
+            bullet("/setrole — 🎭 назначить роль участнику"),
+            bullet("/syncroles — ♻️ обновить роли"),
+            bullet("/game_poll — 🎮 создать опрос на игру"),
+            bullet("/spy_kick — 🕵️ исключить из «Шпион»"),
             bullet("/spy_end — завершить «Шпион»"),
         ]
     custom = [r for r in get_custom_commands() if _custom_command_allowed(r, message)]
@@ -5415,7 +5438,7 @@ async def roles_audit_cmd(message: Message):
     active=group_db_op(lambda conn: conn.execute("SELECT COUNT(*) AS n FROM group_members WHERE chat_id=? AND active=1",(chat_id,)).fetchone())["n"]
     assigned=group_db_op(lambda conn: conn.execute("SELECT COUNT(*) AS n FROM group_members WHERE chat_id=? AND active=1 AND role_key IS NOT NULL",(chat_id,)).fetchone())["n"]
     recent=group_db_op(lambda conn: conn.execute("SELECT h.user_id,h.role_name,h.event,h.created_at,COALESCE(m.username,m.first_name,CAST(h.user_id AS TEXT)) AS who FROM role_history h LEFT JOIN group_members m ON m.chat_id=h.chat_id AND m.user_id=h.user_id WHERE h.chat_id=? ORDER BY h.id DESC LIMIT 12",(chat_id,)).fetchall())
-    lines=["𝗥𝗢𝗟𝗘 𝗔𝗨𝗗𝗜𝗧","",f"Основной чат: {chat_id}",f"Активных участников: {active}",f"С назначенной ролью: {assigned}",f"Без роли: {active-assigned}","","Последние изменения:"]
+    lines=["༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Аудит ролей","",f"Основной чат: {chat_id}",f"Активных участников: {active}",f"С назначенной ролью: {assigned}",f"Без роли: {active-assigned}","","Последние изменения:"]
     if recent:
         for r in recent:
             who=f"@{r['who']}" if r['who'] and not str(r['who']).startswith('@') and not str(r['who']).isdigit() else str(r['who'])
@@ -5429,7 +5452,7 @@ async def roles_audit_cmd(message: Message):
 async def sync_roles_cmd(message: Message):
     if not require_primary_group(message): return
     if not is_group_admin_user(message):
-        await message.reply("𝗔𝗖𝗖𝗘𝗦𝗦\n\nУ вас нет прав для этой команды."); return
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🔐 Доступ\n\nУ вас нет прав для этой команды."); return
     chat_id=PRIMARY_CHAT_ID
     rows=group_db_op(lambda conn: conn.execute("SELECT DISTINCT user_id FROM participant_roster WHERE chat_id=? AND user_id IS NOT NULL",(chat_id,)).fetchall())
     rows2=group_db_op(lambda conn: conn.execute("SELECT DISTINCT user_id FROM group_members WHERE chat_id=? AND user_id IS NOT NULL",(chat_id,)).fetchall())
@@ -5470,7 +5493,7 @@ async def sync_roles_cmd(message: Message):
         except Exception as exc:
             errors+=1; details.append(f"{uid}: {type(exc).__name__}"); logger.exception("Role sync failed | chat=%s user=%s",chat_id,uid)
     with suppress(Exception): await update_role_snapshot(chat_id)
-    lines=["𝗥𝗢𝗟𝗘 𝗦𝗬𝗡𝗖","",f"Проверено участников: {checked}",f"Ролей распознано: {recognized}",f"Новых/обновлённых ролей: {adopted}",f"Без роли: {without_role}",f"Ботов пропущено: {bots}",f"Администраторов проверено: {admins_checked}",f"Вышедших: {left}",f"Ошибок проверки: {errors}"]
+    lines=["༺ 𓆩 ✧ 𓆪 ༻\n\n🔄 Синхронизация ролей","",f"Проверено участников: {checked}",f"Ролей распознано: {recognized}",f"Новых/обновлённых ролей: {adopted}",f"Без роли: {without_role}",f"Ботов пропущено: {bots}",f"Администраторов проверено: {admins_checked}",f"Вышедших: {left}",f"Ошибок проверки: {errors}"]
     if details: lines += ["","Ошибки:"]+[f"• {x}" for x in details[:12]]
     await bot.send_message(ADMIN_ID,"\n".join(lines))
 
@@ -6174,16 +6197,16 @@ async def role_assign_from_text(message: Message, state: FSMContext):
     chat_id=int(data.get("chat_id",0)); target_id=int(data.get("target_id",0))
     await state.clear()
     if message.chat.type not in {"group","supergroup"} or not is_group_admin_user(message) or message.chat.id!=chat_id:
-        await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nНет доступа к этому назначению.")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nНет доступа к этому назначению.")
         return
     role=role_for((message.text or "").strip())
     if not role:
-        await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nТакой роли нет в каталоге 148 ролей.")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nТакой роли нет в каталоге 148 ролей.")
         return
     try:
         member=await bot.get_chat_member(chat_id,target_id)
         if not _chat_member_is_active(member):
-            await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nУчастник больше не находится в чате.")
+            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nУчастник больше не находится в чате.")
             return
         target=member.user
         tag,key=assign_role_db_atomic(chat_id,target,role)
@@ -6197,10 +6220,10 @@ async def role_assign_from_text(message: Message, state: FSMContext):
         lifted=await lift_member_restriction(chat_id,target.id)
         await message.reply(f"✅ Назначено\n{display_username_for_group(target)}\nРоль: {role['name']}\nТег: {actual or tag}\nОграничение снято: {'да' if lifted else 'нет'}")
     except ValueError as exc:
-        await message.reply("𝗥𝗢𝗟𝗘 𝗢𝗖𝗖𝗨𝗣𝗜𝗘𝗗\n\nЭта роль уже занята." if str(exc)=="ROLE_OCCUPIED" else "𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nНе удалось назначить роль.")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Роль занята\n\nЭта роль уже занята." if str(exc)=="ROLE_OCCUPIED" else "༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nНе удалось назначить роль.")
     except Exception:
         logger.exception("Role assignment from welcome button failed")
-        await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nНе удалось назначить роль.")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nНе удалось назначить роль.")
 
 
 def _message_with_text(message, text):
@@ -6219,13 +6242,13 @@ async def sign_assigned_role_for_user(message: Message):
     ).fetchall())
     if not rows:
         await message.reply(
-            "𝗥𝗢𝗟𝗘 𝗧𝗔𝗚\n\n"
+            "༺ 𓆩 ✧ 𓆪 ༻\n\n🏷 Тег роли\n\n"
             "У тебя пока нет назначенной роли.\n"
             "Попроси администратора назначить её через «калл <роль>»."
         )
         return
     if len(rows) > 1:
-        lines = ["𝗥𝗢𝗟𝗘 𝗧𝗔𝗚", "", "Найдено несколько ролей в активных чатах:", ""]
+        lines = ["༺ 𓆩 ✧ 𓆪 ༻\n\n🏷 Тег роли", "", "Найдено несколько ролей в активных чатах:", ""]
         for row in rows:
             lines.append(f"{row['role_name']} — {row['tag'] or 'тег не установлен'} — чат {row['chat_id']}")
         lines.append("\nВыбери нужную группу, если понадобится повторная установка тега.")
@@ -6234,7 +6257,7 @@ async def sign_assigned_role_for_user(message: Message):
     row = rows[0]
     role = role_for(row["role_name"])
     if not role:
-        await message.reply("𝗥𝗢𝗟𝗘 𝗧𝗔𝗚\n\nНазначенная роль больше не найдена в каталоге.")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🏷 Тег роли\n\nНазначенная роль больше не найдена в каталоге.")
         return
     desired = make_tag(role["english"])
     ok, actual = await apply_member_tag(int(row["chat_id"]), user_id, desired)
@@ -6243,7 +6266,7 @@ async def sign_assigned_role_for_user(message: Message):
         return
     finalize_role_assignment(int(row["chat_id"]), user_id, normalize_role(role["name"]), actual or desired)
     await message.reply(
-        "𝗥𝗢𝗟𝗘 𝗧𝗔𝗚\n\n"
+        "༺ 𓆩 ✧ 𓆪 ༻\n\n🏷 Тег роли\n\n"
         f"Роль: {role['name']}\n"
         f"Тег: {actual or desired}\n\n"
         "Готово."
@@ -6500,44 +6523,45 @@ def seed_default_games():
 
 async def setup_commands():
     # Private menu for all users. Admin-only commands are exposed only to OWNER_ID.
+    # The default private menu is intentionally minimal. Birthday commands are
+    # documented by /help only after membership is confirmed, so a newcomer
+    # is not presented with functions that cannot be used before joining.
     private_user = [
-        BotCommand(command="start", description="Вход и информация Justice Faite"),
-        BotCommand(command="help", description="Помощь"),
-        BotCommand(command="anon", description="Анонимно написать администрации"),
-        BotCommand(command="jf_birthday", description="Указать свой день рождения"),
-        BotCommand(command="jf_birthdays", description="Дни рождения"),
+        BotCommand(command="start", description="🌸 Вход в Justice Faite"),
+        BotCommand(command="help", description="✦ Навигация и команды"),
+        BotCommand(command="anon", description="🤫 Анонимное обращение"),
     ]
     group_user = [
         BotCommand(command="help", description="Команды"),
-        BotCommand(command="mafia", description="Лобби MafiaAzBot"),
-        BotCommand(command="mafia_leave", description="Выйти из мафии"),
-        BotCommand(command="spy", description="Запустить игру «Шпион»"),
+        BotCommand(command="mafia", description="🎭 Открыть игровое лобби"),
+        BotCommand(command="mafia_leave", description="✦ Выйти из лобби"),
+        BotCommand(command="spy", description="🕵️ Запустить «Шпион»"),
     ]
     group_admin = group_user + [
-        BotCommand(command="setrole", description="Назначить роль"),
-        BotCommand(command="syncroles", description="Синхронизировать роли"),
-        BotCommand(command="game_poll", description="Опрос на игру"),
-        BotCommand(command="spy_kick", description="Исключить из «Шпион»"),
-        BotCommand(command="spy_end", description="Завершить «Шпион»"),
+        BotCommand(command="setrole", description="🎭 Назначить роль участнику"),
+        BotCommand(command="syncroles", description="✦ Синхронизировать роли"),
+        BotCommand(command="game_poll", description="🎮 Создать опрос на игру"),
+        BotCommand(command="spy_kick", description="🕵️ Исключить из игры"),
+        BotCommand(command="spy_end", description="🏁 Завершить «Шпион»"),
     ]
     owner_private = [
         *private_user,
-        BotCommand(command="jf_applications", description="Заявки на вступление"),
-        BotCommand(command="jf_awards", description="Кандидаты на награды"),
-        BotCommand(command="jf_award", description="Выдать награду"),
-        BotCommand(command="jf_iris_sync", description="Подготовить награды для Ирис"),
-        BotCommand(command="jf_dashboard", description="Панель Justice Faite"),
-        BotCommand(command="jf_warn", description="Выдать предупреждение"),
-        BotCommand(command="jf_warnings", description="История предупреждений"),
-        BotCommand(command="jf_warn_remove", description="Снять предупреждение"),
-        BotCommand(command="jf_rest", description="Поставить на рест"),
-        BotCommand(command="jf_restlist", description="Список реста"),
-        BotCommand(command="roles_audit", description="Аудит ролей"),
-        BotCommand(command="bindrole", description="Привязать роль"),
-        BotCommand(command="manage_commands", description="Управление командами"),
-        BotCommand(command="addcommand", description="Добавить команду"),
-        BotCommand(command="delcommand", description="Удалить команду"),
-        BotCommand(command="commands", description="Список команд"),
+        BotCommand(command="jf_applications", description="🚪 Заявки на вступление"),
+        BotCommand(command="jf_awards", description="🏆 Кандидаты на достижения"),
+        BotCommand(command="jf_award", description="🏵 Выдать достижение"),
+        BotCommand(command="jf_iris_sync", description="✦ Подготовить награды для Ирис"),
+        BotCommand(command="jf_dashboard", description="🌸 Панель Justice Faite"),
+        BotCommand(command="jf_warn", description="⚠️ Выдать предупреждение"),
+        BotCommand(command="jf_warnings", description="📜 История предупреждений"),
+        BotCommand(command="jf_warn_remove", description="↩️ Снять предупреждение"),
+        BotCommand(command="rest", description="🥹 Оформить или продлить рест"),
+        BotCommand(command="jf_restlist", description="📋 Проверить рестников"),
+        BotCommand(command="roles_audit", description="🔎 Проверить роли"),
+        BotCommand(command="bindrole", description="🎭 Привязать роль"),
+        BotCommand(command="manage_commands", description="⚙️ Управление командами"),
+        BotCommand(command="addcommand", description="➕ Добавить команду"),
+        BotCommand(command="delcommand", description="🗑 Удалить команду"),
+        BotCommand(command="commands", description="📚 Список команд"),
     ]
 
     custom = get_custom_commands()
@@ -8528,6 +8552,25 @@ async def spy_callback(callback: CallbackQuery):
     await callback.answer()
 
 
+# =========================================================
+# JUSTICE FAITE COMMUNITY FEATURES
+# =========================================================
+
+try:
+    from justice_features import (
+        register_justice_features,
+        init_justice_features_db,
+        begin_join_application as jf_begin_join_application,
+        latest_requested_role_for_chat as jf_latest_requested_role,
+        auto_bind_requested_role as jf_autobind_requested_role,
+        feature_maintenance_worker,
+    )
+    register_justice_features(globals())
+except Exception:
+    logger.exception("Could not register Justice Faite features")
+    raise
+
+
 @dp.message(F.chat.type == "private", F.text)
 async def spy_private_text(message: Message):
     if not message.from_user or not message.text or message.text.startswith("/"):
@@ -8737,25 +8780,6 @@ async def _spy_recovery_worker():
             logger.exception("Spy recovery worker failed")
         await asyncio.sleep(5)
 
-
-
-# =========================================================
-# JUSTICE FAITE COMMUNITY FEATURES
-# =========================================================
-
-try:
-    from justice_features import (
-        register_justice_features,
-        init_justice_features_db,
-        begin_join_application as jf_begin_join_application,
-        latest_requested_role_for_chat as jf_latest_requested_role,
-        auto_bind_requested_role as jf_autobind_requested_role,
-        feature_maintenance_worker,
-    )
-    register_justice_features(globals())
-except Exception:
-    logger.exception("Could not register Justice Faite features")
-    raise
 
 
 # Custom slash-command fallback MUST be registered after all built-in handlers.
