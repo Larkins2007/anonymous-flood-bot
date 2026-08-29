@@ -4779,22 +4779,17 @@ async def group_member_update(event: ChatMemberUpdated):
             tag_set_by_bot=False,
         )
         await sync_member_tag(chat_id, user.id, user=user, refresh_roster=False, force=True)
-        auto_bound = False
+        # Role assignment is deliberately NOT automatic.
+        # The owner/admin performs the Call ID flow manually after the participant enters.
         try:
-            auto_bound = await jf_autobind_requested_role(chat_id, user)
+            await bot.restrict_chat_member(
+                chat_id,
+                user.id,
+                permissions=NEW_MEMBER_RESTRICTION,
+                use_independent_chat_permissions=True,
+            )
         except Exception:
-            logger.exception("Requested-role auto bind failed | chat=%s user=%s", chat_id, user.id)
-        refreshed = get_member(chat_id, user.id)
-        if not auto_bound and not (refreshed and refreshed["role_key"]):
-            try:
-                await bot.restrict_chat_member(
-                    chat_id,
-                    user.id,
-                    permissions=NEW_MEMBER_RESTRICTION,
-                    use_independent_chat_permissions=True,
-                )
-            except Exception:
-                logger.exception("Could not restrict new member | chat=%s user=%s", chat_id, user.id)
+            logger.exception("Could not restrict new member | chat=%s user=%s", chat_id, user.id)
         await send_or_edit_welcome(chat_id, user.id)
         return
 
@@ -8571,7 +8566,6 @@ try:
         init_justice_features_db,
         begin_join_application as jf_begin_join_application,
         latest_requested_role_for_chat as jf_latest_requested_role,
-        auto_bind_requested_role as jf_autobind_requested_role,
         feature_maintenance_worker,
     )
     register_justice_features(globals())

@@ -68,7 +68,7 @@ def _back_home_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="↩ Назад", callback_data="u:home")]
     ])
 
-IRIS_USERNAME = os.getenv("IRIS_BOT_USERNAME", "").strip().lstrip("@")
+IRIS_USERNAME = os.getenv("IRIS_BOT_USERNAME", "iris_dp_bot").strip().lstrip("@")
 IRIS_AUTO_AWARDS = os.getenv("IRIS_AUTO_AWARDS", "1") == "1"
 IRIS_COMMAND = os.getenv("IRIS_AWARD_COMMAND", "наградить")
 IRIS_OLDS_COMMAND = os.getenv("IRIS_OLDS_COMMAND", "олды")
@@ -992,7 +992,66 @@ async def application_callback(callback: CallbackQuery):
         return
 
 
+async def join_request_admin_callback(callback: CallbackQuery):
+    """Final admission decision for a valid Telegram join request."""
+    if not callback.message or callback.message.chat.type != "private" or callback.from_user.id != int(_admin_id):
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    try:
+        action, raw_id = (callback.data or "").split(":")[-2:]
+        app_id = int(raw_id)
+    except (ValueError, IndexError):
+        await callback.answer("Некорректная заявка.", show_alert=True)
+        return
+    app = _q(lambda conn: conn.execute("SELECT * FROM jf_applications WHERE id=?", (app_id,)).fetchone())
+    if not app:
+        await callback.answer("Заявка не найдена.", show_alert=True)
+        return
+    if str(app["status"]) != "approved_waiting_join":
+        await callback.answer("Эта заявка уже не ожидает вступления.", show_alert=True)
+        return
+    user_id = int(app["user_id"])
+    if not app["join_request_chat_id"] or int(app["join_request_chat_id"]) != int(_primary_chat_id):
+        await callback.answer("Актуальной заявки Telegram ещё нет.", show_alert=True)
+        return
+    try:
+        if action == "join_approve":
+            await _bot.approve_chat_join_request(int(_primary_chat_id), user_id)
+            _set_application_field(app_id, status="approved", updated_at=_utc_iso())
+            with suppress(Exception):
+                if app["approved_invite_link"]:
+                    await _bot.revoke_chat_invite_link(int(_primary_chat_id), app["approved_invite_link"])
+            with suppress(Exception):
+                _q(lambda conn: (conn.execute("UPDATE jf_invites SET status='used',used_by=?,used_at=? WHERE invite_link=?", (user_id,_utc_iso(),app["approved_invite_link"])), conn.commit()))
+            await callback.answer("Вступление одобрено.")
+            with suppress(Exception):
+                await callback.message.edit_reply_markup(reply_markup=None)
+            with suppress(Exception):
+                await _bot.send_message(user_id, _fmt("Добро пожаловать") + "\n\n✦ Администрация одобрила вступление во флуд.\n✦ Роль после входа назначается вручную через Call ID.")
+            return
+        if action == "join_decline":
+            await _bot.decline_chat_join_request(int(_primary_chat_id), user_id)
+            _set_application_field(app_id, status="declined", updated_at=_utc_iso(), review_reason="Вступление отклонено администрацией")
+            with suppress(Exception):
+                await _bot.send_message(user_id, _fmt("Вступление отклонено") + "\n\n✦ Администрация не одобрила вход во флуд.")
+            await callback.answer("Вступление отклонено.")
+            with suppress(Exception):
+                await callback.message.edit_reply_markup(reply_markup=None)
+            return
+        await callback.answer("Неизвестное действие.", show_alert=True)
+    except Exception:
+        import logging
+        logging.getLogger("justice_features").exception("Join request decision failed | app=%s", app_id)
+        await callback.answer("Не удалось обработать заявку. Попробуйте ещё раз.", show_alert=True)
+
+
 async def handle_join_request(event: ChatJoinRequest):
+    """Register a Telegram join request but never approve it automatically.
+
+    Approval is always an explicit administrator action. The application
+    workflow may create a single-user-equivalent join-request invite, but the
+    final admission decision remains with the owner/administrator.
+    """
     if int(event.chat.id) != int(_primary_chat_id):
         return
     user = event.from_user
@@ -1001,54 +1060,40 @@ async def handle_join_request(event: ChatJoinRequest):
         "SELECT * FROM jf_applications WHERE user_id=? AND chat_id=? AND status='approved_waiting_join' ORDER BY id DESC LIMIT 1",
         (int(user.id), int(event.chat.id)),
     ).fetchone())
-    # Reject requests that do not belong to a currently approved application/link.
     if not app or not invite_text or invite_text != (app["approved_invite_link"] or ""):
+        # Unknown/expired/unrelated requests are safe to reject. This is not
+        # the admission path; valid requests always wait for admin approval.
         with suppress(Exception):
             await _bot.decline_chat_join_request(int(event.chat.id), int(user.id))
         return
-    try:
-        await _bot.approve_chat_join_request(int(event.chat.id), int(user.id))
-        with suppress(Exception):
-            await _bot.revoke_chat_invite_link(int(event.chat.id), invite_text)
-        _q(lambda conn: (conn.execute("UPDATE jf_invites SET status='used',used_by=?,used_at=? WHERE invite_link=?", (int(user.id), _utc_iso(), invite_text)), conn.commit()))
-        _set_application_field(int(app["id"]), status="approved", reviewed_by=int(_admin_id), reviewed_at=app["reviewed_at"] or _utc_iso())
-    except Exception:
-        # Keep the application waiting so a transient Telegram error can be retried.
-        logger_msg = f"Join request approval failed | app={app['id']} user={user.id}"
-        try:
-            import logging as _logging
-            _logging.getLogger(__name__).exception(logger_msg)
-        except Exception:
-            pass
+
+    _set_application_field(
+        int(app["id"]),
+        join_request_chat_id=int(event.chat.id),
+        join_request_user_chat_id=int(getattr(event, "user_chat_id", user.id) or user.id),
+        join_request_at=_utc_iso(),
+    )
+    with suppress(Exception):
+        await _bot.send_message(
+            int(_admin_id),
+            _fmt("Заявка на вступление") + "\n\n"
+            f"№ {int(app['id'])}\n"
+            f"👤 {_display_username(user)}\n"
+            f"🎭 Желаемая роль: {app['requested_role'] or '—'}\n\n"
+            "✦ Кандидат отправил запрос на вступление.\n"
+            "✦ Автоматически он не будет принят. Решение остаётся за администрацией.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [
+                    InlineKeyboardButton(text="✅ Принять во флуд", callback_data=f"{FEATURE_PREFIX}join_approve:{int(app['id'])}"),
+                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"{FEATURE_PREFIX}join_decline:{int(app['id'])}"),
+                ]
+            ]),
+        )
 
 
 async def auto_bind_requested_role(chat_id: int, user):
-    app = _q(lambda conn: conn.execute(
-        "SELECT * FROM jf_applications WHERE user_id=? AND chat_id=? AND status IN ('approved_waiting_join','approved') AND requested_role!='' ORDER BY id DESC LIMIT 1",
-        (int(user.id), int(chat_id)),
-    ).fetchone())
-    if not app:
-        return False
-    role = _role_for(app["requested_role"])
-    if not role:
-        return False
-    try:
-        tag, role_key = _assign_role_db_atomic(int(chat_id), user, role)
-        ok, actual = await _apply_member_tag(int(chat_id), int(user.id), tag)
-        if not ok:
-            with suppress(Exception):
-                from bot import release_role_assignment
-                release_role_assignment(int(chat_id), int(user.id), role_key)
-            return False
-        _finalize_role_assignment(int(chat_id), int(user.id), role_key, actual or tag)
-        _confirm_member(int(chat_id), int(user.id))
-        await _lift_member_restriction(int(chat_id), int(user.id))
-        _set_application_field(app["id"], status="joined")
-        return True
-    except ValueError as exc:
-        return str(exc) != "ROLE_OCCUPIED" and False
-    except Exception:
-        return False
+    """Compatibility stub: role binding is intentionally manual via Call ID."""
+    return False
 
 
 def warning_eligible_at(level: int, issued_at: str) -> Optional[str]:
@@ -1379,9 +1424,14 @@ async def handle_iris_olds_response(message: Message):
     sender = message.from_user
     if not sender or not sender.is_bot:
         return
-    if IRIS_USERNAME and (not sender.username or sender.username.casefold() != IRIS_USERNAME.casefold()):
-        return
-    if not IRIS_USERNAME:
+    if IRIS_USERNAME:
+        if sender.username and sender.username.casefold() == IRIS_USERNAME.casefold():
+            pass
+        else:
+            sender_name = " ".join(x for x in ((sender.first_name or ""), (sender.last_name or "")) if x).casefold()
+            if "iris" not in sender_name or "deep" not in sender_name:
+                return
+    else:
         sender_name = " ".join(x for x in ((sender.first_name or ""), (sender.last_name or "")) if x).casefold()
         if "iris" not in sender_name:
             return
@@ -2052,6 +2102,7 @@ def register_justice_features(ns: dict[str, Any]):
     _dp.message.register(natural_restlist_command, F.text.regexp(r"(?iu)^\s*рестники\s*$"))
     _dp.message.register(natural_rest_command, F.text.regexp(r"(?iu)^\s*выдать\s+рест\s+.+$"))
 
+    _dp.callback_query.register(join_request_admin_callback, F.data.regexp(r"^" + re.escape(FEATURE_PREFIX) + r"join_(approve|decline):\d+$"))
     _dp.callback_query.register(join_rules_callback, F.data.startswith(FEATURE_PREFIX + "join_"))
     # Persistent DB-driven routers come before FSM-specific handlers. This makes
     # the application flow recover even if MemoryStorage is cleared/restarted.
