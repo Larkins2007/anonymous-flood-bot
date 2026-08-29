@@ -76,6 +76,7 @@ SCHEDULE_CHECK_SECONDS = int(os.getenv("SCHEDULE_CHECK_SECONDS", "30"))
 DEFAULT_TIMEZONE_OFFSET_HOURS = int(os.getenv("DEFAULT_TIMEZONE_OFFSET_HOURS", "3"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "justice_faite_bot").strip().lstrip("@")
 JF_RULES_URL = os.getenv("JF_RULES_URL", "").strip()
+WELCOME_LOCKS = {}
 
 
 # =========================================================
@@ -4686,47 +4687,55 @@ async def send_or_edit_welcome(chat_id, user_id):
     if not row or not row["active"]:
         return
 
-    display = (row["username"] and "@" + row["username"]) or row["first_name"] or "участник"
-    text = (
-        "༺ 𓆩 ✧ 𓆪 ༻\n\n"
-        f"🌸 Добро пожаловать, {display}!\n\n"
-        "✦ Рады видеть тебя в Justice Faite.\n"
-        "✦ Правила флуда доступны в информационном канале.\n"
-        "✦ По важным вопросам используй обратную связь бота.\n\n"
-        "༺ 𓆩 ✧ 𓆪 ༻"
-    )
-    rows = []
-    rules_url = os.getenv("JF_RULES_URL", "").strip()
-    if rules_url:
-        rows.append([InlineKeyboardButton(text="📜 Правила", url=rules_url)])
-    bot_username = os.getenv("BOT_USERNAME", "justice_faite_bot").strip().lstrip("@")
-    rows.append([InlineKeyboardButton(text="🌸 Открыть бота", url=f"https://t.me/{bot_username}?start=home")])
-    markup = InlineKeyboardMarkup(inline_keyboard=rows)
-
-    if row["welcome_message_id"]:
-        try:
-            await bot.edit_message_text(
-                chat_id=chat_id,
-                message_id=row["welcome_message_id"],
-                text=text,
-                reply_markup=markup,
-            )
+    lock_key = (int(chat_id), int(user_id))
+    lock = WELCOME_LOCKS.setdefault(lock_key, asyncio.Lock())
+    async with lock:
+        # Re-read inside the lock so two join/role callbacks cannot both send
+        # a welcome before either has persisted welcome_message_id.
+        row = get_member(chat_id, user_id)
+        if not row or not row["active"]:
             return
+
+        display = (row["username"] and "@" + row["username"]) or row["first_name"] or "участник"
+        text = (
+            "༺ 𓆩 ✧ 𓆪 ༻\n\n"
+            f"🌸 Добро пожаловать, {display}!\n\n"
+            "✦ Рады видеть тебя в Justice Faite.\n"
+            "✦ Правила флуда доступны в информационном канале.\n"
+            "✦ По важным вопросам используй обратную связь бота.\n\n"
+            "༺ 𓆩 ✧ 𓆪 ༻"
+        )
+        rows = []
+        rules_url = os.getenv("JF_RULES_URL", "").strip()
+        if rules_url:
+            rows.append([InlineKeyboardButton(text="📜 Правила", url=rules_url)])
+        bot_username = os.getenv("BOT_USERNAME", "justice_faite_bot").strip().lstrip("@")
+        rows.append([InlineKeyboardButton(text="🌸 Открыть бота", url=f"https://t.me/{bot_username}?start=home")])
+        markup = InlineKeyboardMarkup(inline_keyboard=rows)
+
+        if row["welcome_message_id"]:
+            try:
+                await bot.edit_message_text(
+                    chat_id=chat_id,
+                    message_id=row["welcome_message_id"],
+                    text=text,
+                    reply_markup=markup,
+                )
+                return
+            except Exception:
+                pass
+
+        try:
+            sent = await bot.send_message(chat_id, text, reply_markup=markup)
+            group_db_op(lambda conn: (
+                conn.execute(
+                    "UPDATE group_members SET welcome_message_id=? WHERE chat_id=? AND user_id=?",
+                    (sent.message_id, chat_id, user_id),
+                ),
+                conn.commit(),
+            ))
         except Exception:
-            pass
-
-    try:
-        sent = await bot.send_message(chat_id, text, reply_markup=markup)
-        group_db_op(lambda conn: (
-            conn.execute(
-                "UPDATE group_members SET welcome_message_id=? WHERE chat_id=? AND user_id=?",
-                (sent.message_id, chat_id, user_id),
-            ),
-            conn.commit(),
-        ))
-    except Exception:
-        logger.exception("Could not send welcome | chat=%s user=%s", chat_id, user_id)
-
+            logger.exception("Could not send welcome | chat=%s user=%s", chat_id, user_id)
 
 def _chat_member_is_active(member) -> bool:
     status = getattr(member, "status", None)

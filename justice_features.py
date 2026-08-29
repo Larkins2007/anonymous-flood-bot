@@ -39,6 +39,7 @@ _db = None
 _db_op = None
 _now = None
 _role_for = None
+_role_for_tag = None
 _normalize_role = None
 _group_member_is_active = None
 _upsert_group_member = None
@@ -56,6 +57,7 @@ _admin_id = None
 _register_user = None
 
 FEATURE_PREFIX = "jf:"
+_PENDING_ADMIN_MESSAGE: dict[int, int] = {}
 
 # Unified Justice Faite visual style for all newly added messages.
 def _fmt(text: str) -> str:
@@ -95,6 +97,10 @@ class JoinApplicationState(StatesGroup):
     waiting_rules = State()
     waiting_role = State()
     waiting_document = State()
+
+
+class AdminApplicationMessageState(StatesGroup):
+    waiting_text = State()
 
 
 def _q(fn, *args):
@@ -473,15 +479,28 @@ def _create_application(user_id: int) -> int:
 def _join_application_kb(app_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
         [InlineKeyboardButton(text="✅ Принять", callback_data=f"{FEATURE_PREFIX}app_ok:{int(app_id)}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"{FEATURE_PREFIX}app_no:{int(app_id)}")],
+        [InlineKeyboardButton(text="🎭 Изменить роль", callback_data=f"{FEATURE_PREFIX}app_role:{int(app_id)}")],
+        [InlineKeyboardButton(text="💬 Написать кандидату", callback_data=f"{FEATURE_PREFIX}app_msg:{int(app_id)}")],
     ])
 
 
 def _application_summary(app) -> str:
+    username = str(app['username'] or '').strip() if 'username' in app.keys() else ''
+    first_name = str(app['first_name'] or '').strip() if 'first_name' in app.keys() else ''
+    if not username and not first_name:
+        user_row = _q(lambda conn: conn.execute(
+            "SELECT username,first_name FROM users WHERE user_id=? LIMIT 1", (int(app['user_id']),)
+        ).fetchone())
+        if user_row:
+            username = str(user_row['username'] or '').strip()
+            first_name = str(user_row['first_name'] or '').strip()
+    user_line = f"@{username}" if username else (first_name or '—')
     return (
         "༺ 𓆩 ✧ 𓆪 ༻\n\n"
         "🌸 Новая заявка Justice Faite\n\n"
         f"№ {int(app['id'])}\n"
-        f"Роль: {app['requested_role'] or '—'}\n"
+        f"Пользователь: {user_line}\n"
+        f"Желаемая роль: {app['requested_role'] or '—'}\n"
         f"Документ: {'получен' if app['document_file_id'] else 'ожидается'}\n\n"
         "✦ Документ предназначен только для проверки возраста."
     )
@@ -605,6 +624,115 @@ async def join_rules_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+async def _live_role_occupied(role: dict[str, Any]) -> bool:
+    """Check role_state, local roster and live Telegram member tags.
+
+    This closes the stale-database hole where a role is already visible in the
+    chat but role_state/group_members missed it.
+    """
+    role_key = _normalize_role(role["name"])
+    row = _q(lambda conn: conn.execute(
+        "SELECT user_id,status FROM role_state WHERE chat_id=? AND role_key=? LIMIT 1",
+        (int(_primary_chat_id), role_key),
+    ).fetchone())
+    if row and (row["user_id"] is not None or row["status"] == "taken"):
+        return True
+
+    local = _q(lambda conn: conn.execute(
+        "SELECT user_id FROM group_members WHERE chat_id=? AND active=1 AND (role_key=? OR lower(replace(role_name,'ё','е'))=lower(replace(?,'ё','е'))) LIMIT 1",
+        (int(_primary_chat_id), role_key, role["name"]),
+    ).fetchone())
+    if local:
+        with suppress(Exception):
+            _q(lambda conn: (conn.execute(
+                "INSERT INTO role_state(chat_id,role_key,role_name,user_id,status,bot_managed,legacy_marker,legacy_custom_emoji_id) VALUES(?,?,?,?,?,0,'','') "
+                "ON CONFLICT(chat_id,role_key) DO UPDATE SET user_id=excluded.user_id,status='taken',role_name=excluded.role_name",
+                (int(_primary_chat_id), role_key, role["name"], int(local["user_id"]), "taken"),
+            ), conn.commit()))
+        return True
+
+    # Verify current Telegram member tags when local state is stale. This is
+    # intentionally limited to known active members; it avoids needing a full
+    # chat-member listing API that Telegram does not expose to bots.
+    members = _q(lambda conn: conn.execute(
+        "SELECT user_id FROM group_members WHERE chat_id=? AND active=1 LIMIT 500",
+        (int(_primary_chat_id),),
+    ).fetchall())
+    for item in members:
+        uid = int(item["user_id"])
+        try:
+            cm = await _bot.get_chat_member(int(_primary_chat_id), uid)
+        except Exception:
+            continue
+        status = getattr(cm, "status", None)
+        if status not in {"member", "administrator", "creator"} and not (status == "restricted" and bool(getattr(cm, "is_member", False))):
+            continue
+        tag = (getattr(cm, "tag", None) or getattr(cm, "custom_title", None) or "").strip()
+        if tag and _role_for_tag and _role_for_tag(tag):
+            live_role = _role_for_tag(tag)
+            if live_role and _normalize_role(live_role["name"]) == role_key:
+                with suppress(Exception):
+                    await _q(lambda conn: (conn.execute(
+                        "UPDATE group_members SET role_key=?,role_name=?,tag=? WHERE chat_id=? AND user_id=?",
+                        (role_key, role["name"], tag, int(_primary_chat_id), uid),
+                    ), conn.commit()))
+                return True
+    return False
+
+
+async def _requested_role_reserved_elsewhere(role_key: str, application_id: int) -> bool:
+    row = _q(lambda conn: conn.execute(
+        "SELECT 1 FROM jf_applications WHERE chat_id=? AND requested_role_key=? AND id!=? AND status IN ('awaiting_document','pending_review','approved_waiting_join') LIMIT 1",
+        (int(_primary_chat_id), role_key, int(application_id)),
+    ).fetchone())
+    return bool(row)
+
+
+async def _process_requested_role(message: Message, state: FSMContext):
+    app = _application_open_for_user(message.from_user.id)
+    if not app or app["status"] != "awaiting_data":
+        return False
+    role = find_requested_role(message.text or "")
+    if not role:
+        await message.reply(_fmt("Роль не распознана") + "\n\n✦ Напишите имя персонажа ещё раз. Можно обычной фразой, например: «хочу Кадзуху».")
+        return True
+    role_key = _normalize_role(role["name"])
+    if await _live_role_occupied(role) or await _requested_role_reserved_elsewhere(role_key, int(app["id"])):
+        await message.reply(_fmt("Роль недоступна") + "\n\n✦ Выбранная роль сейчас недоступна. Укажите другую желаемую роль.")
+        return True
+    _set_application_field(int(app["id"]), requested_role=role["name"], requested_role_key=role_key, status="awaiting_document")
+    await state.set_state(JoinApplicationState.waiting_document)
+    await message.reply(
+        _fmt("Подтверждение возраста") + "\n\n"
+        f"✦ Желаемая роль: {role['name']}\n\n"
+        "✦ Теперь отправьте фотографию документа, подтверждающего, что вам есть 16.\n"
+        "✦ Дата рождения должна быть видна.\n"
+        "✦ Остальные данные можно скрыть.\n\n"
+        "♡ Документ увидит только владелец Justice Faite."
+    )
+    return True
+
+
+async def join_application_text_router(message: Message, state: FSMContext):
+    if message.chat.type != "private" or not message.from_user or not (message.text or "").strip():
+        return
+    app = _application_open_for_user(message.from_user.id)
+    if not app:
+        return
+    status = str(app["status"] or "")
+    if status == "awaiting_data":
+        await _process_requested_role(message, state)
+    elif status == "awaiting_document":
+        await state.set_state(JoinApplicationState.waiting_document)
+        await message.reply(_fmt("Нужна фотография") + "\n\n✦ Отправьте фото документа с видимой датой рождения.")
+    elif status == "pending_review":
+        await message.reply(_fmt("Заявка на проверке") + "\n\n✦ Документ уже передан владельцу. Дождитесь решения администрации.")
+    elif status == "approved_waiting_join":
+        link = app["approved_invite_link"] or ""
+        if link:
+            await message.reply(_fmt("Заявка одобрена") + f"\n\n✦ Ваша персональная ссылка:\n\n{link}")
+
+
 async def join_role_text(message: Message, state: FSMContext):
     if message.chat.type != "private":
         return
@@ -616,11 +744,8 @@ async def join_role_text(message: Message, state: FSMContext):
         await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Не удалось определить персонажа. Напишите название роли ещё раз.")
         return
     role_key = _normalize_role(role["name"])
-    occupied = _q(lambda conn: conn.execute(
-        "SELECT 1 FROM role_state WHERE chat_id=? AND role_key=? AND status='taken' LIMIT 1",
-        (int(_primary_chat_id), role_key),
-    ).fetchone())
-    if occupied:
+    occupied = await _live_role_occupied(role)
+    if occupied or await _requested_role_reserved_elsewhere(role_key, int(app["id"])):
         await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Эта роль сейчас недоступна. Выберите другую желаемую роль.")
         return
     _set_application_field(int(app["id"]), requested_role=role["name"], requested_role_key=role_key, status="awaiting_document")
@@ -635,6 +760,15 @@ async def join_role_text(message: Message, state: FSMContext):
     )
 
 
+async def join_application_photo_router(message: Message, state: FSMContext):
+    if message.chat.type != "private" or not message.from_user or not message.photo:
+        return
+    app = _application_open_for_user(message.from_user.id)
+    if not app or str(app["status"] or "") != "awaiting_document":
+        return
+    await join_document_photo(message, state)
+
+
 async def join_document_photo(message: Message, state: FSMContext):
     if message.chat.type != "private":
         return
@@ -645,11 +779,13 @@ async def join_document_photo(message: Message, state: FSMContext):
         await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\nСначала укажите желаемую роль.")
         return
     try:
+        user_label = f"@{message.from_user.username}" if message.from_user.username else (message.from_user.first_name or "участник")
         caption = (
             "༺ 𓆩 ✧ 𓆪 ༻\n\n📄 Проверка возраста — Justice Faite\n\n"
             f"Заявка №{int(app['id'])}\n"
-            f"Пользователь: @{message.from_user.username}" if message.from_user.username else
-            f"Заявка №{int(app['id'])}\nПользователь: {message.from_user.first_name or 'участник'}"
+            f"Пользователь: {user_label}\n"
+            f"Желаемая роль: {app['requested_role'] or '—'}\n\n"
+            "✦ Фото документа предназначено только для владельца."
         )
         sent = await _bot.send_photo(_admin_id, message.photo[-1].file_id, caption=caption, reply_markup=_join_application_kb(int(app["id"])))
     except Exception:
@@ -686,11 +822,8 @@ async def join_role_fallback(message: Message, state: FSMContext):
         await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Не удалось определить персонажа. Попробуйте написать имя ещё раз.")
         return
     role_key = _normalize_role(role["name"])
-    occupied = _q(lambda conn: conn.execute(
-        "SELECT 1 FROM role_state WHERE chat_id=? AND role_key=? AND status='taken' LIMIT 1",
-        (int(_primary_chat_id), role_key),
-    ).fetchone())
-    if occupied:
+    occupied = await _live_role_occupied(role)
+    if occupied or await _requested_role_reserved_elsewhere(role_key, int(app["id"])):
         await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Эта роль сейчас недоступна. Укажите другую желаемую роль.")
         return
     _set_application_field(int(app["id"]), requested_role=role["name"], requested_role_key=role_key, status="awaiting_document")
@@ -727,6 +860,32 @@ async def applications_list(message: Message):
     await message.reply("\n".join(lines))
 
 
+async def admin_application_message_text(message: Message, state: FSMContext):
+    if message.chat.type != "private" or not _admin_only(message):
+        return
+    app_id = int(_PENDING_ADMIN_MESSAGE.get(int(message.from_user.id), 0))
+    if not app_id:
+        data = await state.get_data()
+        app_id = int(data.get("application_id") or 0)
+    if not app_id:
+        await state.clear()
+        return
+    app = _q(lambda conn: conn.execute("SELECT * FROM jf_applications WHERE id=?", (app_id,)).fetchone())
+    if not app:
+        await state.clear()
+        await message.reply(_fmt("Заявка не найдена"))
+        return
+    text = (message.text or "").strip()
+    if not text:
+        await message.reply(_fmt("Пустое сообщение") + "\n\n✦ Напишите текст для кандидата.")
+        return
+    with suppress(Exception):
+        await _bot.send_message(int(app["user_id"]), _fmt("Сообщение администрации") + f"\n\n✦ {text}")
+    _PENDING_ADMIN_MESSAGE.pop(int(message.from_user.id), None)
+    await state.clear()
+    await message.reply(_fmt("Сообщение отправлено") + "\n\n✦ Кандидат получит его в личных сообщениях.")
+
+
 async def application_callback(callback: CallbackQuery):
     if callback.from_user.id != int(_admin_id):
         await callback.answer("Нет доступа.", show_alert=True)
@@ -740,6 +899,34 @@ async def application_callback(callback: CallbackQuery):
     app = _q(lambda conn: conn.execute("SELECT * FROM jf_applications WHERE id=?", (app_id,)).fetchone())
     if not app:
         await callback.answer("Заявка не найдена.", show_alert=True)
+        return
+    if action == "app_role":
+        if app["status"] in {"declined", "joined"}:
+            await callback.answer("Заявка уже завершена.", show_alert=True)
+            return
+        _set_application_field(app_id, status="awaiting_data", requested_role="", requested_role_key="", review_reason="")
+        with suppress(Exception):
+            await _bot.send_message(int(app["user_id"]), _fmt("Выбор роли") + "\n\n✦ Администрация попросила выбрать другую роль.\n✦ Напишите желаемого персонажа ещё раз.")
+        with suppress(Exception):
+            await callback.message.edit_reply_markup(reply_markup=None)
+        await callback.answer("Кандидату отправлен запрос на выбор другой роли.")
+        return
+    if action == "app_msg":
+        if app["status"] in {"declined", "joined"}:
+            await callback.answer("Для этой заявки сообщение уже не требуется.", show_alert=True)
+            return
+        # Store state without relying on callback-local data after a restart.
+        try:
+            from aiogram.fsm.context import FSMContext as _FSMContext
+        except Exception:
+            _FSMContext = None
+        # This callback is always handled in the owner's private chat.
+        # The handler receives FSMContext only if registered as a callback with it,
+        # so we use a compact transient marker in-memory through the dispatcher.
+        await callback.answer("Напишите сообщение следующим сообщением.")
+        # Best-effort: attach application id to the callback message via a command prompt.
+        await callback.message.reply("💬 Введите текст для кандидата следующим сообщением.")
+        _PENDING_ADMIN_MESSAGE[int(callback.from_user.id)] = app_id
         return
     if action == "app_no":
         if app["status"] in {"declined", "joined"}:
@@ -761,6 +948,16 @@ async def application_callback(callback: CallbackQuery):
             return
         if not _application_ready(app):
             await callback.answer("Нужны роль и документ.", show_alert=True)
+            return
+        role = _role_for(app["requested_role"])
+        if not role or await _live_role_occupied(role):
+            await callback.answer("Эта роль уже недоступна. Заявка сохранена, но сначала выберите другую роль.", show_alert=True)
+            with suppress(Exception):
+                await _bot.send_message(int(app["user_id"]), _fmt("Роль недоступна") + "\n\n✦ Выбранная ранее роль больше не свободна. Обратитесь к администрации.")
+            return
+        if await _member_is_active_in_primary(int(app["user_id"])):
+            _set_application_field(app_id, status="joined", reviewed_by=int(_admin_id), reviewed_at=_utc_iso(), review_reason="Участник уже находится во флуде")
+            await callback.answer("Участник уже находится во флуде.", show_alert=True)
             return
         try:
             expire = datetime.now(timezone.utc) + timedelta(hours=INVITE_TTL_HOURS)
@@ -846,8 +1043,6 @@ async def auto_bind_requested_role(chat_id: int, user):
         _finalize_role_assignment(int(chat_id), int(user.id), role_key, actual or tag)
         _confirm_member(int(chat_id), int(user.id))
         await _lift_member_restriction(int(chat_id), int(user.id))
-        if _send_or_edit_welcome:
-            await _send_or_edit_welcome(int(chat_id), int(user.id))
         _set_application_field(app["id"], status="joined")
         return True
     except ValueError as exc:
@@ -1802,7 +1997,7 @@ async def feature_maintenance_worker():
         await asyncio.sleep(300)
 
 def register_justice_features(ns: dict[str, Any]):
-    global _bot, _dp, _db, _db_op, _now, _role_for, _normalize_role
+    global _bot, _dp, _db, _db_op, _now, _role_for, _role_for_tag, _normalize_role
     global _group_member_is_active, _upsert_group_member, _get_member, _assign_role_db_atomic
     global _apply_member_tag, _finalize_role_assignment, _confirm_member, _lift_member_restriction
     global _send_or_edit_welcome, _display_username, _primary_chat_id, _is_primary_chat, _admin_id, _register_user
@@ -1812,6 +2007,7 @@ def register_justice_features(ns: dict[str, Any]):
     _db_op = ns["group_db_op"]
     _now = ns["now"]
     _role_for = ns["role_for"]
+    _role_for_tag = ns.get("role_for_tag")
     _normalize_role = ns["normalize_role"]
     _group_member_is_active = ns["_chat_member_is_active"]
     _upsert_group_member = ns["upsert_group_member"]
@@ -1857,11 +2053,16 @@ def register_justice_features(ns: dict[str, Any]):
     _dp.message.register(natural_rest_command, F.text.regexp(r"(?iu)^\s*выдать\s+рест\s+.+$"))
 
     _dp.callback_query.register(join_rules_callback, F.data.startswith(FEATURE_PREFIX + "join_"))
+    # Persistent DB-driven routers come before FSM-specific handlers. This makes
+    # the application flow recover even if MemoryStorage is cleared/restarted.
+    _dp.message.register(join_application_text_router, private, F.text)
+    _dp.message.register(join_application_photo_router, private, F.photo)
     _dp.message.register(join_role_text, JoinApplicationState.waiting_role, private, F.text)
     _dp.message.register(join_document_photo, JoinApplicationState.waiting_document, private, F.photo)
     _dp.message.register(join_document_nonphoto, JoinApplicationState.waiting_document, private)
     _dp.message.register(join_role_fallback, private, F.text)
     _dp.message.register(join_document_photo_fallback, private, F.photo)
     _dp.callback_query.register(application_callback, F.data.startswith(FEATURE_PREFIX + "app_"))
+    _dp.message.register(admin_application_message_text, lambda m: m.chat.type == "private" and _admin_only(m) and int(m.from_user.id) in _PENDING_ADMIN_MESSAGE and bool((m.text or "").strip()))
     _dp.chat_join_request.register(handle_join_request)
 
