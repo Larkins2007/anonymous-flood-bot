@@ -57,7 +57,7 @@ from aiogram.types import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-ADMIN_ID = 1682289834
+ADMIN_ID = int(os.getenv("ADMIN_ID", "1682289834") or "1682289834")
 PRIMARY_CHAT_ID = int(os.getenv("PRIMARY_CHAT_ID", "-1004313546398") or "-1004313546398")
 
 DB_PATH = os.getenv("DB_PATH", "users.db").strip() or "users.db"
@@ -210,15 +210,15 @@ async def global_error_handler(event: ErrorEvent):
 # =========================================================
 
 def title(text: str) -> str:
-    return f"♡₊˚ {text} ˚₊♡"
+    return f"༺ 𓆩 ✧ 𓆪 ༻\n🌸 {text}"
 
 
 def section(text: str) -> str:
-    return f"୨୧ {text} ୨୧"
+    return f"✧ {text}"
 
 
 def bullet(text: str) -> str:
-    return f"♡ {text}"
+    return f"✦ {text}"
 
 
 def note(text: str) -> str:
@@ -226,11 +226,11 @@ def note(text: str) -> str:
 
 
 def divider() -> str:
-    return "୨୧ ───────────── ୨୧"
+    return "༺ 𓆩 ✧ 𓆪 ༻"
 
 
 def warning(text: str) -> str:
-    return f"⚠ {text}"
+    return f"⚠️ {text}"
 
 
 # =========================================================
@@ -4662,23 +4662,21 @@ async def send_or_edit_welcome(chat_id, user_id):
         return
 
     display = (row["username"] and "@" + row["username"]) or row["first_name"] or "участник"
-    confirmed = bool(row["confirmed"])
-
     text = (
-        "𝗪𝗘𝗟𝗖𝗢𝗠𝗘\n\n"
-        f"Привет, {display}! 🤍\n\n"
-        "Рады видеть тебя здесь. Перед началом общения, пожалуйста, ознакомься с правилами флуда.\n\n"
-        "𝗥𝗨𝗟𝗘𝗦\n"
-        "Нажимая кнопку ниже, ты подтверждаешь, что ознакомлен(а) с правилами флуда "
-        "и самостоятельно несёшь ответственность за свои действия и сообщения в чате."
+        "༺ 𓆩 ✧ 𓆪 ༻\n\n"
+        f"🌸 Добро пожаловать, {display}!\n\n"
+        "✦ Рады видеть тебя в Justice Faite.\n"
+        "✦ Правила флуда доступны в информационном канале.\n"
+        "✦ По важным вопросам используй обратную связь бота.\n\n"
+        "༺ 𓆩 ✧ 𓆪 ༻"
     )
-
-    button_text = "✓ Правила подтверждены" if confirmed else "✓ Я ознакомлен(а) с правилами"
-    callback_data = f"fm:confirmed:{chat_id}:{user_id}" if confirmed else f"fm:confirm:{chat_id}:{user_id}"
-    markup = InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text=button_text, callback_data=callback_data)],
-        [InlineKeyboardButton(text="Назначить роль", callback_data=f"fm:role:{chat_id}:{user_id}")]
-    ])
+    rows = []
+    rules_url = os.getenv("JF_RULES_URL", "").strip()
+    if rules_url:
+        rows.append([InlineKeyboardButton(text="📜 Правила", url=rules_url)])
+    bot_username = os.getenv("BOT_USERNAME", "justice_faite_bot").strip().lstrip("@")
+    rows.append([InlineKeyboardButton(text="🌸 Открыть бота", url=f"https://t.me/{bot_username}?start=home")])
+    markup = InlineKeyboardMarkup(inline_keyboard=rows)
 
     if row["welcome_message_id"]:
         try:
@@ -4703,6 +4701,7 @@ async def send_or_edit_welcome(chat_id, user_id):
         ))
     except Exception:
         logger.exception("Could not send welcome | chat=%s user=%s", chat_id, user_id)
+
 
 def _chat_member_is_active(member) -> bool:
     status = getattr(member, "status", None)
@@ -4746,8 +4745,13 @@ async def group_member_update(event: ChatMemberUpdated):
             tag_set_by_bot=False,
         )
         await sync_member_tag(chat_id, user.id, user=user, refresh_roster=False, force=True)
+        auto_bound = False
+        try:
+            auto_bound = await jf_autobind_requested_role(chat_id, user)
+        except Exception:
+            logger.exception("Requested-role auto bind failed | chat=%s user=%s", chat_id, user.id)
         refreshed = get_member(chat_id, user.id)
-        if not (refreshed and refreshed["role_key"]):
+        if not auto_bound and not (refreshed and refreshed["role_key"]):
             try:
                 await bot.restrict_chat_member(
                     chat_id,
@@ -4879,14 +4883,21 @@ async def call_assign_role(message: Message):
     if not message.from_user or message.from_user.id != ADMIN_ID:
         return
 
-    role_text = re.sub(r"^\s*калл\s+", "", message.text or "", flags=re.IGNORECASE).strip()
-    role = role_for(role_text)
-    if not role:
-        return
+    role_text = re.sub(r"^\s*калл\s*", "", message.text or "", flags=re.IGNORECASE).strip()
+    role = role_for(role_text) if role_text else None
 
     pending = latest_pending_member(message.chat.id)
     if not pending:
         await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nНе найден новый участник без назначенной роли.")
+        return
+
+    if role is None:
+        try:
+            role = jf_latest_requested_role(message.chat.id)
+        except Exception:
+            role = None
+    if not role:
+        await message.reply("𝗥𝗢𝗟𝗘 𝗔𝗦𝗦𝗜𝗚𝗡𝗠𝗘𝗡𝗧\n\nДля последнего кандидата не сохранена желаемая роль. Укажите её после команды «калл».")
         return
 
     try:
@@ -6444,6 +6455,10 @@ async def setup_commands():
         BotCommand(command="mafia", description="Лобби MafiaAzBot"),
         BotCommand(command="mafia_leave", description="Выйти из мафии"),
         BotCommand(command="spy", description="Запустить игру «Шпион»"),
+        BotCommand(command="jf_join", description="Статус заявки Justice Faite"),
+        BotCommand(command="jf_birthdays", description="Дни рождения Justice Faite"),
+        BotCommand(command="jf_restlist", description="Кто сейчас в ресте"),
+        BotCommand(command="jf_anon", description="Анонимное обращение администрации"),
     ]
     base_admin = [
         *base_user,
@@ -6452,6 +6467,18 @@ async def setup_commands():
         BotCommand(command="game_poll", description="Опрос на игру"),
         BotCommand(command="setrole", description="Назначить роль"),
         BotCommand(command="syncroles", description="Сверить и сохранить роли"),
+        BotCommand(command="jf_invite", description="Создать персональную ссылку на вступление"),
+        BotCommand(command="jf_applications", description="Заявки на вступление"),
+        BotCommand(command="jf_awards", description="Проверить кандидатов на награды"),
+        BotCommand(command="jf_iris_sync", description="Подготовить/передать награды Ирис"),
+        BotCommand(command="jf_dashboard", description="Панель Justice Faite"),
+        BotCommand(command="jf_warn", description="Выдать предупреждение"),
+        BotCommand(command="jf_warnings", description="История предупреждений"),
+        BotCommand(command="jf_warn_remove", description="Снять предупреждение"),
+        BotCommand(command="jf_rest", description="Поставить участника на рест"),
+        BotCommand(command="jf_birthday", description="Сохранить день рождения"),
+        BotCommand(command="jf_birthdays", description="Дни рождения Justice Faite"),
+        BotCommand(command="jf_restlist", description="Кто сейчас в ресте"),
     ]
     private = [
         BotCommand(command="manage_commands", description="Управление командами"),
@@ -8666,6 +8693,24 @@ async def _spy_recovery_worker():
 
 
 
+# =========================================================
+# JUSTICE FAITE COMMUNITY FEATURES
+# =========================================================
+
+try:
+    from justice_features import (
+        register_justice_features,
+        init_justice_features_db,
+        latest_requested_role_for_chat as jf_latest_requested_role,
+        auto_bind_requested_role as jf_autobind_requested_role,
+        feature_maintenance_worker,
+    )
+    register_justice_features(globals())
+except Exception:
+    logger.exception("Could not register Justice Faite features")
+    raise
+
+
 # Custom slash-command fallback MUST be registered after all built-in handlers.
 # aiogram stops on the first matching handler, so registering this before /mafia,
 # /roles, etc. would swallow native commands that are not custom commands.
@@ -8692,6 +8737,7 @@ async def main():
     init_db()
     migrate_db()
     init_group_db()
+    init_justice_features_db()
     seed_role_catalog()
     seed_default_games()
     migrate_group_state()
@@ -8734,6 +8780,7 @@ async def main():
     asyncio.create_task(game_poll_expiry_recovery_worker())
     asyncio.create_task(mafia_expiry_recovery_worker())
     asyncio.create_task(schedule_worker())
+    feature_maintenance_task = asyncio.create_task(feature_maintenance_worker(), name="justice-feature-maintenance")
 
     delivery_tasks = [
         asyncio.create_task(delivery_worker(i + 1), name=f"delivery-{i + 1}")
@@ -8767,6 +8814,10 @@ async def main():
             if exc:
                 raise exc
     finally:
+        feature_maintenance_task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await feature_maintenance_task
+
         for task in delivery_tasks + broadcast_tasks:
             task.cancel()
         for task in delivery_tasks + broadcast_tasks:
