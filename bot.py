@@ -1588,14 +1588,12 @@ async def send_long_message(
 # =========================================================
 
 def main_kb():
-    rows = [
-        [InlineKeyboardButton(text="🚪 Как вступить", callback_data="u:join")],
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="🚪 Хочу вступить", callback_data="u:join")],
         [InlineKeyboardButton(text="🤫 Анонимная связь", callback_data="u:send")],
         [InlineKeyboardButton(text="⚠ Жалоба", callback_data="u:report")],
         [InlineKeyboardButton(text="✦ Как это работает", callback_data="u:info")],
-    ]
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
+    ])
 
 def cancel_kb():
     return InlineKeyboardMarkup(
@@ -1772,15 +1770,14 @@ def report_admin_kb(
 
 def home_text():
     return (
-        f"{title('Вход в Justice Faite')}\n\n"
-        "Добро пожаловать. Здесь можно пройти вступление, "
-        "проверить статус заявки или связаться с администрацией анонимно.\n\n"
-        f"{bullet('Для вступления требуется персональная ссылка от администрации.')}\n"
-        f"{bullet('Анонимные обращения доступны через отдельную кнопку или /anon.')}\n\n"
+        f"{title('Justice Faite')}\n\n"
+        "Добро пожаловать.\n\n"
+        f"{bullet('🚪 Для вступления нажмите «Хочу вступить».')}\n"
+        f"{bullet('🤫 Для анонимной связи используйте отдельное действие.')}\n"
+        f"{bullet('⚠ Для обращения по нарушению используйте жалобу.')}\n\n"
         f"{divider()}\n"
-        "♡ Выберите нужное действие"
+        "♡ Выберите действие"
     )
-
 
 def admin_home_text():
     return (
@@ -1799,7 +1796,7 @@ def admin_home_text():
 # START
 # =========================================================
 
-@dp.message(CommandStart())
+@dp.message(CommandStart(), F.chat.type == "private")
 async def start(
     message: Message,
     state: FSMContext,
@@ -1856,22 +1853,10 @@ async def anon_command(message: Message, state: FSMContext):
 
 @dp.callback_query(F.data == "u:join")
 async def user_join_info(callback: CallbackQuery, state: FSMContext):
-    await state.clear()
-    rules_line = f"\n✦ Правила: {JF_RULES_URL}" if JF_RULES_URL else ""
-    await edit_callback_screen(
-        callback,
-        state,
-        f"{title('Вступление во флуд')}\n\n"
-        f"{bullet('Для входа нужна персональная ссылка от администрации.')}\n"
-        f"{bullet('После запроса на вступление бот напишет вам в личных сообщениях.')}\n"
-        f"{bullet('В ЛС потребуется указать желаемую роль и отправить документ с видимой датой рождения.')}\n"
-        f"{bullet('Документ передаётся только администрации.')}"
-        f"{rules_line}\n\n"
-        f"{divider()}\n"
-        "♡ После одобрения вы сможете полноценно участвовать во флуде.",
-        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="‹ Назад", callback_data="u:home")]]),
-    )
-    await safe_callback_answer(callback)
+    if callback.message.chat.type != "private":
+        await safe_callback_answer(callback)
+        return
+    await jf_begin_join_application(callback, state)
 
 # =========================================================
 # HOME
@@ -5365,27 +5350,25 @@ async def help_cmd(message: Message):
         lines = [
             title("Помощь"),
             "",
-            section("Пользователь"),
-            bullet("/start — вход и информация о Justice Faite"),
+            section("Личные функции"),
+            bullet("/start — вход в Justice Faite и главное меню"),
             bullet("/anon — анонимно написать администрации"),
-            bullet("/jf_join — статус заявки на вступление"),
-            bullet("/jf_birthday DD.MM — сохранить свой день рождения"),
-            bullet("/jf_birthdays — ближайшие дни рождения"),
+            bullet("/jf_birthday — указать или изменить свой день рождения"),
+            bullet("/jf_birthdays — посмотреть дни рождения участников"),
         ]
         if message.from_user and message.from_user.id == ADMIN_ID:
             lines += [
-                "", section("Администратор · только ЛС"),
-                bullet("/jf_invite — создать персональную ссылку на вступление"),
-                bullet("/jf_applications — активные заявки"),
-                bullet("/jf_awards — кандидаты на награды"),
-                bullet("/jf_award — выдать локальную награду"),
-                bullet("/jf_iris_sync — подготовить награды для Ирис"),
+                "", section("Владелец · только это ЛС"),
+                bullet("/jf_applications — активные заявки на вступление"),
+                bullet("/jf_awards — кандидаты на достижения"),
+                bullet("/jf_award — выдать достижение"),
+                bullet("/jf_iris_sync — подготовить выдачу наград через Ирис"),
                 bullet("/jf_dashboard — сводка Justice Faite"),
                 bullet("/jf_warn — выдать предупреждение"),
                 bullet("/jf_warnings — история предупреждений"),
                 bullet("/jf_warn_remove — снять предупреждение"),
-                bullet("/jf_rest — изменить рест"),
-                bullet("/jf_restlist — список реста"),
+                bullet("/jf_rest — поставить или продлить рест"),
+                bullet("/jf_restlist — текущий рест"),
                 bullet("/roles_audit — аудит ролей"),
                 bullet("/bindrole — привязать роль"),
                 bullet("/manage_commands — управление пользовательскими командами"),
@@ -5395,13 +5378,13 @@ async def help_cmd(message: Message):
             ]
         custom = [r for r in get_custom_commands() if _custom_command_allowed(r, message)]
         if custom:
-            lines += ["", section("Дополнительные") ]
+            lines += ["", section("Дополнительные")]
             lines.extend(bullet(f"/{r['command']} — {r['description']}") for r in custom)
         await message.reply("\n".join(lines))
         return
 
     lines = [
-        title("Команды в чате"),
+        title("Команды флуда"),
         "",
         section("Игры"),
         bullet("/mafia — открыть лобби MafiaAzBot"),
@@ -5414,12 +5397,12 @@ async def help_cmd(message: Message):
             bullet("/setrole — назначить роль участнику"),
             bullet("/syncroles — синхронизировать роли"),
             bullet("/game_poll — создать опрос на игру"),
-            bullet("/spy_kick — исключить участника из «Шпион»"),
+            bullet("/spy_kick — исключить из «Шпион»"),
             bullet("/spy_end — завершить «Шпион»"),
         ]
     custom = [r for r in get_custom_commands() if _custom_command_allowed(r, message)]
     if custom:
-        lines += ["", section("Дополнительные") ]
+        lines += ["", section("Дополнительные")]
         lines.extend(bullet(f"/{r['command']} — {r['description']}") for r in custom)
     await message.reply("\n".join(lines))
 
@@ -6521,7 +6504,6 @@ async def setup_commands():
         BotCommand(command="start", description="Вход и информация Justice Faite"),
         BotCommand(command="help", description="Помощь"),
         BotCommand(command="anon", description="Анонимно написать администрации"),
-        BotCommand(command="jf_join", description="Статус заявки"),
         BotCommand(command="jf_birthday", description="Указать свой день рождения"),
         BotCommand(command="jf_birthdays", description="Дни рождения"),
     ]
@@ -6540,7 +6522,6 @@ async def setup_commands():
     ]
     owner_private = [
         *private_user,
-        BotCommand(command="jf_invite", description="Создать ссылку на вступление"),
         BotCommand(command="jf_applications", description="Заявки на вступление"),
         BotCommand(command="jf_awards", description="Кандидаты на награды"),
         BotCommand(command="jf_award", description="Выдать награду"),
@@ -8766,6 +8747,7 @@ try:
     from justice_features import (
         register_justice_features,
         init_justice_features_db,
+        begin_join_application as jf_begin_join_application,
         latest_requested_role_for_chat as jf_latest_requested_role,
         auto_bind_requested_role as jf_autobind_requested_role,
         feature_maintenance_worker,

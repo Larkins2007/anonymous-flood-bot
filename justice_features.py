@@ -72,6 +72,12 @@ class BirthdayState(StatesGroup):
     waiting_date = State()
 
 
+class JoinApplicationState(StatesGroup):
+    waiting_rules = State()
+    waiting_role = State()
+    waiting_document = State()
+
+
 def _q(fn, *args):
     if _db_op is not None:
         return _db_op(fn, *args)
@@ -119,6 +125,8 @@ def init_justice_features_db() -> None:
                 reviewed_by INTEGER,
                 reviewed_at TEXT,
                 review_reason TEXT NOT NULL DEFAULT '',
+                approved_invite_link TEXT NOT NULL DEFAULT '',
+                approved_invite_expires_at TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
             );
@@ -205,8 +213,13 @@ def init_justice_features_db() -> None:
                 sent_at TEXT NOT NULL,
                 PRIMARY KEY(chat_id,user_id,year)
             );
-        """
-        )
+        """)
+        # Forward-compatible migrations for an existing SQLite database.
+        existing = {row[1] for row in conn.execute("PRAGMA table_info(jf_applications)").fetchall()}
+        if "approved_invite_link" not in existing:
+            conn.execute("ALTER TABLE jf_applications ADD COLUMN approved_invite_link TEXT NOT NULL DEFAULT ''")
+        if "approved_invite_expires_at" not in existing:
+            conn.execute("ALTER TABLE jf_applications ADD COLUMN approved_invite_expires_at TEXT")
         conn.commit()
     _q(op)
 
@@ -287,7 +300,8 @@ def _set_application_field(application_id: int, **fields):
         "requested_role", "requested_role_key", "birth_date", "document_file_id",
         "document_message_id", "status", "reviewed_by", "reviewed_at",
         "review_reason", "join_request_at", "join_request_chat_id",
-        "join_request_user_chat_id", "updated_at", "document_message_id"
+        "join_request_user_chat_id", "approved_invite_link",
+        "approved_invite_expires_at", "updated_at"
     }
     fields = {k: v for k, v in fields.items() if k in allowed}
     if not fields:
@@ -300,318 +314,316 @@ def _set_application_field(application_id: int, **fields):
     _q(op)
 
 
+async def _member_is_active_in_primary(user_id: int) -> bool:
+    try:
+        member = await _bot.get_chat_member(int(_primary_chat_id), int(user_id))
+    except Exception:
+        return False
+    status = getattr(member, "status", None)
+    return status in {"member", "administrator", "creator"} or (status == "restricted" and bool(getattr(member, "is_member", False)))
+
+
+def _join_rules_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="✅ Да, ознакомлен", callback_data=FEATURE_PREFIX + "join_rules_yes")],
+        [InlineKeyboardButton(text="❌ Нет", callback_data=FEATURE_PREFIX + "join_rules_no")],
+        [InlineKeyboardButton(text="‹ Назад", callback_data=FEATURE_PREFIX + "join_back")],
+    ])
+
+
+def _join_back_kb() -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="‹ Назад", callback_data=FEATURE_PREFIX + "join_back")]])
+
+
 def _application_ready(row) -> bool:
     return bool(row and str(row["requested_role"] or "").strip() and str(row["document_file_id"] or "").strip())
 
 
-def _application_text(row, user=None) -> str:
-    username = getattr(user, "username", None) if user is not None else None
-    first_name = getattr(user, "first_name", "") if user is not None else ""
-    last_name = getattr(user, "last_name", "") if user is not None else ""
-    display = (f"@{username}" if username else (f"{first_name} {last_name}".strip() or "участник"))
-    role = row["requested_role"] or "не указана"
-    status_map = {
-        "awaiting_data": "ожидание данных",
-        "ready": "данные получены",
-        "pending_review": "на проверке",
-        "approved": "одобрена",
-        "declined": "отклонена",
-    }
-    return (
-        "༺ 𓆩 ✧ 𓆪 ༻\n\n"
-        "🌸 Justice Faite · заявка\n\n"
-        f"👤 {display}\n"
-        f"🎭 Роль: {role}\n"
-        f"🎂 Дата рождения: {row['birth_date'] or 'не указана'}\n"
-        f"📄 Документ: {'получен' if row['document_file_id'] else 'ожидается'}\n"
-        f"📌 Статус: {status_map.get(row['status'], row['status'])}\n\n"
-        "༺ 𓆩 ✧ 𓆪 ༻"
-    )
+def _application_open_for_user(user_id: int):
+    return _q(lambda conn: conn.execute(
+        "SELECT * FROM jf_applications WHERE user_id=? AND status IN ('awaiting_rules','awaiting_data','ready','pending_review') ORDER BY id DESC LIMIT 1",
+        (int(user_id),),
+    ).fetchone())
 
 
-def _application_admin_kb(app_id: int):
+def _create_application(user_id: int) -> int:
+    def op(conn):
+        cur = conn.execute(
+            "INSERT INTO jf_applications(user_id,chat_id,status,created_at,updated_at) VALUES(?,?,?,?,?)",
+            (int(user_id), int(_primary_chat_id), "awaiting_rules", _utc_iso(), _utc_iso()),
+        )
+        conn.commit()
+        return int(cur.lastrowid)
+    return _q(op)
+
+
+def _join_application_kb(app_id: int):
     return InlineKeyboardMarkup(inline_keyboard=[
-        [
-            InlineKeyboardButton(text="✅ Одобрить вступление", callback_data=f"{FEATURE_PREFIX}app_ok:{app_id}"),
-            InlineKeyboardButton(text="❌ Отклонить", callback_data=f"{FEATURE_PREFIX}app_no:{app_id}"),
-        ],
-        [InlineKeyboardButton(text="📄 Запросить документ ещё раз", callback_data=f"{FEATURE_PREFIX}app_doc:{app_id}")],
+        [InlineKeyboardButton(text="✅ Принять", callback_data=f"{FEATURE_PREFIX}app_ok:{int(app_id)}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"{FEATURE_PREFIX}app_no:{int(app_id)}")],
     ])
 
 
-async def create_invite(message: Message):
-    if not _admin_only(message):
+def _application_summary(app) -> str:
+    return (
+        "༺ 𓆩 ✧ 𓆪 ༻\n\n"
+        "🌸 Новая заявка Justice Faite\n\n"
+        f"№ {int(app['id'])}\n"
+        f"Роль: {app['requested_role'] or '—'}\n"
+        f"Документ: {'получен' if app['document_file_id'] else 'ожидается'}\n\n"
+        "✦ Документ предназначен только для проверки возраста."
+    )
+
+
+async def begin_join_application(callback: CallbackQuery, state: FSMContext):
+    if callback.message.chat.type != "private":
+        await callback.answer()
         return
-    try:
-        expire_dt = datetime.now(timezone.utc) + timedelta(hours=INVITE_TTL_HOURS)
-        link = await _bot.create_chat_invite_link(
-            chat_id=int(_primary_chat_id),
-            name=f"JF-{int(time.time())}",
-            expire_date=int(expire_dt.timestamp()),
-            creates_join_request=True,
-        )
-    except Exception as exc:
-        await message.reply(
+    if await _member_is_active_in_primary(callback.from_user.id):
+        await callback.answer("Вы уже состоите во флуде.", show_alert=True)
+        return
+    app = _application_open_for_user(callback.from_user.id)
+    if not app:
+        app_id = _create_application(callback.from_user.id)
+        app = _q(lambda conn: conn.execute("SELECT * FROM jf_applications WHERE id=?", (app_id,)).fetchone())
+    status = str(app["status"])
+    if status == "pending_review":
+        await callback.message.edit_text("༺ 𓆩 ✧ 𓆪 ༻\n\n🌸 Заявка уже отправлена\n\n✦ Дождитесь подтверждения владельца.", reply_markup=_join_back_kb())
+        await callback.answer()
+        return
+    if status == "ready":
+        _set_application_field(app["id"], status="pending_review")
+        await callback.message.edit_text("༺ 𓆩 ✧ 𓆪 ༻\n\n🌸 Заявка готова\n\n✦ Дождитесь подтверждения владельца.", reply_markup=_join_back_kb())
+        await callback.answer()
+        return
+    await state.set_state(JoinApplicationState.waiting_rules)
+    rules_text = "\n\n✦ Правила: " + WELCOME_RULES_URL if WELCOME_RULES_URL else ""
+    await callback.message.edit_text(
+        "༺ 𓆩 ✧ 𓆪 ༻\n\n"
+        "🌸 Вступление в Justice Faite\n\n"
+        "✦ Перед вступлением ознакомьтесь с информационным каналом и правилами флуда.\n\n"
+        "Вы ознакомились?" + rules_text,
+        reply_markup=_join_rules_kb(),
+    )
+    await callback.answer()
+
+
+async def join_rules_callback(callback: CallbackQuery, state: FSMContext):
+    if callback.from_user.id is None:
+        return
+    data = callback.data or ""
+    if data.endswith("join_rules_yes"):
+        app = _application_open_for_user(callback.from_user.id)
+        if not app:
+            app_id = _create_application(callback.from_user.id)
+            app = _q(lambda conn: conn.execute("SELECT * FROM jf_applications WHERE id=?", (app_id,)).fetchone())
+        _set_application_field(int(app["id"]), status="awaiting_data")
+        await state.set_state(JoinApplicationState.waiting_role)
+        await callback.message.edit_text(
             "༺ 𓆩 ✧ 𓆪 ༻\n\n"
-            "❌ Не удалось создать ссылку.\n\n"
-            "Проверь, что бот является администратором флуда и имеет право приглашать пользователей."
+            "🎭 Желаемая роль\n\n"
+            "✦ Напишите персонажа, которого хотите взять.\n"
+            "✦ Можно написать обычной фразой — бот попробует распознать роль.\n"
+            "✦ Занятые роли не показываются.",
+            reply_markup=_join_back_kb(),
         )
+    elif data.endswith("join_rules_no"):
+        await state.clear()
+        await callback.message.edit_text(
+            "༺ 𓆩 ✧ 𓆪 ༻\n\n"
+            "🌸 Тогда сначала загляни в правила 😭\n\n"
+            "✦ Когда ознакомишься — возвращайся и попробуй снова.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩ Назад", callback_data="u:home")]]),
+        )
+    elif data.endswith("join_back"):
+        await state.clear()
+        await callback.message.edit_text(
+            "༺ 𓆩 ✧ 𓆪 ༻\n\n🌸 Justice Faite\n\n✦ Нажмите «Хочу вступить», чтобы подать заявку.",
+            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="🚪 Хочу вступить", callback_data="u:join")],
+                [InlineKeyboardButton(text="🤫 Анонимная связь", callback_data="u:send")],
+                [InlineKeyboardButton(text="⚠ Жалоба", callback_data="u:report")],
+                [InlineKeyboardButton(text="✦ Информация", callback_data="u:info")],
+            ]),
+        )
+    await callback.answer()
+
+
+async def join_role_text(message: Message, state: FSMContext):
+    if message.chat.type != "private":
         return
-    def op(conn):
-        cur = conn.execute(
-            "INSERT INTO jf_invites(invite_link,chat_id,created_by,created_at,expires_at,status) VALUES(?,?,?,?,?,'active')",
-            (link.invite_link, int(_primary_chat_id), int(message.from_user.id), _utc_iso(), expire_dt.isoformat()),
-        )
-        conn.commit()
-        return cur.lastrowid
-    invite_id = _q(op)
+    app = _application_open_for_user(message.from_user.id)
+    if not app or app["status"] != "awaiting_data":
+        return
+    role = find_requested_role(message.text or "")
+    if not role:
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Не удалось определить персонажа. Напишите название роли ещё раз.")
+        return
+    role_key = _normalize_role(role["name"])
+    occupied = _q(lambda conn: conn.execute(
+        "SELECT 1 FROM role_state WHERE chat_id=? AND role_key=? AND status='occupied' LIMIT 1",
+        (int(_primary_chat_id), role_key),
+    ).fetchone())
+    if occupied:
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Эта роль сейчас недоступна. Выберите другую желаемую роль.")
+        return
+    _set_application_field(int(app["id"]), requested_role=role["name"], requested_role_key=role_key)
+    await state.set_state(JoinApplicationState.waiting_document)
     await message.reply(
         "༺ 𓆩 ✧ 𓆪 ༻\n\n"
-        "🌸 Новая ссылка Justice Faite\n\n"
-        f"{link.invite_link}\n\n"
-        f"⏳ Действует до: {expire_dt.astimezone().strftime('%d.%m.%Y %H:%M')}\n"
-        "✦ Ссылка предназначена для одного нового кандидата и автоматически отзывается после первой заявки.\n\n"
-        f"ID заявки-приглашения: {invite_id}"
+        "📄 Подтверждение возраста\n\n"
+        "✦ Отправьте фотографию документа, подтверждающего, что вам есть 16.\n"
+        "✦ Дата рождения должна быть видна.\n"
+        "✦ Остальные данные можно скрыть.\n\n"
+        "Документ увидит только владелец Justice Faite."
     )
+
+
+async def join_document_photo(message: Message, state: FSMContext):
+    if message.chat.type != "private":
+        return
+    app = _application_open_for_user(message.from_user.id)
+    if not app or app["status"] != "awaiting_data":
+        return
+    if not app["requested_role"]:
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\nСначала укажите желаемую роль.")
+        return
+    try:
+        caption = (
+            "༺ 𓆩 ✧ 𓆪 ༻\n\n📄 Проверка возраста — Justice Faite\n\n"
+            f"Заявка №{int(app['id'])}\n"
+            f"Пользователь: @{message.from_user.username}" if message.from_user.username else
+            f"Заявка №{int(app['id'])}\nПользователь: {message.from_user.first_name or 'участник'}"
+        )
+        sent = await _bot.send_photo(_admin_id, message.photo[-1].file_id, caption=caption, reply_markup=_join_application_kb(int(app["id"])))
+    except Exception:
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Не удалось передать документ владельцу. Отправьте фотографию ещё раз.")
+        return
+    _set_application_field(int(app["id"]), document_file_id=message.photo[-1].file_id, document_message_id=sent.message_id, status="pending_review")
+    await state.clear()
+    await message.reply(
+        "༺ 𓆩 ✧ 𓆪 ༻\n\n✅ Документ передан владельцу.\n\n"
+        "✦ Дождитесь подтверждения. После одобрения бот пришлёт персональную ссылку на вступление во флуд."
+    )
+
+
+async def join_document_nonphoto(message: Message, state: FSMContext):
+    if message.chat.type != "private":
+        return
+    app = _application_open_for_user(message.from_user.id)
+    if app and app["status"] == "awaiting_data" and app["requested_role"]:
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n📄 Нужна именно фотография документа. Отправьте изображение с видимой датой рождения.")
 
 
 async def applications_list(message: Message):
-    if not _admin_only(message):
+    if not _admin_only(message) or message.chat.type != "private":
         return
-    rows = _q(lambda conn: conn.execute(
-        "SELECT * FROM jf_applications WHERE chat_id=? AND status IN ('awaiting_data','ready','pending_review') ORDER BY id DESC LIMIT 25",
-        (int(_primary_chat_id),),
-    ).fetchall())
+    rows = _q(lambda conn: conn.execute("SELECT * FROM jf_applications WHERE status IN ('awaiting_data','ready','pending_review','approved_waiting_join','approved') ORDER BY id DESC LIMIT 25").fetchall())
     if not rows:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🌸 Сейчас нет активных заявок.")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n📭 Активных заявок нет.")
         return
-    lines = ["༺ 𓆩 ✧ 𓆪 ༻", "", "🌸 Заявки Justice Faite", ""]
+    lines=["༺ 𓆩 ✧ 𓆪 ༻","","📋 Заявки Justice Faite",""]
     for row in rows:
-        status = "✅" if row["status"] == "ready" else "🟡"
-        lines.append(f"{status} #{row['id']} · {row['requested_role'] or 'роль не указана'} · {'документ' if row['document_file_id'] else 'без документа'}")
+        lines.append(f"#{row['id']} · {row['status']} · {row['requested_role'] or '—'} · {'📄' if row['document_file_id'] else '—'}")
     await message.reply("\n".join(lines))
-
-
-
-async def handle_join_request(event: ChatJoinRequest):
-    if not _is_primary_chat(event.chat.id):
-        return
-    user = event.from_user
-    if getattr(user, "is_bot", False):
-        with suppress(Exception):
-            await _bot.decline_chat_join_request(event.chat.id, user.id)
-        return
-    _register_user(user)
-    invite = event.invite_link
-    invite_text = getattr(invite, "invite_link", "") if invite else ""
-    invite_row = None
-    if invite_text:
-        invite_row = _q(lambda conn: conn.execute(
-            "SELECT * FROM jf_invites WHERE invite_link=? LIMIT 1", (invite_text,)
-        ).fetchone())
-    if invite_row:
-        def op(conn):
-            updated = conn.execute(
-                "UPDATE jf_invites SET status='used',used_by=?,used_at=? WHERE id=? AND status='active'",
-                (int(user.id), _utc_iso(), int(invite_row["id"])),
-            ).rowcount
-            conn.commit()
-            return updated == 1
-        used_now = _q(op)
-        if used_now:
-            with suppress(Exception):
-                await _bot.revoke_chat_invite_link(event.chat.id, invite_text)
-            # Rotate the admission link automatically: every accepted/used
-            # personal link is replaced by a fresh one for the next candidate.
-            try:
-                expire_dt = datetime.now(timezone.utc) + timedelta(hours=INVITE_TTL_HOURS)
-                replacement = await _bot.create_chat_invite_link(
-                    chat_id=int(_primary_chat_id),
-                    name=f"JF-{int(time.time())}",
-                    expire_date=int(expire_dt.timestamp()),
-                    creates_join_request=True,
-                )
-                _q(lambda conn: (conn.execute(
-                    "INSERT OR IGNORE INTO jf_invites(invite_link,chat_id,created_by,created_at,expires_at,status) VALUES(?,?,?,?,?,'active')",
-                    (replacement.invite_link, int(_primary_chat_id), int(_admin_id), _utc_iso(), expire_dt.isoformat()),
-                ), conn.commit()))
-                with suppress(Exception):
-                    await _bot.send_message(
-                        _admin_id,
-                        title("Новая ссылка на вступление") + "\n\n"
-                        + bullet(replacement.invite_link) + "\n"
-                        + bullet(f"Действует до {expire_dt.astimezone().strftime('%d.%m.%Y %H:%M')}")
-                    )
-            except Exception:
-                pass
-
-    def create_app(conn):
-        old = conn.execute(
-            "SELECT * FROM jf_applications WHERE user_id=? AND chat_id=? AND status IN ('awaiting_data','ready','pending_review') ORDER BY id DESC LIMIT 1",
-            (int(user.id), int(event.chat.id)),
-        ).fetchone()
-        if old:
-            conn.execute(
-                "UPDATE jf_applications SET join_request_chat_id=?,join_request_user_chat_id=?,join_request_at=?,invite_id=?,invite_link=?,updated_at=? WHERE id=?",
-                (int(event.chat.id), int(event.user_chat_id), _utc_iso(), invite_row["id"] if invite_row else None, invite_text, _utc_iso(), int(old["id"])),
-            )
-            conn.commit()
-            return old["id"]
-        cur = conn.execute(
-            "INSERT INTO jf_applications(user_id,chat_id,invite_id,invite_link,status,join_request_chat_id,join_request_user_chat_id,join_request_at,created_at,updated_at) VALUES(?,?,?,?,?,?,?,?,?,?)",
-            (int(user.id), int(event.chat.id), invite_row["id"] if invite_row else None, invite_text, 'awaiting_data', int(event.chat.id), int(event.user_chat_id), _utc_iso(), _utc_iso(), _utc_iso()),
-        )
-        conn.commit()
-        return cur.lastrowid
-    app_id = _q(create_app)
-
-    # Telegram explicitly allows a bot to use user_chat_id from a join request
-    # for private messaging for up to 5 minutes; we use it immediately.
-    with suppress(Exception):
-        await _bot.send_message(
-            event.user_chat_id,
-            "༺ 𓆩 ✧ 𓆪 ༻\n\n"
-            "🌸 Добро пожаловать в Justice Faite\n\n"
-            "Чтобы администрация могла рассмотреть вступление, отправьте сюда в любом порядке:\n\n"
-            "✦ желаемую роль;\n"
-            "✦ фотографию документа, подтверждающего, что вам есть 16 лет.\n\n"
-            "Можно скрыть все данные документа, кроме даты рождения.\n"
-            "Фотография документа будет передана только администрации.\n\n"
-            "Порядок не важен: сначала роль, потом документ — или наоборот."
-        )
-
-    row = pending_application(user.id, event.chat.id)
-    # Send an admin application card immediately; document will be forwarded later.
-    try:
-        admin_msg = await _bot.send_message(_admin_id, _application_text(row, user), reply_markup=_application_admin_kb(app_id))
-        _set_application_field(app_id, status=row["status"])
-    except Exception:
-        pass
-
-
-async def _forward_document_to_admin(message: Message, app_row):
-    user = message.from_user
-    caption = (
-        "༺ 𓆩 ✧ 𓆪 ༻\n\n"
-        "📄 Документ кандидата Justice Faite\n\n"
-        f"👤 {(('@' + user.username) if user.username else ((user.first_name or '') + ' ' + (user.last_name or '')).strip() or 'участник')}\n"
-        f"🎭 Желаемая роль: {app_row['requested_role'] or 'не указана'}\n"
-        f"📝 Заявка: #{app_row['id']}\n\n"
-        "✦ Документ предназначен только для проверки возраста администрацией."
-    )
-    try:
-        sent = await _bot.send_photo(_admin_id, message.photo[-1].file_id, caption=caption)
-    except Exception:
-        # As requested, the age proof MUST reach admin; if photo forwarding fails,
-        # do not mark it as accepted.
-        raise
-    _set_application_field(app_row["id"], document_file_id=message.photo[-1].file_id, document_message_id=sent.message_id)
-    return sent
-
-
-async def application_private_photo(message: Message):
-    app = pending_application(message.from_user.id)
-    if not app or message.chat.type != "private":
-        return False
-    try:
-        await _forward_document_to_admin(message, app)
-    except Exception:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Не удалось передать документ администрации. Отправьте фото ещё раз.")
-        return True
-    status = "ready" if _application_ready(_q(lambda conn: conn.execute("SELECT * FROM jf_applications WHERE id=?", (int(app["id"]),)).fetchone())) else "awaiting_data"
-    _set_application_field(app["id"], status=status)
-    if status == "ready":
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n✅ Документ получен и передан администрации. Заявка готова к рассмотрению.")
-    else:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n✅ Документ получен и передан администрации. Теперь укажите желаемую роль.")
-    return True
-
-
-async def application_private_text(message: Message):
-    app = pending_application(message.from_user.id)
-    if not app or message.chat.type != "private":
-        return False
-    text = (message.text or "").strip()
-    if not text or text.startswith("/"):
-        return False
-    role = find_requested_role(text)
-    if role:
-        # Never tell the applicant who owns a conflicting role.
-        role_key = _normalize_role(role["name"])
-        occupied = _q(lambda conn: conn.execute(
-            "SELECT 1 FROM role_state WHERE chat_id=? AND role_key=? AND status='occupied' LIMIT 1",
-            (int(app["chat_id"]), role_key),
-        ).fetchone() is not None)
-        if occupied:
-            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n⚠️ Эта роль сейчас недоступна. Укажите другую желаемую роль.")
-            return True
-        _set_application_field(app["id"], requested_role=role["name"], requested_role_key=role_key)
-    fresh = _q(lambda conn: conn.execute("SELECT * FROM jf_applications WHERE id=?", (int(app["id"]),)).fetchone())
-    if _application_ready(fresh):
-        _set_application_field(app["id"], status="ready")
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n✅ Данные получены. Заявка передана администрации на рассмотрение.")
-    elif role:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Роль сохранена. Теперь отправьте фотографию документа, подтверждающего возраст 16+.")
-    else:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\nНе удалось определить роль. Напишите название персонажа целиком.")
-    return True
 
 
 async def application_callback(callback: CallbackQuery):
     if callback.from_user.id != int(_admin_id):
         await callback.answer("Нет доступа.", show_alert=True)
         return
-    data = callback.data or ""
-    action, raw_id = data.split(":")[-2:]
     try:
+        action, raw_id = (callback.data or "").split(":")[-2:]
         app_id = int(raw_id)
-    except ValueError:
+    except (ValueError, IndexError):
         await callback.answer("Некорректная заявка.", show_alert=True)
         return
     app = _q(lambda conn: conn.execute("SELECT * FROM jf_applications WHERE id=?", (app_id,)).fetchone())
     if not app:
         await callback.answer("Заявка не найдена.", show_alert=True)
         return
-    if action == "app_doc":
-        try:
-            await _bot.send_message(app["join_request_user_chat_id"], "༺ 𓆩 ✧ 𓆪 ༻\n\n📄 Администрации нужен действительный документ с видимой датой рождения. Отправьте фото сюда ещё раз.")
-        except Exception:
-            pass
-        await callback.answer("Запрос отправлен.")
-        return
     if action == "app_no":
-        try:
-            await _bot.decline_chat_join_request(app["chat_id"], app["user_id"])
-            status = "declined"
-            await _bot.send_message(app["join_request_user_chat_id"], "༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Заявка на вступление отклонена администрацией.")
-        except Exception as exc:
-            await callback.answer("Не удалось отклонить заявку.", show_alert=True)
+        if app["status"] in {"declined", "joined"}:
+            await callback.answer("Заявка уже обработана.", show_alert=True)
             return
-        _set_application_field(app_id, status=status, reviewed_by=int(_admin_id), reviewed_at=_utc_iso())
+        _set_application_field(app_id, status="declined", reviewed_by=int(_admin_id), reviewed_at=_utc_iso(), review_reason="Отклонено администрацией")
+        with suppress(Exception):
+            await _bot.send_message(int(app["user_id"]), "༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Заявка на вступление отклонена администрацией.")
         with suppress(Exception):
             await callback.message.edit_reply_markup(reply_markup=None)
         await callback.answer("Заявка отклонена.")
         return
     if action == "app_ok":
+        if app["status"] == "approved_waiting_join":
+            await callback.answer("Для этой заявки ссылка уже создана и ожидает входа.", show_alert=True)
+            return
+        if app["status"] == "approved" or app["status"] == "joined":
+            await callback.answer("Заявка уже обработана.", show_alert=True)
+            return
         if not _application_ready(app):
-            await callback.answer("Сначала нужны роль и документ.", show_alert=True)
+            await callback.answer("Нужны роль и документ.", show_alert=True)
             return
         try:
-            await _bot.approve_chat_join_request(app["chat_id"], app["user_id"])
+            expire = datetime.now(timezone.utc) + timedelta(hours=INVITE_TTL_HOURS)
+            link = await _bot.create_chat_invite_link(
+                int(_primary_chat_id),
+                name=f"Justice Faite #{app_id}",
+                creates_join_request=True,
+                expire_date=expire,
+            )
         except Exception:
-            await callback.answer("Не удалось одобрить вступление. Возможно, заявка уже обработана.", show_alert=True)
+            await callback.answer("Не удалось создать персональную ссылку. Проверьте права бота в чате.", show_alert=True)
             return
-        _set_application_field(app_id, status="approved", reviewed_by=int(_admin_id), reviewed_at=_utc_iso())
-        with suppress(Exception):
-            await _bot.send_message(app["join_request_user_chat_id"], "༺ 𓆩 ✧ 𓆪 ༻\n\n✅ Заявка одобрена. Добро пожаловать в Justice Faite!\n\nПосле входа ваша выбранная роль будет обработана автоматически.")
+        _set_application_field(app_id, status="approved_waiting_join", reviewed_by=int(_admin_id), reviewed_at=_utc_iso(), approved_invite_link=link.invite_link, approved_invite_expires_at=expire.isoformat())
+        try:
+            await _bot.send_message(
+                int(app["user_id"]),
+                "༺ 𓆩 ✧ 𓆪 ༻\n\n✅ Заявка одобрена\n\n"
+                "✦ Ваша персональная ссылка на Justice Faite:\n\n"
+                f"{link.invite_link}\n\n"
+                "✦ Ссылка персональная: бот пропустит по ней только вас. Она ограничена по времени."
+            )
+        except Exception:
+            # Keep the application approved; the admin can inspect the generated link in the application list.
+            pass
         with suppress(Exception):
             await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.answer("Вступление одобрено.")
+        await callback.answer("Заявка одобрена, ссылка создана.")
+        return
+
+
+async def handle_join_request(event: ChatJoinRequest):
+    if int(event.chat.id) != int(_primary_chat_id):
+        return
+    user = event.from_user
+    invite_text = getattr(event.invite_link, "invite_link", "") if getattr(event, "invite_link", None) else ""
+    app = _q(lambda conn: conn.execute(
+        "SELECT * FROM jf_applications WHERE user_id=? AND chat_id=? AND status='approved_waiting_join' ORDER BY id DESC LIMIT 1",
+        (int(user.id), int(event.chat.id)),
+    ).fetchone())
+    # Reject requests that do not belong to a currently approved application/link.
+    if not app or not invite_text or invite_text != (app["approved_invite_link"] or ""):
+        with suppress(Exception):
+            await _bot.decline_chat_join_request(int(event.chat.id), int(user.id))
+        return
+    try:
+        await _bot.approve_chat_join_request(int(event.chat.id), int(user.id))
+        with suppress(Exception):
+            await _bot.revoke_chat_invite_link(int(event.chat.id), invite_text)
+        _q(lambda conn: (conn.execute("UPDATE jf_invites SET status='used',used_by=?,used_at=? WHERE invite_link=?", (int(user.id), _utc_iso(), invite_text)), conn.commit()))
+        _set_application_field(int(app["id"]), status="approved", reviewed_by=int(_admin_id), reviewed_at=app["reviewed_at"] or _utc_iso())
+    except Exception:
+        # Keep the application waiting so a transient Telegram error can be retried.
+        logger_msg = f"Join request approval failed | app={app['id']} user={user.id}"
+        try:
+            import logging as _logging
+            _logging.getLogger(__name__).exception(logger_msg)
+        except Exception:
+            pass
 
 
 async def auto_bind_requested_role(chat_id: int, user):
     app = _q(lambda conn: conn.execute(
-        "SELECT * FROM jf_applications WHERE user_id=? AND chat_id=? AND status='approved' AND requested_role!='' ORDER BY id DESC LIMIT 1",
+        "SELECT * FROM jf_applications WHERE user_id=? AND chat_id=? AND status IN ('approved_waiting_join','approved') AND requested_role!='' ORDER BY id DESC LIMIT 1",
         (int(user.id), int(chat_id)),
     ).fetchone())
     if not app:
@@ -623,34 +635,21 @@ async def auto_bind_requested_role(chat_id: int, user):
         tag, role_key = _assign_role_db_atomic(int(chat_id), user, role)
         ok, actual = await _apply_member_tag(int(chat_id), int(user.id), tag)
         if not ok:
-            # assign_role_db_atomic may have reserved the role; release it atomically.
-            try:
+            with suppress(Exception):
                 from bot import release_role_assignment
                 release_role_assignment(int(chat_id), int(user.id), role_key)
-            except Exception:
-                pass
             return False
         _finalize_role_assignment(int(chat_id), int(user.id), role_key, actual or tag)
         _confirm_member(int(chat_id), int(user.id))
         await _lift_member_restriction(int(chat_id), int(user.id))
         if _send_or_edit_welcome:
             await _send_or_edit_welcome(int(chat_id), int(user.id))
-        await _bot.send_message(
-            _admin_id,
-            "༺ 𓆩 ✧ 𓆪 ༻\n\n"
-            "✅ Роль привязана автоматически\n\n"
-            f"Участник: {_display_username(user)}\n"
-            f"Роль: {role['name']}\n"
-            f"Тег: {actual or tag}"
-        )
-        _set_application_field(app["id"], status="approved")
+        _set_application_field(app["id"], status="joined")
         return True
     except ValueError as exc:
-        if str(exc) == "ROLE_OCCUPIED":
-            return False
+        return str(exc) != "ROLE_OCCUPIED" and False
     except Exception:
         return False
-    return False
 
 
 def warning_eligible_at(level: int, issued_at: str) -> Optional[str]:
@@ -988,28 +987,26 @@ async def cmd_rest(message: Message):
 
 def _parse_birthday(value: str):
     raw = (value or "").strip()
-    m = re.fullmatch(r"(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{4}))?", raw)
+    m = re.fullmatch(r"(\d{1,2})[.\-/](\d{1,2})", raw)
     if not m:
         return None
     day, month = int(m.group(1)), int(m.group(2))
-    year = int(m.group(3)) if m.group(3) else None
     try:
-        # Use a leap year when validating a yearless birthday.
-        datetime(year or 2024, month, day)
+        datetime(2024, month, day)
     except ValueError:
         return None
-    return day, month, year
+    return day, month
 
 
 async def _save_birthday_for_user(user_id: int, value: str, state: FSMContext | None = None):
     parsed = _parse_birthday(value)
     if not parsed:
         return False
-    day, month, year = parsed
+    day, month = parsed
     _q(lambda conn: (conn.execute(
-        "INSERT INTO jf_birthdays(chat_id,user_id,month,day,year,created_at) VALUES(?,?,?,?,?,?) "
-        "ON CONFLICT(chat_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,year=excluded.year,created_at=excluded.created_at",
-        (int(_primary_chat_id), int(user_id), month, day, year, _utc_iso()),
+        "INSERT INTO jf_birthdays(chat_id,user_id,month,day,year,created_at) VALUES(?,?,?,?,NULL,?) "
+        "ON CONFLICT(chat_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,year=NULL,created_at=excluded.created_at",
+        (int(_primary_chat_id), int(user_id), month, day, _utc_iso()),
     ), conn.commit()))
     if state:
         await state.clear()
@@ -1019,106 +1016,19 @@ async def _save_birthday_for_user(user_id: int, value: str, state: FSMContext | 
 async def cmd_birthday(message: Message, state: FSMContext):
     if message.chat.type != "private" or not message.from_user:
         return
-    parts = (message.text or "").split(maxsplit=2)
-    value = parts[1] if len(parts) == 2 else (parts[2] if len(parts) >= 3 and _admin_only(message) else "")
-    target_id = message.from_user.id
-    # Owner may optionally maintain another member's date: /jf_birthday @user DD.MM
-    if len(parts) >= 3 and _admin_only(message):
-        target = parts[1].lstrip("@")
-        row = _q(lambda conn: conn.execute(
-            "SELECT user_id FROM group_members WHERE chat_id=? AND username=? AND active=1 LIMIT 1",
-            (int(_primary_chat_id), target.casefold()),
-        ).fetchone())
-        if not row:
-            await message.reply(f"{title('День рождения')}\n\n{bullet('Участник не найден в активном составе флуда.')}")
-            return
-        target_id = int(row["user_id"])
-        value = parts[2]
-
-    if value:
-        if await _save_birthday_for_user(target_id, value, state):
-            await message.reply(f"{title('День рождения')}\n\n{bullet('Дата сохранена.')}\n{bullet(value.replace('-', '.').replace('/', '.'))}")
+    if not await _member_is_active_in_primary(message.from_user.id):
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\\n\\n🎂 Дни рождения доступны после вступления во флуд.")
+        return
+    parts = (message.text or "").split(maxsplit=1)
+    if len(parts) == 2:
+        if await _save_birthday_for_user(message.from_user.id, parts[1], state):
+            parsed = _parse_birthday(parts[1])
+            await message.reply(f"༺ 𓆩 ✧ 𓆪 ༻\\n\\n✅ День рождения сохранён: {parsed[0]:02d}.{parsed[1]:02d}")
         else:
-            await message.reply(f"{title('День рождения')}\n\n{bullet('Не удалось распознать дату. Используйте DD.MM.')}")
+            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\\n\\n❌ Формат: DD.MM, например 24.03")
         return
-
     await state.set_state(BirthdayState.waiting_date)
-    await message.reply(
-        f"{title('День рождения')}\n\n"
-        f"{bullet('Укажите дату в формате DD.MM.')}\n"
-        f"{bullet('Год указывать не нужно.')}\n\n"
-        f"{divider()}\n"
-        "♡ Например: 24.03",
-    )
-
-
-
-async def _anonymous_send(message: Message):
-    if message.chat.type != "private":
-        return False
-    now = datetime.now(timezone.utc)
-    last = _q(lambda conn: conn.execute(
-        "SELECT created_at FROM jf_anonymous_messages WHERE user_id=? ORDER BY id DESC LIMIT 1", (int(message.from_user.id),)
-    ).fetchone())
-    if last:
-        try:
-            elapsed = (now - datetime.fromisoformat(last["created_at"])).total_seconds()
-            if elapsed < ANON_COOLDOWN_SECONDS:
-                await message.reply(f"⏳ Повторное анонимное сообщение будет доступно через {int(ANON_COOLDOWN_SECONDS-elapsed)} сек.")
-                return True
-        except Exception:
-            pass
-    if len((message.text or "").strip()) > 3000:
-        await message.reply("Слишком длинное сообщение. Максимум — 3000 символов.")
-        return True
-    text = (message.text or "").strip()
-    if not text:
-        return True
-    def op(conn):
-        cur = conn.execute(
-            "INSERT INTO jf_anonymous_messages(user_id,chat_id,text,created_at,status) VALUES(?,?,?,?, 'new')",
-            (int(message.from_user.id), int(_primary_chat_id), text, _utc_iso()),
-        )
-        conn.commit()
-        return cur.lastrowid
-    aid = _q(op)
-    await _bot.send_message(_admin_id, "༺ 𓆩 ✧ 𓆪 ༻\n\n🤫 Анонимное обращение\n\n" + text)
-    await message.reply("✅ Сообщение отправлено анонимно.")
-    return True
-
-
-async def cmd_anon(message: Message):
-    if message.chat.type != "private":
-        return
-    args = (message.text or "").split(maxsplit=1)
-    if len(args) < 2:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\nАнонимная связь запускается командой /anon")
-        return
-    # Rebuild a small Message-like path without leaking author in the visible content.
-    class Proxy:
-        pass
-    proxy = Proxy()
-    proxy.chat = message.chat
-    proxy.from_user = message.from_user
-    proxy.text = args[1]
-    proxy.reply = message.reply
-    await _anonymous_send(proxy)
-
-
-async def join_help(message: Message):
-    if message.chat.type != "private":
-        return
-    app = pending_application(message.from_user.id)
-    if app:
-        await message.reply(
-            "༺ 𓆩 ✧ 𓆪 ༻\n\n"
-            "🌸 Ваша заявка Justice Faite\n\n"
-            f"🎭 Роль: {app['requested_role'] or 'ожидается'}\n"
-            f"📄 Документ: {'получен' if app['document_file_id'] else 'ожидается'}\n\n"
-            "✦ Можно прислать недостающую часть в любом порядке."
-        )
-
-
+    await message.reply("༺ 𓆩 ✧ 𓆪 ༻\\n\\n🎂 Укажите свой день рождения\\n\\n✦ Формат: DD.MM\\n✦ Год указывать не нужно.")
 
 
 async def birthday_state_text(message: Message, state: FSMContext):
@@ -1126,28 +1036,33 @@ async def birthday_state_text(message: Message, state: FSMContext):
         return
     if await _save_birthday_for_user(message.from_user.id, message.text or "", state):
         parsed = _parse_birthday(message.text or "")
-        await message.reply(f"{title('День рождения')}\n\n✅ Дата сохранена: {parsed[0]:02d}.{parsed[1]:02d}")
+        await message.reply(f"༺ 𓆩 ✧ 𓆪 ༻\\n\\n✅ Дата сохранена: {parsed[0]:02d}.{parsed[1]:02d}")
     else:
-        await message.reply(f"{title('День рождения')}\n\n{bullet('Неверный формат. Укажите дату как DD.MM, например 24.03.')}")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\\n\\n❌ Неверный формат. Укажите дату как DD.MM.")
 
 
 async def cmd_birthdays(message: Message):
     if message.chat.type != "private" or not message.from_user:
+        return
+    if not await _member_is_active_in_primary(message.from_user.id):
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\\n\\n🎂 Список доступен после вступления во флуд.")
         return
     rows = _q(lambda conn: conn.execute(
         "SELECT b.*,gm.username,gm.first_name,gm.last_name FROM jf_birthdays b LEFT JOIN group_members gm ON gm.chat_id=b.chat_id AND gm.user_id=b.user_id WHERE b.chat_id=? ORDER BY b.month,b.day",
         (int(_primary_chat_id),),
     ).fetchall())
     if not rows:
-        await message.reply(f"{title('Дни рождения')}\n\n{bullet('Пока никто не добавил дату.')}")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\\n\\n🎂 Сохранённых дней рождения пока нет.")
         return
     today=(datetime.now(timezone.utc).month, datetime.now(timezone.utc).day)
-    ordered=sorted(rows, key=lambda r: (((r["month"]-today[0])%12)*31 + (r["day"]-today[1])%31))
-    lines=[title("Дни рождения"), ""]
+    def dist(r):
+        return ((int(r['month'])-today[0])%12)*31 + ((int(r['day'])-today[1])%31)
+    ordered=sorted(rows, key=dist)
+    lines=["༺ 𓆩 ✧ 𓆪 ༻","","🎂 Дни рождения",""]
     for r in ordered[:30]:
-        name=_display_username(type("U",(),{"id":r["user_id"],"username":r["username"],"first_name":r["first_name"]})())
-        lines.append(f"🎂 {r['day']:02d}.{r['month']:02d} — {name}")
-    await message.reply("\n".join(lines))
+        name=f"@{r['username']}" if r['username'] else (r['first_name'] or "участник")
+        lines.append(f"✦ {r['day']:02d}.{r['month']:02d} — {name}")
+    await message.reply("\\n".join(lines))
 
 
 async def cmd_restlist(message: Message):
@@ -1159,13 +1074,13 @@ async def cmd_restlist(message: Message):
         (int(_primary_chat_id),),
     ).fetchall())
     if not rows:
-        await message.reply(f"{title('Рест')}\n\n{bullet('Сейчас никто не находится в ресте.')}")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\\n\\n🥹 Сейчас никто не находится в ресте.")
         return
-    lines=[title("Рест"), ""]
+    lines=["༺ 𓆩 ✧ 𓆪 ༻","","🥹 Рест",""]
     for r in rows:
         name=f"@{r['username']}" if r["username"] else r["first_name"] or "участник"
-        lines.append(f"🥹 {name} — до {str(r['end_at'])[:10]}")
-    await message.reply("\n".join(lines))
+        lines.append(f"✦ {name} — до {str(r['end_at'])[:10]}")
+    await message.reply("\\n".join(lines))
 
 
 async def feature_maintenance_worker():
@@ -1223,8 +1138,12 @@ def register_justice_features(ns: dict[str, Any]):
     init_justice_features_db()
 
     private = F.chat.type == "private"
-    private_admin = private
-    _dp.message.register(create_invite, Command("jf_invite"), private_admin)
+    private_admin = private & (F.from_user.id == _admin_id)
+
+    _dp.message.register(cmd_birthday, Command("jf_birthday"), private)
+    _dp.message.register(cmd_birthdays, Command("jf_birthdays"), private)
+    _dp.message.register(birthday_state_text, BirthdayState.waiting_date, private, F.text)
+
     _dp.message.register(applications_list, Command("jf_applications"), private_admin)
     _dp.message.register(cmd_dashboard, Command("jf_dashboard"), private_admin)
     _dp.message.register(cmd_awards_check, Command("jf_awards"), private_admin)
@@ -1235,14 +1154,11 @@ def register_justice_features(ns: dict[str, Any]):
     _dp.message.register(cmd_remove_warning, Command("jf_warn_remove"), private_admin)
     _dp.message.register(cmd_rest, Command("jf_rest"), private_admin)
     _dp.message.register(cmd_restlist, Command("jf_restlist"), private_admin)
-    _dp.message.register(cmd_birthday, Command("jf_birthday"), private)
-    _dp.message.register(cmd_birthdays, Command("jf_birthdays"), private)
-    _dp.message.register(join_help, Command("jf_join"), private)
-    _dp.message.register(birthday_state_text, BirthdayState.waiting_date, private, F.text)
-    _dp.chat_join_request.register(handle_join_request)
-    _dp.callback_query.register(application_callback, F.data.startswith(FEATURE_PREFIX + "app_"))
 
-    # These two handlers are intentionally last: they only catch private
-    # application traffic that wasn't claimed by existing FSM handlers.
-    _dp.message.register(application_private_photo, F.chat.type == "private", F.photo)
-    _dp.message.register(application_private_text, F.chat.type == "private", F.text)
+    _dp.callback_query.register(join_rules_callback, F.data.startswith(FEATURE_PREFIX + "join_"))
+    _dp.message.register(join_role_text, JoinApplicationState.waiting_role, private, F.text)
+    _dp.message.register(join_document_photo, JoinApplicationState.waiting_document, private, F.photo)
+    _dp.message.register(join_document_nonphoto, JoinApplicationState.waiting_document, private)
+    _dp.callback_query.register(application_callback, F.data.startswith(FEATURE_PREFIX + "app_"))
+    _dp.chat_join_request.register(handle_join_request)
+
