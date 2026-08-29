@@ -19,6 +19,8 @@ from typing import Any, Optional
 
 from aiogram import F
 from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
 from aiogram.types import (
     CallbackQuery,
     ChatJoinRequest,
@@ -64,6 +66,10 @@ ANON_COOLDOWN_SECONDS = max(0, int(os.getenv("JF_ANON_COOLDOWN_SECONDS", "300"))
 WELCOME_RULES_URL = os.getenv("JF_RULES_URL", "").strip()
 
 ROLE_SCAN_LIMIT = 180
+
+
+class BirthdayState(StatesGroup):
+    waiting_date = State()
 
 
 def _q(fn, *args):
@@ -405,14 +411,39 @@ async def handle_join_request(event: ChatJoinRequest):
         ).fetchone())
     if invite_row:
         def op(conn):
-            conn.execute(
+            updated = conn.execute(
                 "UPDATE jf_invites SET status='used',used_by=?,used_at=? WHERE id=? AND status='active'",
                 (int(user.id), _utc_iso(), int(invite_row["id"])),
-            )
+            ).rowcount
             conn.commit()
-        _q(op)
-        with suppress(Exception):
-            await _bot.revoke_chat_invite_link(event.chat.id, invite_text)
+            return updated == 1
+        used_now = _q(op)
+        if used_now:
+            with suppress(Exception):
+                await _bot.revoke_chat_invite_link(event.chat.id, invite_text)
+            # Rotate the admission link automatically: every accepted/used
+            # personal link is replaced by a fresh one for the next candidate.
+            try:
+                expire_dt = datetime.now(timezone.utc) + timedelta(hours=INVITE_TTL_HOURS)
+                replacement = await _bot.create_chat_invite_link(
+                    chat_id=int(_primary_chat_id),
+                    name=f"JF-{int(time.time())}",
+                    expire_date=int(expire_dt.timestamp()),
+                    creates_join_request=True,
+                )
+                _q(lambda conn: (conn.execute(
+                    "INSERT OR IGNORE INTO jf_invites(invite_link,chat_id,created_by,created_at,expires_at,status) VALUES(?,?,?,?,?,'active')",
+                    (replacement.invite_link, int(_primary_chat_id), int(_admin_id), _utc_iso(), expire_dt.isoformat()),
+                ), conn.commit()))
+                with suppress(Exception):
+                    await _bot.send_message(
+                        _admin_id,
+                        title("Новая ссылка на вступление") + "\n\n"
+                        + bullet(replacement.invite_link) + "\n"
+                        + bullet(f"Действует до {expire_dt.astimezone().strftime('%d.%m.%Y %H:%M')}")
+                    )
+            except Exception:
+                pass
 
     def create_app(conn):
         old = conn.execute(
@@ -955,31 +986,71 @@ async def cmd_rest(message: Message):
     await message.reply("🥹 Рест обновлён.")
 
 
-async def cmd_birthday(message: Message):
-    if not _admin_only(message):
-        return
-    raw = (message.text or "").split(maxsplit=2)
-    if len(raw) < 3 or not re.match(r"^\d{2}\.\d{2}(?:\.\d{4})?$", raw[2]):
-        await message.reply("Формат: /jf_birthday @username DD.MM или DD.MM.YYYY")
-        return
-    username, date_text = raw[1].lstrip("@"), raw[2]
-    row = _q(lambda conn: conn.execute(
-        "SELECT * FROM group_members WHERE chat_id=? AND username=? AND active=1 LIMIT 1", (int(_primary_chat_id), username.casefold())
-    ).fetchone())
-    if not row:
-        await message.reply("Участник не найден.")
-        return
-    parts = date_text.split(".")
-    day, month = int(parts[0]), int(parts[1])
-    year = int(parts[2]) if len(parts) == 3 else None
-    if not (1 <= month <= 12 and 1 <= day <= 31):
-        await message.reply("Некорректная дата.")
-        return
+def _parse_birthday(value: str):
+    raw = (value or "").strip()
+    m = re.fullmatch(r"(\d{1,2})[.\-/](\d{1,2})(?:[.\-/](\d{4}))?", raw)
+    if not m:
+        return None
+    day, month = int(m.group(1)), int(m.group(2))
+    year = int(m.group(3)) if m.group(3) else None
+    try:
+        # Use a leap year when validating a yearless birthday.
+        datetime(year or 2024, month, day)
+    except ValueError:
+        return None
+    return day, month, year
+
+
+async def _save_birthday_for_user(user_id: int, value: str, state: FSMContext | None = None):
+    parsed = _parse_birthday(value)
+    if not parsed:
+        return False
+    day, month, year = parsed
     _q(lambda conn: (conn.execute(
-        "INSERT INTO jf_birthdays(chat_id,user_id,month,day,year,created_at) VALUES(?,?,?,?,?,?) ON CONFLICT(chat_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,year=excluded.year,created_at=excluded.created_at",
-        (int(_primary_chat_id), int(row["user_id"]), month, day, year, _utc_iso()),
+        "INSERT INTO jf_birthdays(chat_id,user_id,month,day,year,created_at) VALUES(?,?,?,?,?,?) "
+        "ON CONFLICT(chat_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,year=excluded.year,created_at=excluded.created_at",
+        (int(_primary_chat_id), int(user_id), month, day, year, _utc_iso()),
     ), conn.commit()))
-    await message.reply("🎂 День рождения сохранён.")
+    if state:
+        await state.clear()
+    return True
+
+
+async def cmd_birthday(message: Message, state: FSMContext):
+    if message.chat.type != "private" or not message.from_user:
+        return
+    parts = (message.text or "").split(maxsplit=2)
+    value = parts[1] if len(parts) == 2 else (parts[2] if len(parts) >= 3 and _admin_only(message) else "")
+    target_id = message.from_user.id
+    # Owner may optionally maintain another member's date: /jf_birthday @user DD.MM
+    if len(parts) >= 3 and _admin_only(message):
+        target = parts[1].lstrip("@")
+        row = _q(lambda conn: conn.execute(
+            "SELECT user_id FROM group_members WHERE chat_id=? AND username=? AND active=1 LIMIT 1",
+            (int(_primary_chat_id), target.casefold()),
+        ).fetchone())
+        if not row:
+            await message.reply(f"{title('День рождения')}\n\n{bullet('Участник не найден в активном составе флуда.')}")
+            return
+        target_id = int(row["user_id"])
+        value = parts[2]
+
+    if value:
+        if await _save_birthday_for_user(target_id, value, state):
+            await message.reply(f"{title('День рождения')}\n\n{bullet('Дата сохранена.')}\n{bullet(value.replace('-', '.').replace('/', '.'))}")
+        else:
+            await message.reply(f"{title('День рождения')}\n\n{bullet('Не удалось распознать дату. Используйте DD.MM.')}")
+        return
+
+    await state.set_state(BirthdayState.waiting_date)
+    await message.reply(
+        f"{title('День рождения')}\n\n"
+        f"{bullet('Укажите дату в формате DD.MM.')}\n"
+        f"{bullet('Год указывать не нужно.')}\n\n"
+        f"{divider()}\n"
+        "♡ Например: 24.03",
+    )
+
 
 
 async def _anonymous_send(message: Message):
@@ -1021,7 +1092,7 @@ async def cmd_anon(message: Message):
         return
     args = (message.text or "").split(maxsplit=1)
     if len(args) < 2:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\nФормат:\n/jf_anon ваш текст")
+        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\nАнонимная связь запускается командой /anon")
         return
     # Rebuild a small Message-like path without leaking author in the visible content.
     class Proxy:
@@ -1050,26 +1121,37 @@ async def join_help(message: Message):
 
 
 
+async def birthday_state_text(message: Message, state: FSMContext):
+    if message.chat.type != "private" or not message.from_user:
+        return
+    if await _save_birthday_for_user(message.from_user.id, message.text or "", state):
+        parsed = _parse_birthday(message.text or "")
+        await message.reply(f"{title('День рождения')}\n\n✅ Дата сохранена: {parsed[0]:02d}.{parsed[1]:02d}")
+    else:
+        await message.reply(f"{title('День рождения')}\n\n{bullet('Неверный формат. Укажите дату как DD.MM, например 24.03.')}")
+
+
 async def cmd_birthdays(message: Message):
-    if message.chat.type not in {"private", "group", "supergroup"}:
+    if message.chat.type != "private" or not message.from_user:
         return
     rows = _q(lambda conn: conn.execute(
         "SELECT b.*,gm.username,gm.first_name,gm.last_name FROM jf_birthdays b LEFT JOIN group_members gm ON gm.chat_id=b.chat_id AND gm.user_id=b.user_id WHERE b.chat_id=? ORDER BY b.month,b.day",
         (int(_primary_chat_id),),
     ).fetchall())
     if not rows:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎂 Сохранённых дней рождения пока нет.")
+        await message.reply(f"{title('Дни рождения')}\n\n{bullet('Пока никто не добавил дату.')}")
         return
     today=(datetime.now(timezone.utc).month, datetime.now(timezone.utc).day)
     ordered=sorted(rows, key=lambda r: (((r["month"]-today[0])%12)*31 + (r["day"]-today[1])%31))
-    lines=["༺ 𓆩 ✧ 𓆪 ༻","","🎂 Дни рождения Justice Faite",""]
-    for r in ordered[:20]:
+    lines=[title("Дни рождения"), ""]
+    for r in ordered[:30]:
         name=_display_username(type("U",(),{"id":r["user_id"],"username":r["username"],"first_name":r["first_name"]})())
         lines.append(f"🎂 {r['day']:02d}.{r['month']:02d} — {name}")
     await message.reply("\n".join(lines))
 
+
 async def cmd_restlist(message: Message):
-    if message.chat.type not in {"private", "group", "supergroup"}:
+    if not _admin_only(message) or message.chat.type != "private":
         return
     _q(lambda conn: (conn.execute("UPDATE jf_rest SET active=0 WHERE chat_id=? AND active=1 AND end_at<=?", (int(_primary_chat_id), _utc_iso())), conn.commit()))
     rows = _q(lambda conn: conn.execute(
@@ -1077,13 +1159,14 @@ async def cmd_restlist(message: Message):
         (int(_primary_chat_id),),
     ).fetchall())
     if not rows:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🥹 Сейчас никто не находится в ресте.")
+        await message.reply(f"{title('Рест')}\n\n{bullet('Сейчас никто не находится в ресте.')}")
         return
-    lines=["༺ 𓆩 ✧ 𓆪 ༻","","🥹 Сейчас в ресте",""]
+    lines=[title("Рест"), ""]
     for r in rows:
         name=f"@{r['username']}" if r["username"] else r["first_name"] or "участник"
         lines.append(f"🥹 {name} — до {str(r['end_at'])[:10]}")
     await message.reply("\n".join(lines))
+
 
 async def feature_maintenance_worker():
     last_bday_date = None
@@ -1139,21 +1222,23 @@ def register_justice_features(ns: dict[str, Any]):
     # makes importing the module in simulations convenient.
     init_justice_features_db()
 
-    _dp.message.register(create_invite, Command("jf_invite"))
-    _dp.message.register(applications_list, Command("jf_applications"))
-    _dp.message.register(cmd_dashboard, Command("jf_dashboard"))
-    _dp.message.register(cmd_awards_check, Command("jf_awards"))
-    _dp.message.register(cmd_award, Command("jf_award"))
-    _dp.message.register(cmd_iris_sync, Command("jf_iris_sync"))
-    _dp.message.register(cmd_warn, Command("jf_warn"))
-    _dp.message.register(cmd_warnings, Command("jf_warnings"))
-    _dp.message.register(cmd_remove_warning, Command("jf_warn_remove"))
-    _dp.message.register(cmd_rest, Command("jf_rest"))
-    _dp.message.register(cmd_birthday, Command("jf_birthday"))
-    _dp.message.register(cmd_birthdays, Command("jf_birthdays"))
-    _dp.message.register(cmd_restlist, Command("jf_restlist"))
-    _dp.message.register(cmd_anon, Command("jf_anon"))
-    _dp.message.register(join_help, Command("jf_join"))
+    private = F.chat.type == "private"
+    private_admin = private
+    _dp.message.register(create_invite, Command("jf_invite"), private_admin)
+    _dp.message.register(applications_list, Command("jf_applications"), private_admin)
+    _dp.message.register(cmd_dashboard, Command("jf_dashboard"), private_admin)
+    _dp.message.register(cmd_awards_check, Command("jf_awards"), private_admin)
+    _dp.message.register(cmd_award, Command("jf_award"), private_admin)
+    _dp.message.register(cmd_iris_sync, Command("jf_iris_sync"), private_admin)
+    _dp.message.register(cmd_warn, Command("jf_warn"), private_admin)
+    _dp.message.register(cmd_warnings, Command("jf_warnings"), private_admin)
+    _dp.message.register(cmd_remove_warning, Command("jf_warn_remove"), private_admin)
+    _dp.message.register(cmd_rest, Command("jf_rest"), private_admin)
+    _dp.message.register(cmd_restlist, Command("jf_restlist"), private_admin)
+    _dp.message.register(cmd_birthday, Command("jf_birthday"), private)
+    _dp.message.register(cmd_birthdays, Command("jf_birthdays"), private)
+    _dp.message.register(join_help, Command("jf_join"), private)
+    _dp.message.register(birthday_state_text, BirthdayState.waiting_date, private, F.text)
     _dp.chat_join_request.register(handle_join_request)
     _dp.callback_query.register(application_callback, F.data.startswith(FEATURE_PREFIX + "app_"))
 

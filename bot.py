@@ -75,6 +75,7 @@ SCHEDULE_ANCHOR_DATE = os.getenv("SCHEDULE_ANCHOR_DATE", "2026-08-18")
 SCHEDULE_CHECK_SECONDS = int(os.getenv("SCHEDULE_CHECK_SECONDS", "30"))
 DEFAULT_TIMEZONE_OFFSET_HOURS = int(os.getenv("DEFAULT_TIMEZONE_OFFSET_HOURS", "3"))
 BOT_USERNAME = os.getenv("BOT_USERNAME", "justice_faite_bot").strip().lstrip("@")
+JF_RULES_URL = os.getenv("JF_RULES_URL", "").strip()
 
 
 # =========================================================
@@ -1587,28 +1588,13 @@ async def send_long_message(
 # =========================================================
 
 def main_kb():
-    return InlineKeyboardMarkup(
-        inline_keyboard=[
-            [
-                InlineKeyboardButton(
-                    text="♡₊˚ Оставить сообщение ˚₊♡",
-                    callback_data="u:send",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="୨୧ Как это работает",
-                    callback_data="u:info",
-                )
-            ],
-            [
-                InlineKeyboardButton(
-                    text="⚠ Пожаловаться",
-                    callback_data="u:report",
-                )
-            ],
-        ]
-    )
+    rows = [
+        [InlineKeyboardButton(text="🚪 Как вступить", callback_data="u:join")],
+        [InlineKeyboardButton(text="🤫 Анонимная связь", callback_data="u:send")],
+        [InlineKeyboardButton(text="⚠ Жалоба", callback_data="u:report")],
+        [InlineKeyboardButton(text="✦ Как это работает", callback_data="u:info")],
+    ]
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 
 def cancel_kb():
@@ -1786,11 +1772,13 @@ def report_admin_kb(
 
 def home_text():
     return (
-        f"{title('Анонимная обратная связь')}\n\n"
-        "Здесь вы можете оставить сообщение администрации.\n\n"
-        f"{bullet('Другие участники не видят ваш профиль.')}\n\n"
+        f"{title('Вход в Justice Faite')}\n\n"
+        "Добро пожаловать. Здесь можно пройти вступление, "
+        "проверить статус заявки или связаться с администрацией анонимно.\n\n"
+        f"{bullet('Для вступления требуется персональная ссылка от администрации.')}\n"
+        f"{bullet('Анонимные обращения доступны через отдельную кнопку или /anon.')}\n\n"
         f"{divider()}\n"
-        "♡ Выберите действие"
+        "♡ Выберите нужное действие"
     )
 
 
@@ -1844,6 +1832,47 @@ async def start(
         main_kb(),
     )
 
+@dp.message(Command("anon"), F.chat.type == "private")
+async def anon_command(message: Message, state: FSMContext):
+    if is_blocked(message.from_user.id):
+        await message.answer(
+            f"{title('Доступ ограничен')}\n\n"
+            f"{bullet('Для вашего аккаунта отправка сообщений отключена.')}"
+        )
+        return
+    await state.set_state(FeedbackState.waiting)
+    await send_screen(
+        message,
+        state,
+        f"{title('Анонимная связь')}\n\n"
+        f"{bullet('Ваш текст увидит только администрация.')}\n"
+        f"{bullet('Имя, username и ID не отображаются в интерфейсе обращения.')}\n"
+        f"{bullet('Максимальная длина — {MAX_MESSAGE_LENGTH} символов.')}\n\n"
+        f"{divider()}\n"
+        "♡ Напишите сообщение следующим сообщением.",
+        cancel_kb(),
+    )
+
+
+@dp.callback_query(F.data == "u:join")
+async def user_join_info(callback: CallbackQuery, state: FSMContext):
+    await state.clear()
+    rules_line = f"\n✦ Правила: {JF_RULES_URL}" if JF_RULES_URL else ""
+    await edit_callback_screen(
+        callback,
+        state,
+        f"{title('Вступление во флуд')}\n\n"
+        f"{bullet('Для входа нужна персональная ссылка от администрации.')}\n"
+        f"{bullet('После запроса на вступление бот напишет вам в личных сообщениях.')}\n"
+        f"{bullet('В ЛС потребуется указать желаемую роль и отправить документ с видимой датой рождения.')}\n"
+        f"{bullet('Документ передаётся только администрации.')}"
+        f"{rules_line}\n\n"
+        f"{divider()}\n"
+        "♡ После одобрения вы сможете полноценно участвовать во флуде.",
+        InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="‹ Назад", callback_data="u:home")]]),
+    )
+    await safe_callback_answer(callback)
+
 # =========================================================
 # HOME
 # =========================================================
@@ -1876,8 +1905,8 @@ async def user_info(
     await edit_callback_screen(
         callback,
         state,
-        f"♡₊˚ Как это работает ˚₊♡\n\n"
-        "Вы можете оставить обратную связь о флуде, "
+        f"{title('Как это работает')}\n\n"
+        "Бот объединяет вступление, анонимную связь и внутренние функции Justice Faite. "
         "поделиться своим мнением, предложением, советом "
         "или своими предпочтениями.\n\n"
         f"{divider()}\n"
@@ -5331,30 +5360,68 @@ async def commands_cmd(message: Message):
 async def help_cmd(message: Message):
     if message.chat.type in {"group", "supergroup"} and not is_primary_chat(message.chat.id):
         return
-    text=(
-        "𝗛𝗘𝗟𝗣\n\n"
-        "Основные команды\n"
-        "/mafia — открыть лобби MafiaAzBot\n"
-        "/mafia_leave — выйти из лобби\n"
-    )
+
+    if message.chat.type == "private":
+        lines = [
+            title("Помощь"),
+            "",
+            section("Пользователь"),
+            bullet("/start — вход и информация о Justice Faite"),
+            bullet("/anon — анонимно написать администрации"),
+            bullet("/jf_join — статус заявки на вступление"),
+            bullet("/jf_birthday DD.MM — сохранить свой день рождения"),
+            bullet("/jf_birthdays — ближайшие дни рождения"),
+        ]
+        if message.from_user and message.from_user.id == ADMIN_ID:
+            lines += [
+                "", section("Администратор · только ЛС"),
+                bullet("/jf_invite — создать персональную ссылку на вступление"),
+                bullet("/jf_applications — активные заявки"),
+                bullet("/jf_awards — кандидаты на награды"),
+                bullet("/jf_award — выдать локальную награду"),
+                bullet("/jf_iris_sync — подготовить награды для Ирис"),
+                bullet("/jf_dashboard — сводка Justice Faite"),
+                bullet("/jf_warn — выдать предупреждение"),
+                bullet("/jf_warnings — история предупреждений"),
+                bullet("/jf_warn_remove — снять предупреждение"),
+                bullet("/jf_rest — изменить рест"),
+                bullet("/jf_restlist — список реста"),
+                bullet("/roles_audit — аудит ролей"),
+                bullet("/bindrole — привязать роль"),
+                bullet("/manage_commands — управление пользовательскими командами"),
+                bullet("/addcommand — добавить пользовательскую команду"),
+                bullet("/delcommand — удалить пользовательскую команду"),
+                bullet("/commands — список пользовательских команд"),
+            ]
+        custom = [r for r in get_custom_commands() if _custom_command_allowed(r, message)]
+        if custom:
+            lines += ["", section("Дополнительные") ]
+            lines.extend(bullet(f"/{r['command']} — {r['description']}") for r in custom)
+        await message.reply("\n".join(lines))
+        return
+
+    lines = [
+        title("Команды в чате"),
+        "",
+        section("Игры"),
+        bullet("/mafia — открыть лобби MafiaAzBot"),
+        bullet("/mafia_leave — выйти из лобби"),
+        bullet("/spy — запустить игру «Шпион»"),
+    ]
     if is_group_admin_user(message):
-        text += (
-            "\n𝗔𝗗𝗠𝗜𝗡\n"
-            "/setrole — назначить роль участнику\n"
-            "/syncroles — сверить и сохранить реальные Telegram-теги участников\n"
-            "/game_poll — запустить опрос на игру\n"
-                    )
-    if message.chat.type=="private" and message.from_user and message.from_user.id==ADMIN_ID:
-        text += (
-            "\n𝗟𝗦 𝗔𝗗𝗠𝗜𝗡\n"
-            "/start — открыть анонимную обратную связь\n"
-            "/manage_commands\n/addcommand\n/delcommand\n/commands\n/bindrole\n/roles_audit\n"
-        )
-    custom=get_custom_commands()
-    visible=[r for r in custom if _custom_command_allowed(r,message)]
-    if visible:
-        text += "\n𝗖𝗨𝗦𝗧𝗢𝗠\n" + "\n".join(f"/{r['command']} — {r['description']}" for r in visible)
-    await message.reply(text)
+        lines += [
+            "", section("Администрирование"),
+            bullet("/setrole — назначить роль участнику"),
+            bullet("/syncroles — синхронизировать роли"),
+            bullet("/game_poll — создать опрос на игру"),
+            bullet("/spy_kick — исключить участника из «Шпион»"),
+            bullet("/spy_end — завершить «Шпион»"),
+        ]
+    custom = [r for r in get_custom_commands() if _custom_command_allowed(r, message)]
+    if custom:
+        lines += ["", section("Дополнительные") ]
+        lines.extend(bullet(f"/{r['command']} — {r['description']}") for r in custom)
+    await message.reply("\n".join(lines))
 
 
 @dp.message(Command("roles_audit"), F.chat.type == "private")
@@ -6449,86 +6516,84 @@ def seed_default_games():
 
 
 async def setup_commands():
-    base_user = [
-        BotCommand(command="start", description="Открыть анонимную обратную связь"),
-        BotCommand(command="help", description="Помощь и команды"),
+    # Private menu for all users. Admin-only commands are exposed only to OWNER_ID.
+    private_user = [
+        BotCommand(command="start", description="Вход и информация Justice Faite"),
+        BotCommand(command="help", description="Помощь"),
+        BotCommand(command="anon", description="Анонимно написать администрации"),
+        BotCommand(command="jf_join", description="Статус заявки"),
+        BotCommand(command="jf_birthday", description="Указать свой день рождения"),
+        BotCommand(command="jf_birthdays", description="Дни рождения"),
+    ]
+    group_user = [
+        BotCommand(command="help", description="Команды"),
         BotCommand(command="mafia", description="Лобби MafiaAzBot"),
         BotCommand(command="mafia_leave", description="Выйти из мафии"),
         BotCommand(command="spy", description="Запустить игру «Шпион»"),
-        BotCommand(command="jf_join", description="Статус заявки Justice Faite"),
-        BotCommand(command="jf_birthdays", description="Дни рождения Justice Faite"),
-        BotCommand(command="jf_restlist", description="Кто сейчас в ресте"),
-        BotCommand(command="jf_anon", description="Анонимное обращение администрации"),
     ]
-    base_admin = [
-        *base_user,
-        BotCommand(command="spy_kick", description="Исключить участника из «Шпион»"),
-        BotCommand(command="spy_end", description="Досрочно завершить «Шпион»"),
-        BotCommand(command="game_poll", description="Опрос на игру"),
+    group_admin = group_user + [
         BotCommand(command="setrole", description="Назначить роль"),
-        BotCommand(command="syncroles", description="Сверить и сохранить роли"),
-        BotCommand(command="jf_invite", description="Создать персональную ссылку на вступление"),
+        BotCommand(command="syncroles", description="Синхронизировать роли"),
+        BotCommand(command="game_poll", description="Опрос на игру"),
+        BotCommand(command="spy_kick", description="Исключить из «Шпион»"),
+        BotCommand(command="spy_end", description="Завершить «Шпион»"),
+    ]
+    owner_private = [
+        *private_user,
+        BotCommand(command="jf_invite", description="Создать ссылку на вступление"),
         BotCommand(command="jf_applications", description="Заявки на вступление"),
-        BotCommand(command="jf_awards", description="Проверить кандидатов на награды"),
-        BotCommand(command="jf_iris_sync", description="Подготовить/передать награды Ирис"),
+        BotCommand(command="jf_awards", description="Кандидаты на награды"),
+        BotCommand(command="jf_award", description="Выдать награду"),
+        BotCommand(command="jf_iris_sync", description="Подготовить награды для Ирис"),
         BotCommand(command="jf_dashboard", description="Панель Justice Faite"),
         BotCommand(command="jf_warn", description="Выдать предупреждение"),
         BotCommand(command="jf_warnings", description="История предупреждений"),
         BotCommand(command="jf_warn_remove", description="Снять предупреждение"),
-        BotCommand(command="jf_rest", description="Поставить участника на рест"),
-        BotCommand(command="jf_birthday", description="Сохранить день рождения"),
-        BotCommand(command="jf_birthdays", description="Дни рождения Justice Faite"),
-        BotCommand(command="jf_restlist", description="Кто сейчас в ресте"),
-    ]
-    private = [
+        BotCommand(command="jf_rest", description="Поставить на рест"),
+        BotCommand(command="jf_restlist", description="Список реста"),
+        BotCommand(command="roles_audit", description="Аудит ролей"),
+        BotCommand(command="bindrole", description="Привязать роль"),
         BotCommand(command="manage_commands", description="Управление командами"),
         BotCommand(command="addcommand", description="Добавить команду"),
         BotCommand(command="delcommand", description="Удалить команду"),
         BotCommand(command="commands", description="Список команд"),
-        BotCommand(command="bindrole", description="Привязать роль"),
-        BotCommand(command="roles_audit", description="Аудит ролей"),
     ]
-    user_commands=list(base_user)
-    admin_commands=list(base_admin)
-    private_commands=list(private)
-    for row in get_custom_commands():
+
+    custom = get_custom_commands()
+    for row in custom:
         try:
-            cmd=BotCommand(command=row["command"], description=row["description"][:256])
+            cmd = BotCommand(command=row["command"], description=row["description"][:256])
         except Exception:
             continue
         if row["scope"] in {"all", "group"}:
-            user_commands.append(cmd)
-        if row["scope"] in {"all", "admin"}:
-            admin_commands.append(cmd)
-        if row["scope"] == "private":
-            private_commands.append(cmd)
-    # Clear stale command scopes from previous deployments first.
-    with suppress(Exception):
-        await bot.set_my_commands([], scope=BotCommandScopeDefault())
-    with suppress(Exception):
-        await bot.set_my_commands([], scope=BotCommandScopeAllGroupChats())
-    with suppress(Exception):
-        await bot.set_my_commands([], scope=BotCommandScopeAllChatAdministrators())
-    if PRIMARY_CHAT_ID:
-        with suppress(Exception):
-            await bot.set_my_commands([], scope=BotCommandScopeChat(chat_id=PRIMARY_CHAT_ID))
-        with suppress(Exception):
-            await bot.set_my_commands([], scope=BotCommandScopeChatAdministrators(chat_id=PRIMARY_CHAT_ID))
+            group_user.append(cmd)
+            group_admin.append(cmd)
+        if row["scope"] == "all":
+            private_user.append(cmd)
+        if row["scope"] in {"all", "admin", "private"}:
+            owner_private.append(cmd)
 
-    # Private/default user commands. No legacy /schedule command.
-    await bot.set_my_commands(user_commands, scope=BotCommandScopeDefault())
+    stale_scopes = [
+        BotCommandScopeDefault(),
+        BotCommandScopeAllGroupChats(),
+        BotCommandScopeAllChatAdministrators(),
+        BotCommandScopeChat(chat_id=ADMIN_ID),
+    ]
     if PRIMARY_CHAT_ID:
-        # Everyone in the primary chat sees base user commands.
-        await bot.set_my_commands(user_commands, scope=BotCommandScopeChat(chat_id=PRIMARY_CHAT_ID))
-        # Keep the full useful menu visible in the primary chat; handlers enforce admin-only actions.
-        await bot.set_my_commands(admin_commands, scope=BotCommandScopeChat(chat_id=PRIMARY_CHAT_ID))
-    else:
-        # Safe fallback for first deployment before PRIMARY_CHAT_ID is configured.
-        await bot.set_my_commands(user_commands, scope=BotCommandScopeAllGroupChats())
-        await bot.set_my_commands(admin_commands, scope=BotCommandScopeAllChatAdministrators())
+        stale_scopes += [
+            BotCommandScopeChat(chat_id=PRIMARY_CHAT_ID),
+            BotCommandScopeChatAdministrators(chat_id=PRIMARY_CHAT_ID),
+        ]
+    for scope in stale_scopes:
+        with suppress(Exception):
+            await bot.set_my_commands([], scope=scope)
 
-    # Owner's private command menu.
-    await bot.set_my_commands(admin_commands + private_commands, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    await bot.set_my_commands(private_user, scope=BotCommandScopeDefault())
+    await bot.set_my_commands(owner_private, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
+    if PRIMARY_CHAT_ID:
+        # Commands are intentionally published only in the actual Justice Faite chat.
+        await bot.set_my_commands(group_user, scope=BotCommandScopeChat(chat_id=PRIMARY_CHAT_ID))
+        await bot.set_my_commands(group_admin, scope=BotCommandScopeChatAdministrators(chat_id=PRIMARY_CHAT_ID))
 
 
 # =========================================================
