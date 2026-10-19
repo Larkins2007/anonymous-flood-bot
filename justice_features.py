@@ -14,6 +14,7 @@ import re
 import sqlite3
 import difflib
 import time
+import unicodedata
 from contextlib import suppress
 from datetime import datetime, timezone, timedelta
 from typing import Any, Optional
@@ -1219,7 +1220,14 @@ def compute_old_and_active_candidates(chat_id: int):
 
 
 def _display_key(value: str) -> str:
-    return re.sub(r"[^a-zа-я0-9]+", "", (value or "").casefold().replace("ё", "е"))
+    """Normalize a display name while retaining Unicode and stylized letters.
+
+    Iris lists often contain mathematical/stylized Unicode alphabets. NFKC
+    converts compatible glyphs where possible; keeping all Unicode letters and
+    numbers prevents Cyrillic/Latin stylized names from collapsing to empty keys.
+    """
+    normalized = unicodedata.normalize("NFKC", (value or "")).casefold().replace("ё", "е")
+    return "".join(ch for ch in normalized if unicodedata.category(ch)[:1] in {"L", "N"})
 
 
 def _utf16_prefix(text: str) -> list[int]:
@@ -1238,12 +1246,13 @@ def _utf16_slice(text: str, start: int, length: int) -> str:
 
 def _line_entity_identity(message: Message, line_start_py: int, line_end_py: int):
     """Return concrete Telegram user identities referenced by clickable entities in a line."""
-    text = message.text or ""
+    text = message.text or message.caption or ""
     prefix = _utf16_prefix(text)
     start_u16 = prefix[line_start_py]
     end_u16 = prefix[line_end_py]
     identities: list[tuple[str, Any]] = []
-    for entity in message.entities or []:
+    entities = message.entities or message.caption_entities or []
+    for entity in entities:
         ent_start = int(entity.offset)
         ent_end = ent_start + int(entity.length)
         if ent_start < start_u16 or ent_start >= end_u16:
@@ -1253,9 +1262,13 @@ def _line_entity_identity(message: Message, line_start_py: int, line_end_py: int
             identities.append(("id", entity.user))
         elif etype == "text_link":
             url = str(getattr(entity, "url", "") or "")
-            match = re.search(r"tg://user\?id=(\d+)", url)
-            if match:
-                identities.append(("id", int(match.group(1))))
+            id_match = re.search(r"tg://user\?id=(\d+)", url)
+            if id_match:
+                identities.append(("id", int(id_match.group(1))))
+            else:
+                username_match = re.search(r"(?:https?://)?(?:www\.)?t\.me/([A-Za-z0-9_]{3,32})(?:[/?#]|$)", url, re.I)
+                if username_match:
+                    identities.append(("username", username_match.group(1).casefold()))
         elif etype == "mention":
             mention_text = _utf16_slice(text, ent_start, int(entity.length)).lstrip("@")
             identities.append(("username", mention_text.casefold()))
@@ -1298,6 +1311,8 @@ async def _resolve_member_by_identity(identity, active_rows: list[Any]):
         _upsert_group_member(int(_primary_chat_id), user, active=True)
     row = _get_member(int(_primary_chat_id), uid)
     if row:
+        # sqlite3.Row is indexable but has no .get(); normalize it before the
+        # reward packager accesses username/first_name fields.
         return dict(row)
     return {
         "user_id": uid,
@@ -1308,41 +1323,46 @@ async def _resolve_member_by_identity(identity, active_rows: list[Any]):
 
 
 async def _match_iris_old_line(line: str, active_rows: list[Any], message: Message | None = None, line_start_py: int = 0, line_end_py: int = 0):
-    """Prefer Telegram clickable identity, then username/display-name fallback."""
+    """Resolve an Iris old-list line only with strong, deterministic identity evidence.
+
+    Never use fuzzy similarity here: a false positive can award the wrong member.
+    Preferred order: Telegram user entity/id, exact @username, exact normalized
+    display name extracted from the list row. Ambiguous or unknown rows are skipped.
+    """
     if message is not None:
         for identity in _line_entity_identity(message, line_start_py, line_end_py):
             hit = await _resolve_member_by_identity(identity, active_rows)
             if hit:
                 return hit
 
-    line_key = _display_key(line)
-    username_hit = re.search(r"@([A-Za-z0-9_]{3,32})", line)
+    # Exact username match, if Iris included one in the line.
+    username_hit = re.search(r"(?<![A-Za-z0-9_])@([A-Za-z0-9_]{3,32})", line)
     if username_hit:
         uname = username_hit.group(1).casefold()
-        hits = [r for r in active_rows if (r["username"] or "").casefold() == uname]
-        if len(hits) == 1:
-            return hits[0]
+        hits = [r for r in active_rows if str(r["username"] or "").casefold().lstrip("@") == uname]
+        return hits[0] if len(hits) == 1 else None
+
+    # Iris usually formats rows as: "1. 🔥 Display Name (1,2k) — 3 месяца 2 дн".
+    # Extract only the display-name field and compare it exactly after normalization.
+    row_match = re.match(r"^\s*\d+\.\s*(.*?)\s*\([^()]*\)\s*[—–-]\s*.+$", line)
+    if not row_match:
+        return None
+    display_text = row_match.group(1).strip()
+    # _display_key removes decorative emoji/punctuation while preserving Unicode letters.
+    target_key = _display_key(display_text)
+    if not target_key:
+        return None
+
     exact = []
-    for r in active_rows:
-        display = " ".join(x for x in ((r["first_name"] or ""), (r["last_name"] or "")) if x).strip()
-        username = r["username"] or ""
-        candidates = {_display_key(display), _display_key(username)}
-        if any(k and k in line_key for k in candidates):
-            exact.append(r)
-    if len(exact) == 1:
-        return exact[0]
-    best = []
-    for r in active_rows:
-        display = " ".join(x for x in ((r["first_name"] or ""), (r["last_name"] or "")) if x).strip()
-        dk = _display_key(display)
-        if not dk:
-            continue
-        ratio = difflib.SequenceMatcher(None, dk, line_key).ratio()
-        best.append((ratio, r))
-    best.sort(reverse=True, key=lambda x: x[0])
-    if best and best[0][0] >= 0.78 and (len(best) == 1 or best[0][0] - best[1][0] >= 0.08):
-        return best[0][1]
-    return None
+    for row in active_rows:
+        display = " ".join(
+            part for part in (str(row["first_name"] or ""), str(row["last_name"] or "")) if part
+        ).strip()
+        username = str(row["username"] or "").lstrip("@")
+        keys = {_display_key(display), _display_key(username)}
+        if target_key in keys:
+            exact.append(row)
+    return exact[0] if len(exact) == 1 else None
 
 
 def _iter_text_lines_with_offsets(text: str):
@@ -1357,13 +1377,13 @@ def _iter_text_lines_with_offsets(text: str):
 
 async def _extract_iris_old_candidates(message: Message, active_rows: list[Any]):
     """Parse an Iris ``олды`` response using clickable entities whenever available."""
-    text = message.text or ""
+    text = message.text or message.caption or ""
     results = []
     for line, line_start, line_end in _iter_text_lines_with_offsets(text):
         stripped = line.strip()
         if not stripped:
             continue
-        duration = re.search(r"—\s*(.+?)\s*$", stripped)
+        duration = re.search(r"[—–-]\s*(.+?)\s*$", stripped)
         if not duration:
             continue
         age_text = duration.group(1).strip()
@@ -1374,7 +1394,9 @@ async def _extract_iris_old_candidates(message: Message, active_rows: list[Any])
             continue
         member = await _match_iris_old_line(stripped, active_rows, message, line_start, line_end)
         if member:
-            results.append((member, days, age_text))
+            row_match = re.match(r"^\s*\d+\.\s*(.*?)\s*\([^()]*\)\s*[—–-]\s*.+$", stripped)
+            display_label = row_match.group(1).strip() if row_match else stripped
+            results.append((member, days, age_text, display_label))
     return results
 
 
@@ -1411,7 +1433,20 @@ async def handle_iris_olds_response(message: Message):
     if not source_text.strip():
         await message.reply("Не вижу текста в пересланном сообщении. Перешли ответ Ирис с текстом списка «олды» или вставь его текстом.")
         return
-    # Forwarded messages preserve entities. Pasted text still supports @username matching.
+    # Do not consume the scan if the owner accidentally sends another message
+    # while the scan is waiting. Require at least one correctly shaped numbered
+    # Iris row; a valid old-list containing no eligible people is still accepted.
+    looks_like_olds_list = False
+    for candidate_line, _, _ in _iter_text_lines_with_offsets(source_text):
+        candidate_line = candidate_line.strip()
+        if (re.match(r"^\s*\d+\.\s*.*?\([^()]*\)\s*[—–-]\s*.+$", candidate_line)
+                and re.search(r"[—–-]\s*(.+?)\s*$", candidate_line)):
+            looks_like_olds_list = True
+            break
+    if not looks_like_olds_list:
+        await message.reply("Пока не вижу списка «олды» Ирис. Перешли сюда её исходное сообщение целиком — ожидание сохранено, можешь отправить список ещё раз.")
+        return
+    # Forwarded messages preserve entities. Pasted text still supports exact name matching.
     _q(lambda conn: (conn.execute("UPDATE jf_iris_scan SET status='processing' WHERE id=?", (int(waiting["id"]),)), conn.commit()))
     try:
         active_rows = _active_member_rows()
@@ -1421,14 +1456,39 @@ async def handle_iris_olds_response(message: Message):
         if not parsed and source_text != (message.text or ""):
             shadow = message.model_copy(update={"text": source_text, "caption": None})
             parsed = await _extract_iris_old_candidates(shadow, active_rows)
-        package: list[tuple[int, str, str]] = []
+        package: list[tuple[int, str, str, str, str]] = []
         skipped = 0
         seen_pairs: set[tuple[int, int]] = set()
-        for row, days, age_text in parsed:
+        matched_labels = {_display_key(label) for _, _, _, label in parsed}
+        unmatched_lines: list[str] = []
+        for line, _, _ in _iter_text_lines_with_offsets(source_text):
+            stripped = line.strip()
+            duration_match = re.search(r"[—–-]\s*(.+?)\s*$", stripped)
+            if not duration_match or not re.search(r"(?:дн|день|дня|дней|месяц|год|лет|ч\b|мин)", duration_match.group(1).casefold()):
+                continue
+            if _duration_to_days(duration_match.group(1).strip()) >= 30:
+                row_match = re.match(r"^\s*\d+\.\s*(.*?)\s*\([^()]*\)\s*[—–-]\s*.+$", stripped)
+                label = row_match.group(1).strip() if row_match else stripped
+                # We'll list unmatched eligible lines after all resolvable rows are known.
+                label_key = _display_key(label)
+                name_hits = []
+                for r in active_rows:
+                    display_key = _display_key(" ".join(part for part in (str(r["first_name"] or ""), str(r["last_name"] or "")) if part).strip())
+                    username_key = _display_key(str(r["username"] or "").lstrip("@"))
+                    if label_key and label_key in {display_key, username_key}:
+                        name_hits.append(int(r["user_id"]))
+                # An entity-resolved line may have a custom display label, so the
+                # label in the parsed results is also concrete evidence. A name
+                # that maps to multiple users is still considered ambiguous.
+                identity_ok = label_key in matched_labels or len(set(name_hits)) == 1
+                if not identity_ok:
+                    unmatched_lines.append(label)
+        for row, days, age_text, display_label in parsed:
             uid = int(row["user_id"])
-            username = (row.get("username") or "").strip()
+            username = str(row.get("username") or "").strip()
             if not username:
                 skipped += 1
+                unmatched_lines.append(f"{display_label} — участник найден, но у него нет @username; команда Iris не подготовлена")
                 continue
             for threshold_days, level, title in IRIS_OLD_THRESHOLDS:
                 if days < threshold_days:
@@ -1442,15 +1502,47 @@ async def handle_iris_olds_response(message: Message):
                 package.append((uid, command, f"{title}. Стаж: {age_text}.", f"iris_old_{threshold_days}d", title))
         _q(lambda conn: (conn.execute("UPDATE jf_iris_scan SET status='prepared',finished_at=? WHERE id=?", (_utc_iso(), int(waiting["id"]))), conn.commit()))
         if not package:
-            await message.reply("Список обработан, но подходящих участников не удалось однозначно сопоставить с активными участниками. Проверь, что в ответе есть @username или имя, совпадающее с базой.")
+            response = [
+                "Список обработан, но команды наград не подготовлены.",
+                f"Строк с олдами распознано: {len(parsed)}.",
+                f"Пропущено: {skipped}.",
+                "Награды выдаются только при точном сопоставлении — бот не будет угадывать получателя.",
+            ]
+            if unmatched_lines:
+                response.append("\nНе удалось подготовить команду для строк:")
+                response.extend(f"• {name}" for name in list(dict.fromkeys(unmatched_lines))[:30])
+            await message.answer("\n".join(response))
             return
-        await message.answer(
-            "🏆 **Пакет наград подготовлен**\n\n"
-            f"Команд для ручной пересылки: {len(package)}\n"
-            f"Пропущено (нет username/уже учтено): {skipped}\n\n"
-            "Ни одна команда не отправлена в флуд автоматически. Перешли каждое следующее сообщение в основной чат. После успешной выдачи нажми «Отметить выданными» в сводке пакета.",
-            parse_mode="Markdown",
+        # Send an at-a-glance roster so the owner can see all recipients and levels,
+        # followed by individual command messages that can be forwarded to the flood.
+        roster_lines = ["🏆 ПАКЕТ НАГРАД: КОМУ И ЧТО ВЫДАТЬ", ""]
+        for index, (uid, command, reason, code, title) in enumerate(package, start=1):
+            roster_lines.append(f"{index}. {command} — {reason}")
+        roster_text = (
+            "🏆 Пакет наград подготовлен\n\n"
+            f"Распознано олдов: {len(parsed)}\n"
+            f"Команд к ручной пересылке: {len(package)}\n"
+            f"Пропущено команд: {skipped}\n\n"
+            "Ни одна команда не отправлена в флуд автоматически. Ниже — полный список, затем каждая команда придёт отдельным сообщением для пересылки Ирису в флуд."
         )
+        await message.answer(roster_text)
+        # Telegram caps a message at 4096 chars; chunk the full roster safely.
+        current_chunk = ""
+        for roster_line in roster_lines:
+            candidate = current_chunk + roster_line + "\n"
+            if len(candidate) > 3500 and current_chunk:
+                await message.answer(current_chunk.rstrip())
+                current_chunk = roster_line + "\n"
+            else:
+                current_chunk = candidate
+        if current_chunk.strip():
+            await message.answer(current_chunk.rstrip())
+        if unmatched_lines:
+            unique_unmatched = list(dict.fromkeys(unmatched_lines))
+            warning = "⚠️ Не удалось однозначно сопоставить строки (награды не подготовлены для них):\n" + "\n".join(f"• {name}" for name in unique_unmatched[:40])
+            if len(unique_unmatched) > 40:
+                warning += f"\n…и ещё {len(unique_unmatched) - 40}."
+            await message.answer(warning)
         # Persist the pending audit before exposing buttons, so an immediate tap
         # cannot race ahead of the database insert.
         for uid, command, reason, code, title in package:
