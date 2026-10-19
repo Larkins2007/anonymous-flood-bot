@@ -30,6 +30,7 @@ from aiogram.exceptions import (
     TelegramUnauthorizedError,
 )
 from aiogram.filters import Command, CommandStart
+from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -1601,7 +1602,6 @@ async def send_long_message(
 
 def main_kb():
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🚪 Хочу вступить", callback_data="u:join")],
         [InlineKeyboardButton(text="🤫 Анонимная связь", callback_data="u:send")],
         [InlineKeyboardButton(text="⚠ Жалоба", callback_data="u:report")],
         [InlineKeyboardButton(text="✦ Как это работает", callback_data="u:info")],
@@ -1873,13 +1873,6 @@ async def anon_command(message: Message, state: FSMContext):
         cancel_kb(),
     )
 
-
-@dp.callback_query(F.data == "u:join")
-async def user_join_info(callback: CallbackQuery, state: FSMContext):
-    if callback.message.chat.type != "private":
-        await safe_callback_answer(callback)
-        return
-    await jf_begin_join_application(callback, state)
 
 # =========================================================
 # HOME
@@ -5396,10 +5389,9 @@ async def help_cmd(message: Message):
         if message.from_user and message.from_user.id == ADMIN_ID:
             lines += [
                 "", section("Владелец · только это ЛС"),
-                bullet("/jf_applications — активные заявки на вступление"),
-                bullet("/jf_awards — проверить олдов и автоматически выдать награды через Ирис"),
+                                bullet("/jf_awards — подготовить команды наград по пересланному ответу Ирис «олды»"),
                 bullet("/jf_award — выдать достижение"),
-                bullet("/jf_iris_sync — повторить автоматическую выдачу через Ирис"),
+                bullet("/jf_iris_sync — открыть сценарий ручной подготовки наград"),
                 bullet("/jf_dashboard — сводка Justice Faite"),
                 bullet("/jf_warn — выдать предупреждение"),
                 bullet("/jf_warnings — история предупреждений"),
@@ -6133,49 +6125,10 @@ async def mafia_expiry_recovery_worker():
 
 
 async def schedule_worker():
-    """Optional 30-minute reminders; disabled by default and controlled in /admin DM panel."""
+    """Disabled by design: never post unsolicited game messages to the flood."""
     while True:
-        try:
-            if get_bot_setting("scheduled_announcements", "0") != "1":
-                await asyncio.sleep(SCHEDULE_CHECK_SECONDS)
-                continue
-            local = datetime.now(timezone.utc) + timedelta(hours=DEFAULT_TIMEZONE_OFFSET_HOURS)
-            if PRIMARY_CHAT_ID:
-                slot = next_cycle_slot(PRIMARY_CHAT_ID, local)
-                if slot:
-                    candidate, slot_index, time_hm = slot
-                    delta = candidate - local
-                    chat_id = PRIMARY_CHAT_ID
-                    # 30-minute reminder. Claimed through schedule_runs to avoid repeats.
-                    if timedelta(minutes=29, seconds=50) <= delta <= timedelta(minutes=30, seconds=10):
-                        game_name = group_db_op(lambda conn: conn.execute(
-                            "SELECT game_name FROM schedule_cycle WHERE chat_id=? AND slot_index=? AND enabled=1",
-                            (chat_id, slot_index),
-                        ).fetchone())
-                        if game_name:
-                            run_key = f"reminder30:{candidate.isoformat()}"
-                            claimed = group_db_op(lambda conn: (
-                                conn.execute(
-                                    "INSERT OR IGNORE INTO schedule_runs(chat_id,run_date,time_hm,game_name,source,created_at) VALUES(?,?,?,?,?,?)",
-                                    (chat_id, candidate.date().isoformat(), time_hm, game_name["game_name"], run_key, now()),
-                                ).rowcount == 1
-                            ))
-                            if claimed:
-                                await bot.send_message(
-                                    chat_id,
-                                    f"𝗚𝗔𝗠𝗘 𝗦𝗧𝗔𝗥𝗧𝗦\n\n{html.escape(game_name['game_name'])} начнётся через 30 минут.\nВремя начала: {time_hm} МСК.",
-                                    parse_mode="HTML",
-                                )
-        except asyncio.CancelledError:
-            raise
-        except Exception:
-            logger.exception("Schedule worker failed")
-        await asyncio.sleep(SCHEDULE_CHECK_SECONDS)
+        await asyncio.sleep(max(30, SCHEDULE_CHECK_SECONDS))
 
-
-# =========================================================
-# MAFIA
-# =========================================================
 
 async def _assign_access(callback, chat_id):
     if callback.from_user.id == ADMIN_ID:
@@ -6555,15 +6508,86 @@ def set_bot_setting(key: str, value: str, user_id: int) -> None:
     ))
 
 
+# Per-command controls. Settings are stored in SQLite and applied by middleware.
+COMMAND_SETTING_NAMES = {
+    "help": "Справка", "anon": "Анонимное обращение", "mafia": "Мафия",
+    "mafia_leave": "Выход из Мафии", "spy": "Шпион", "spy_kick": "Исключить из Шпиона",
+    "spy_end": "Завершить Шпиона", "game_poll": "Опрос игр", "setrole": "Назначение роли",
+    "syncroles": "Синхронизация ролей", "bindrole": "Привязка роли", "roles_audit": "Аудит ролей",
+    "jf_dashboard": "Сводка", "jf_awards": "Подготовка наград", "jf_award": "Локальная награда",
+    "jf_iris_sync": "Синхронизация наград", "jf_rest": "Рест (алиас)", "jf_warn": "Выдать предупреждение",
+    "jf_warnings": "История предупреждений", "jf_warn_remove": "Снять предупреждение",
+    "rest": "Рест", "jf_restlist": "Список рестов", "jf_birthday": "День рождения",
+    "jf_birthdays": "Дни рождения", "manage_commands": "Управление командами",
+    "addcommand": "Добавить пользовательскую команду", "delcommand": "Удалить пользовательскую команду",
+    "commands": "Список пользовательских команд",
+}
+
+def command_settings_keyboard():
+    rows = []
+    names = dict(COMMAND_SETTING_NAMES)
+    for custom in get_custom_commands():
+        names[custom["command"]] = f"Пользовательская: {custom['description'][:28]}"
+    for command, label in names.items():
+        enabled = get_bot_setting(f"cmd:{command}:enabled", "1") == "1"
+        mark = "🟢" if enabled else "🔴"
+        rows.append([InlineKeyboardButton(text=f"{mark} /{command} — {label}", callback_data=f"cmdcfg:toggle:{command}")])
+    rows.append([InlineKeyboardButton(text="↻ Обновить", callback_data="cmdcfg:refresh")])
+    rows.append([InlineKeyboardButton(text="‹ Назад в панель", callback_data="cmdcfg:back")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+async def show_command_settings(message: Message, owner_id: int):
+    text = "⚙️ **Персональные настройки команд**\n\nНажми на команду, чтобы включить или отключить её. Настройки сохраняются в SQLite. Системные права доступа всё равно проверяются отдельно."
+    if message.text or message.caption:
+        await message.answer(text, reply_markup=command_settings_keyboard(), parse_mode="Markdown")
+    else:
+        await message.edit_text(text, reply_markup=command_settings_keyboard(), parse_mode="Markdown")
+
+@dp.callback_query(F.data.startswith("cmdcfg:"))
+async def command_settings_callback(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id != ADMIN_ID or not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    custom_names = {row["command"] for row in get_custom_commands()}
+    if len(parts) == 3 and parts[1] == "toggle" and (parts[2] in COMMAND_SETTING_NAMES or parts[2] in custom_names):
+        key = f"cmd:{parts[2]}:enabled"
+        value = "0" if get_bot_setting(key, "1") == "1" else "1"
+        set_bot_setting(key, value, callback.from_user.id)
+    if len(parts) == 2 and parts[1] == "back":
+        await callback.message.edit_text(
+            "༺ 𓆩 ✧ 𓆪 ༻\n\n🌿 **Панель управления Justice Faite**\n\nБот не публикует автоматические объявления об играх и не принимает заявки на вступление во флуд.",
+            reply_markup=owner_panel_keyboard(), parse_mode="Markdown"
+        )
+    else:
+        await callback.message.edit_text(
+            "⚙️ **Персональные настройки команд**\n\nНажми на команду, чтобы включить или отключить её. Настройки сохраняются в SQLite. Системные права доступа всё равно проверяются отдельно.",
+            reply_markup=command_settings_keyboard(), parse_mode="Markdown"
+        )
+    await callback.answer("Настройки обновлены")
+
+class PerCommandSettingsMiddleware(BaseMiddleware):
+    async def __call__(self, handler, event, data):
+        text_value = getattr(event, "text", None) or ""
+        match = re.match(r"^/([a-zA-Z0-9_]+)(?:@\w+)?(?:\s|$)", text_value)
+        if match:
+            command = match.group(1).lower()
+            # Never lock the owner out of the panel or help while tuning commands.
+            if command not in {"admin", "panel", "help", "start"} and get_bot_setting(f"cmd:{command}:enabled", "1") != "1":
+                if getattr(event, "chat", None) and event.chat.type == "private":
+                    await event.answer(f"Команда /{command} сейчас отключена владельцем.")
+                return
+        return await handler(event, data)
+
+dp.message.middleware(PerCommandSettingsMiddleware())
+
 def owner_panel_keyboard() -> InlineKeyboardMarkup:
-    announcements = get_bot_setting("scheduled_announcements", "0") == "1"
-    label = "🔔 Напоминания об играх: ВКЛ" if announcements else "🔕 Напоминания об играх: ВЫКЛ"
     return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Сводка", callback_data="ownerpanel:dashboard"), InlineKeyboardButton(text="🚪 Заявки", callback_data="ownerpanel:applications")],
-        [InlineKeyboardButton(text="⚠️ Предупреждения", callback_data="ownerpanel:warnings"), InlineKeyboardButton(text="🥹 Рест-лист", callback_data="ownerpanel:rests")],
-        [InlineKeyboardButton(text="🎭 Проверка ролей", callback_data="ownerpanel:roles"), InlineKeyboardButton(text="⚙️ Пользовательские команды", callback_data="ownerpanel:commands")],
-        [InlineKeyboardButton(text=label, callback_data="ownerpanel:toggle_announcements")],
-        [InlineKeyboardButton(text="📚 Все команды и справка", callback_data="ownerpanel:help")],
+        [InlineKeyboardButton(text="📊 Сводка", callback_data="ownerpanel:dashboard"), InlineKeyboardButton(text="⚠️ Предупреждения", callback_data="ownerpanel:warnings")],
+        [InlineKeyboardButton(text="🥹 Рест-лист", callback_data="ownerpanel:rests"), InlineKeyboardButton(text="🎭 Аудит ролей", callback_data="ownerpanel:roles")],
+        [InlineKeyboardButton(text="🏆 Награды Ирис", callback_data="ownerpanel:awards"), InlineKeyboardButton(text="⚙️ Настройки команд", callback_data="ownerpanel:cmdsettings")],
+        [InlineKeyboardButton(text="🧩 Пользовательские команды", callback_data="ownerpanel:commands")],
+        [InlineKeyboardButton(text="📚 Справка", callback_data="ownerpanel:help")],
     ])
 
 
@@ -6571,12 +6595,10 @@ def owner_panel_keyboard() -> InlineKeyboardMarkup:
 async def owner_panel_cmd(message: Message):
     if not message.from_user or message.from_user.id != ADMIN_ID:
         return
-    enabled = get_bot_setting("scheduled_announcements", "0") == "1"
     await message.answer(
         "༺ 𓆩 ✧ 𓆪 ༻\n\n🌿 **Панель управления Justice Faite**\n\n"
-        "Выбирай действие кнопками ниже. Автоматические сообщения о начале игр по умолчанию отключены.\n"
-        f"Напоминания за 30 минут: {'включены' if enabled else 'выключены'}\n\n"
-        "Токен и ID чата/владельца намеренно остаются в переменных окружения: менять секреты через сообщения небезопасно.",
+        "Управление через кнопки. Бот не публикует автоматические объявления об играх и не принимает заявки на вступление во флуд.\n\n"
+        "Токен и ID чата/владельца остаются в переменных окружения для безопасности.",
         reply_markup=owner_panel_keyboard(), parse_mode="Markdown"
     )
 
@@ -6587,20 +6609,21 @@ async def owner_panel_callback(callback: CallbackQuery):
         await callback.answer("Нет доступа.", show_alert=True)
         return
     action = (callback.data or "").split(":", 1)[-1]
-    if action == "toggle_announcements":
-        value = "0" if get_bot_setting("scheduled_announcements", "0") == "1" else "1"
-        set_bot_setting("scheduled_announcements", value, callback.from_user.id)
-        await callback.message.edit_reply_markup(reply_markup=owner_panel_keyboard())
-        await callback.answer("Напоминания включены." if value == "1" else "Автоматические напоминания отключены.")
+    if action == "cmdsettings":
+        await show_command_settings(callback.message, callback.from_user.id)
+        await callback.answer()
+        return
+    if action == "awards":
+        await callback.message.answer("🏆 Награды\n\nНажми /jf_awards, затем перешли сюда ответ Ирис на команду «олды». Бот подготовит команды для ручной пересылки во флуд.")
+        await callback.answer()
         return
     command_map = {
         "dashboard": ("/jf_dashboard", "Сводка по флуду и административным данным."),
-        "applications": ("/jf_applications", "Просмотр и обработка заявок на вступление."),
         "warnings": ("/jf_warnings", "История предупреждений; для выдачи/снятия есть /jf_warn и /jf_warn_remove."),
         "rests": ("/jf_restlist", "Список участников на рест; /rest — оформить или продлить."),
         "roles": ("/roles_audit", "Проверка ролей; /bindrole — ручная привязка."),
         "commands": ("/manage_commands", "Создание и удаление пользовательских команд."),
-        "help": ("/help", "Основные команды и их назначение. Для расширенного перечня см. README.md."),
+        "help": ("/help", "Основные команды и их назначение. Для расширенного перечня см. COMMANDS.md."),
     }
     if action not in command_map:
         await callback.answer("Неизвестный раздел.", show_alert=True)
@@ -6625,7 +6648,7 @@ async def setup_commands():
     # documented by /help only after membership is confirmed, so a newcomer
     # is not presented with functions that cannot be used before joining.
     private_user = [
-        BotCommand(command="start", description="🌸 Вход в Justice Faite"),
+        BotCommand(command="start", description="🌸 Меню Justice Faite"),
         BotCommand(command="help", description="✦ Навигация и команды"),
         BotCommand(command="anon", description="🤫 Анонимное обращение"),
     ]
@@ -6645,7 +6668,6 @@ async def setup_commands():
     owner_private = [
         *private_user,
         BotCommand(command="admin", description="⚙️ Панель управления кнопками"),
-        BotCommand(command="jf_applications", description="🚪 Заявки на вступление"),
         BotCommand(command="jf_awards", description="🏆 Кандидаты на достижения"),
         BotCommand(command="jf_award", description="🏵 Выдать достижение"),
         BotCommand(command="jf_iris_sync", description="✦ Подготовить награды для Ирис"),
@@ -8659,7 +8681,6 @@ try:
     from justice_features import (
         register_justice_features,
         init_justice_features_db,
-        begin_join_application as jf_begin_join_application,
         latest_requested_role_for_chat as jf_latest_requested_role,
         feature_maintenance_worker,
     )

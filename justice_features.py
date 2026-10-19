@@ -68,10 +68,7 @@ def _back_home_kb() -> InlineKeyboardMarkup:
         [InlineKeyboardButton(text="↩ Назад", callback_data="u:home")]
     ])
 
-IRIS_USERNAME = os.getenv("IRIS_BOT_USERNAME", "iris_dp_bot").strip().lstrip("@")
-IRIS_AUTO_AWARDS = os.getenv("IRIS_AUTO_AWARDS", "1") == "1"
 IRIS_COMMAND = os.getenv("IRIS_AWARD_COMMAND", "наградить")
-IRIS_OLDS_COMMAND = os.getenv("IRIS_OLDS_COMMAND", "олды")
 IRIS_AWARD_PREFIX = os.getenv("IRIS_AWARD_PREFIX", "!")
 # Levels/titles are configurable because the exact Iris award scale is a community decision.
 IRIS_30D_LEVEL = max(1, min(8, int(os.getenv("IRIS_30D_AWARD_LEVEL", "5"))))
@@ -1155,7 +1152,7 @@ def issue_local_award(chat_id: int, user_id: int, code: str, title: str, descrip
 
 def iris_already_sent(chat_id: int, user_id: int, kind: str) -> bool:
     row = _q(lambda conn: conn.execute(
-        "SELECT 1 FROM jf_award_audit WHERE chat_id=? AND user_id=? AND kind=? AND status IN ('sent','manual') LIMIT 1",
+        "SELECT 1 FROM jf_award_audit WHERE chat_id=? AND user_id=? AND kind=? AND status IN ('sent','manual','prepared') LIMIT 1",
         (int(chat_id), int(user_id), kind),
     ).fetchone())
     return bool(row)
@@ -1381,129 +1378,137 @@ async def _extract_iris_old_candidates(message: Message, active_rows: list[Any])
     return results
 
 
-async def _send_iris_command(command_text: str) -> bool:
-    """Send a plain-text Iris command into the primary group.
-
-    Bot-to-bot delivery is enabled in BotFather. We intentionally do not add
-    ``@Iris`` to the command itself: the command syntax must stay exactly as
-    Iris expects, e.g. ``!наградить 5 @username``.
-    """
-    if not _bot or not _primary_chat_id:
-        return False
+async def _start_manual_olds_scan() -> bool:
+    """Create a pending scan; the owner manually forwards Iris' response in DM."""
     try:
-        await _bot.send_message(int(_primary_chat_id), command_text)
+        _q(lambda conn: (
+            conn.execute("UPDATE jf_iris_scan SET status='superseded',finished_at=? WHERE chat_id=? AND status='waiting'", (_utc_iso(), int(_primary_chat_id))),
+            conn.execute("INSERT INTO jf_iris_scan(chat_id,requested_at,status) VALUES(?,?,?)", (int(_primary_chat_id), _utc_iso(), "waiting")),
+            conn.commit(),
+        ))
         return True
     except Exception:
         import logging
-        logging.getLogger("justice_features").exception("Could not send Iris command")
+        logging.getLogger("justice_features").exception("Could not start manual Iris scan")
         return False
 
 
-async def _run_iris_old_awards() -> tuple[int, int, int]:
-    """Ask Iris for ``олды``; awards are issued from the response handler."""
-    if not IRIS_USERNAME:
-        return 0, 0, 1
-    _q(lambda conn: (
-        conn.execute("UPDATE jf_iris_scan SET status='superseded',finished_at=? WHERE chat_id=? AND status='waiting'", (_utc_iso(), int(_primary_chat_id))),
-        conn.execute("INSERT INTO jf_iris_scan(chat_id,requested_at,status) VALUES(?,?,?)", (int(_primary_chat_id), _utc_iso(), "waiting")),
-        conn.commit(),
-    ))
-    sent = await _send_iris_command(IRIS_OLDS_COMMAND)
-    if not sent:
-        _q(lambda conn: (
-            conn.execute("UPDATE jf_iris_scan SET status='failed',finished_at=? WHERE chat_id=? AND status='waiting'", (_utc_iso(), int(_primary_chat_id))),
-            conn.commit(),
-        ))
-        return 1, 0, 1
-    return 1, 0, 0
-
-
 async def handle_iris_olds_response(message: Message):
-    if message.chat.type not in {"group", "supergroup"} or not _is_primary_chat(message.chat.id):
-        return
-    sender = message.from_user
-    if not sender or not sender.is_bot:
-        return
-    if IRIS_USERNAME:
-        if sender.username and sender.username.casefold() == IRIS_USERNAME.casefold():
-            pass
-        else:
-            sender_name = " ".join(x for x in ((sender.first_name or ""), (sender.last_name or "")) if x).casefold()
-            if "iris" not in sender_name or "deep" not in sender_name:
-                return
-    else:
-        sender_name = " ".join(x for x in ((sender.first_name or ""), (sender.last_name or "")) if x).casefold()
-        if "iris" not in sender_name:
-            return
+    """Parse a forwarded/pasted Iris 'олды' response in the owner's private chat.
 
+    It never sends commands to Iris or the group. Each reward command is sent to
+    the owner as a separate DM so it can be forwarded manually into the flood.
+    """
+    if not _admin_only(message) or message.chat.type != "private":
+        return
     waiting = _q(lambda conn: conn.execute(
         "SELECT * FROM jf_iris_scan WHERE chat_id=? AND status='waiting' ORDER BY id DESC LIMIT 1",
         (int(_primary_chat_id),),
     ).fetchone())
     if not waiting:
         return
-
-    _q(lambda conn: (
-        conn.execute("UPDATE jf_iris_scan SET status='processing' WHERE id=?", (int(waiting["id"]),)),
-        conn.commit(),
-    ))
-
+    source_text = message.text or message.caption or ""
+    if not source_text.strip():
+        await message.reply("Не вижу текста в пересланном сообщении. Перешли ответ Ирис с текстом списка «олды» или вставь его текстом.")
+        return
+    # Forwarded messages preserve entities. Pasted text still supports @username matching.
+    _q(lambda conn: (conn.execute("UPDATE jf_iris_scan SET status='processing' WHERE id=?", (int(waiting["id"]),)), conn.commit()))
     try:
         active_rows = _active_member_rows()
         parsed = await _extract_iris_old_candidates(message, active_rows)
-        awarded = 0
+        # Some Telegram clients strip entities from copied text; parser still falls
+        # back to usernames and unique display-name matching.
+        if not parsed and source_text != (message.text or ""):
+            shadow = message.model_copy(update={"text": source_text, "caption": None})
+            parsed = await _extract_iris_old_candidates(shadow, active_rows)
+        package: list[tuple[int, str, str]] = []
         skipped = 0
-        package: list[str] = []
-        seen_pairs = set()
+        seen_pairs: set[tuple[int, int]] = set()
         for row, days, age_text in parsed:
             uid = int(row["user_id"])
-            username = (row["username"] or "").strip()
+            username = (row.get("username") or "").strip()
+            if not username:
+                skipped += 1
+                continue
             for threshold_days, level, title in IRIS_OLD_THRESHOLDS:
                 if days < threshold_days:
                     continue
                 pair = (uid, threshold_days)
-                if pair in seen_pairs:
+                if pair in seen_pairs or iris_already_sent(_primary_chat_id, uid, f"iris_old_{threshold_days}d"):
+                    skipped += 1
                     continue
                 seen_pairs.add(pair)
-                code = f"iris_old_{threshold_days}d"
-                if iris_already_sent(_primary_chat_id, uid, code):
-                    skipped += 1
-                    continue
-                if not username:
-                    skipped += 1
-                    record_iris_audit(_primary_chat_id, uid, code, "skipped", f"{title}. Нет username для команды Ирис.", "")
-                    continue
-                reason = f"{title}. Участник находится во флуде {age_text}."
-                command = f"{IRIS_AWARD_PREFIX}{IRIS_COMMAND} {level} @{username}\n{title}"
-                package.append(command)
-                if not IRIS_AUTO_AWARDS:
-                    continue
-                if await _send_iris_command(command):
-                    record_iris_audit(_primary_chat_id, uid, code, "sent", reason, IRIS_USERNAME)
-                    awarded += 1
-                else:
-                    skipped += 1
-                await asyncio.sleep(0.8)
-        _q(lambda conn: (
-            conn.execute("UPDATE jf_iris_scan SET status='done',finished_at=? WHERE id=?", (_utc_iso(), int(waiting["id"]))),
-            conn.commit(),
-        ))
-        with suppress(Exception):
-            summary = (
-                _fmt("Награды Ирис") +
-                f"\n\n✅ Проверка «олды» завершена.\n✦ Отправлено команд: {awarded}\n✦ Пропущено: {skipped}\n✦ Пороги: 30 / 60 / 120 дней."
-            )
-            if not IRIS_AUTO_AWARDS and package:
-                summary += "\n\n🧾 Пакет команд без авто-выдачи:\n\n" + "\n\n".join(package)
-            await _bot.send_message(int(_admin_id), summary)
+                command = f"{IRIS_AWARD_PREFIX}{IRIS_COMMAND} {level} @{username}"
+                package.append((uid, command, f"{title}. Стаж: {age_text}.", f"iris_old_{threshold_days}d", title))
+        _q(lambda conn: (conn.execute("UPDATE jf_iris_scan SET status='prepared',finished_at=? WHERE id=?", (_utc_iso(), int(waiting["id"]))), conn.commit()))
+        if not package:
+            await message.reply("Список обработан, но подходящих участников не удалось однозначно сопоставить с активными участниками. Проверь, что в ответе есть @username или имя, совпадающее с базой.")
+            return
+        await message.answer(
+            "🏆 **Пакет наград подготовлен**\n\n"
+            f"Команд для ручной пересылки: {len(package)}\n"
+            f"Пропущено (нет username/уже учтено): {skipped}\n\n"
+            "Ни одна команда не отправлена в флуд автоматически. Перешли каждое следующее сообщение в основной чат. После успешной выдачи нажми «Отметить выданными» в сводке пакета.",
+            parse_mode="Markdown",
+        )
+        # Persist the pending audit before exposing buttons, so an immediate tap
+        # cannot race ahead of the database insert.
+        for uid, command, reason, code, title in package:
+            record_iris_audit(_primary_chat_id, uid, code, "prepared", reason, command)
+        for uid, command, reason, code, title in package:
+            threshold = re.search(r"(30|60|120)d$", code)
+            threshold_days = threshold.group(1) if threshold else "0"
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="✅ Отметить выданной", callback_data=f"rewardmark:{uid}:{threshold_days}"),
+                InlineKeyboardButton(text="↩️ Не выдана", callback_data=f"rewardcancel:{uid}:{threshold_days}"),
+            ]])
+            await _bot.send_message(int(_admin_id), command, reply_markup=keyboard)
+            await asyncio.sleep(0.15)
+        await _bot.send_message(int(_admin_id), "ℹ️ Команды отправлены выше отдельными сообщениями. Перешли их в флуд вручную; бот не может подтвердить, что Ирис их выполнила.")
     except Exception:
-        _q(lambda conn: (
-            conn.execute("UPDATE jf_iris_scan SET status='failed',finished_at=? WHERE id=?", (_utc_iso(), int(waiting["id"]))),
-            conn.commit(),
-        ))
+        _q(lambda conn: (conn.execute("UPDATE jf_iris_scan SET status='failed',finished_at=? WHERE id=?", (_utc_iso(), int(waiting["id"]))), conn.commit()))
         import logging
-        logging.getLogger("justice_features").exception("Iris old-award processing failed")
+        logging.getLogger("justice_features").exception("Manual Iris award preparation failed")
+        await message.reply("Не удалось обработать список. Ошибка записана в журнал; проверь формат ответа и повтори /jf_awards.")
 
+
+async def handle_reward_cancel(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id != _admin_id or not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or not parts[1].isdigit() or parts[2] not in {"30", "60", "120"}:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+    uid, days = int(parts[1]), parts[2]
+    code = f"iris_old_{days}d"
+    _q(lambda conn: (conn.execute(
+        "DELETE FROM jf_award_audit WHERE id=(SELECT id FROM jf_award_audit WHERE chat_id=? AND user_id=? AND kind=? AND status='prepared' ORDER BY id DESC LIMIT 1)",
+        (int(_primary_chat_id), uid, code),
+    ), conn.commit()))
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Подготовка отменена. Награду можно подготовить повторно.")
+
+async def handle_reward_mark(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id != _admin_id or not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    parts = (callback.data or "").split(":")
+    if len(parts) != 3 or not parts[1].isdigit() or parts[2] not in {"30", "60", "120"}:
+        await callback.answer("Некорректные данные", show_alert=True)
+        return
+    uid, days = int(parts[1]), parts[2]
+    code = f"iris_old_{days}d"
+    row = _q(lambda conn: conn.execute(
+        "SELECT id FROM jf_award_audit WHERE chat_id=? AND user_id=? AND kind=? AND status='prepared' ORDER BY id DESC LIMIT 1",
+        (int(_primary_chat_id), uid, code),
+    ).fetchone())
+    if not row:
+        await callback.answer("Подготовленная награда не найдена или уже отмечена", show_alert=True)
+        return
+    _q(lambda conn: (conn.execute("UPDATE jf_award_audit SET status='manual' WHERE id=?", (int(row["id"]),)), conn.commit()))
+    await callback.message.edit_reply_markup(reply_markup=None)
+    await callback.answer("Отмечено. Бот не может проверить выполнение команды Ирис.")
 
 def _pretty_dashboard(chat_id: int) -> str:
     rows = _q(lambda conn: conn.execute(
@@ -1513,14 +1518,10 @@ def _pretty_dashboard(chat_id: int) -> str:
     rest = _q(lambda conn: conn.execute(
         "SELECT COUNT(*) AS c FROM jf_rest WHERE chat_id=? AND active=1 AND end_at> ?", (int(chat_id), _utc_iso())
     ).fetchone())["c"]
-    apps = _q(lambda conn: conn.execute(
-        "SELECT COUNT(*) AS c FROM jf_applications WHERE chat_id=? AND status IN ('awaiting_data','awaiting_document','ready','pending_review')", (int(chat_id),)
-    ).fetchone())["c"]
     return (
         "༺ 𓆩 ✧ 𓆪 ༻\n\n"
         "🌸 LIFE OF JUSTICE FAITE\n\n"
         f"👥 Активных участников: {active}\n"
-        f"🚪 Заявок: {apps}\n"
         f"🥹 В ресте: {rest}\n\n"
         "✦ Единый центр управления флудом"
     )
@@ -1537,25 +1538,21 @@ async def cmd_dashboard(message: Message):
 async def cmd_awards_check(message: Message):
     if not _admin_only(message) or message.chat.type != "private":
         return
-    if not IRIS_USERNAME:
-        await message.reply(_fmt("Награды Ирис") + "\n\n⚠️ Не задан IRIS_BOT_USERNAME в окружении.")
+    if not await _start_manual_olds_scan():
+        await message.reply("Не удалось создать сессию проверки. Попробуй ещё раз.")
         return
-    await message.reply(
-        _fmt("Награды Ирис") +
-        "\n\n✦ Проверяю участников через команду «олды» Ирис.\n"
-        f"✦ Пороги: 30 / 60 / 120 дней.\n✦ Степени: {IRIS_30D_LEVEL} / {IRIS_60D_LEVEL} / {IRIS_120D_LEVEL}.\n"
-        "✦ Подходящим участникам награда будет отправлена автоматически."
+    await message.answer(
+        "🏆 **Подготовка наград за стаж**\n\n"
+        "1. Открой основной флуд и отправь Ирис команду `!олды`.\n"
+        "2. Дождись ответа Ирис.\n"
+        "3. Перешли ответ сюда в личные сообщения бота.\n\n"
+        f"Пороги: 30 / 60 / 120 дней. Степени: {IRIS_30D_LEVEL} / {IRIS_60D_LEVEL} / {IRIS_120D_LEVEL}.\n"
+        "Бот подготовит отдельное сообщение-команду для каждого участника. Сам в флуд ничего отправлять не будет.",
+        parse_mode="Markdown",
     )
-    requested, awarded, skipped = await _run_iris_old_awards()
-    if requested:
-        await message.reply("✦ Запрос «олды» отправлен Ирис. Ожидаю список и автоматически обработаю найденных участников.")
-    else:
-        await message.reply("⚠️ Не удалось запустить проверку «олды».")
 
 
 async def cmd_iris_sync(message: Message):
-    # Backward-compatible alias: same secure owner-only behavior, but now it
-    # triggers the real Iris-driven automatic milestone workflow.
     await cmd_awards_check(message)
 
 
@@ -2086,10 +2083,11 @@ def register_justice_features(ns: dict[str, Any]):
     _dp.message.register(cmd_birthdays, Command("jf_birthdays"), private)
     _dp.message.register(birthday_state_text, BirthdayState.waiting_date, private, F.text)
 
-    _dp.message.register(handle_iris_olds_response, lambda m: m.chat.type in {"group", "supergroup"} and _is_primary_chat(m.chat.id) and bool(m.from_user and m.from_user.is_bot and m.from_user.username and IRIS_USERNAME and m.from_user.username.casefold()==IRIS_USERNAME.casefold()))
-    _dp.message.register(applications_list, Command("jf_applications"), private_admin)
+    _dp.message.register(handle_iris_olds_response, lambda m: m.chat.type == "private" and bool(m.from_user and m.from_user.id == _admin_id) and bool(m.text or m.caption) and bool(_q(lambda conn: conn.execute("SELECT 1 FROM jf_iris_scan WHERE chat_id=? AND status='waiting' LIMIT 1", (int(_primary_chat_id),)).fetchone())))
     _dp.message.register(cmd_dashboard, Command("jf_dashboard"), private_admin)
     _dp.message.register(cmd_awards_check, Command("jf_awards"), private_admin)
+    _dp.callback_query.register(handle_reward_mark, F.data.startswith("rewardmark:"))
+    _dp.callback_query.register(handle_reward_cancel, F.data.startswith("rewardcancel:"))
     _dp.message.register(cmd_award, Command("jf_award"), private_admin)
     _dp.message.register(cmd_iris_sync, Command("jf_iris_sync"), private_admin)
     _dp.message.register(cmd_warn, Command("jf_warn"), private_admin)
@@ -2102,18 +2100,6 @@ def register_justice_features(ns: dict[str, Any]):
     _dp.message.register(natural_restlist_command, F.text.regexp(r"(?iu)^\s*рестники\s*$"))
     _dp.message.register(natural_rest_command, F.text.regexp(r"(?iu)^\s*выдать\s+рест\s+.+$"))
 
-    _dp.callback_query.register(join_request_admin_callback, F.data.regexp(r"^" + re.escape(FEATURE_PREFIX) + r"join_(approve|decline):\d+$"))
-    _dp.callback_query.register(join_rules_callback, F.data.startswith(FEATURE_PREFIX + "join_"))
     # Persistent DB-driven routers come before FSM-specific handlers. This makes
     # the application flow recover even if MemoryStorage is cleared/restarted.
-    _dp.message.register(join_application_text_router, private, F.text)
-    _dp.message.register(join_application_photo_router, private, F.photo)
-    _dp.message.register(join_role_text, JoinApplicationState.waiting_role, private, F.text)
-    _dp.message.register(join_document_photo, JoinApplicationState.waiting_document, private, F.photo)
-    _dp.message.register(join_document_nonphoto, JoinApplicationState.waiting_document, private)
-    _dp.message.register(join_role_fallback, private, F.text)
-    _dp.message.register(join_document_photo_fallback, private, F.photo)
-    _dp.callback_query.register(application_callback, F.data.startswith(FEATURE_PREFIX + "app_"))
-    _dp.message.register(admin_application_message_text, lambda m: m.chat.type == "private" and _admin_only(m) and int(m.from_user.id) in _PENDING_ADMIN_MESSAGE and bool((m.text or "").strip()))
-    _dp.chat_join_request.register(handle_join_request)
 
