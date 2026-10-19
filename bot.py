@@ -57,8 +57,8 @@ from aiogram.types import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "1682289834") or "1682289834")
-PRIMARY_CHAT_ID = int(os.getenv("PRIMARY_CHAT_ID", "-1004313546398") or "-1004313546398")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
+PRIMARY_CHAT_ID = int(os.getenv("PRIMARY_CHAT_ID", "0") or "0")
 
 DB_PATH = os.getenv("DB_PATH", "users.db").strip() or "users.db"
 PORT = int(os.getenv("PORT", "10000"))
@@ -106,6 +106,10 @@ MEMBER_ACTIVE_PERMISSIONS = ChatPermissions(
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
+if ADMIN_ID <= 0:
+    raise RuntimeError("ADMIN_ID is not set or invalid; configure the owner Telegram user ID")
+if PRIMARY_CHAT_ID >= 0:
+    raise RuntimeError("PRIMARY_CHAT_ID is not set or invalid; configure the Telegram supergroup ID (usually starts with -100)")
 
 
 # =========================================================
@@ -315,6 +319,13 @@ def init_db():
     def create(conn):
         conn.executescript(
             """
+            CREATE TABLE IF NOT EXISTS bot_settings (
+                setting_key TEXT PRIMARY KEY,
+                setting_value TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                updated_by INTEGER NOT NULL DEFAULT 0
+            );
+
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 first_name TEXT NOT NULL DEFAULT '',
@@ -6122,9 +6133,12 @@ async def mafia_expiry_recovery_worker():
 
 
 async def schedule_worker():
-    """Announce scheduled game time in the primary chat; never auto-launch a game."""
+    """Optional 30-minute reminders; disabled by default and controlled in /admin DM panel."""
     while True:
         try:
+            if get_bot_setting("scheduled_announcements", "0") != "1":
+                await asyncio.sleep(SCHEDULE_CHECK_SECONDS)
+                continue
             local = datetime.now(timezone.utc) + timedelta(hours=DEFAULT_TIMEZONE_OFFSET_HOURS)
             if PRIMARY_CHAT_ID:
                 slot = next_cycle_slot(PRIMARY_CHAT_ID, local)
@@ -6517,6 +6531,86 @@ async def mafia_callback(callback: CallbackQuery):
 
 
 # =========================================================
+# OWNER CONTROL PANEL / PERSISTENT SETTINGS
+# =========================================================
+
+def get_bot_setting(key: str, default: str = "0") -> str:
+    try:
+        row = db_transaction(lambda conn: conn.execute(
+            "SELECT setting_value FROM bot_settings WHERE setting_key=?", (key,)
+        ).fetchone())
+        return str(row["setting_value"]) if row else default
+    except Exception:
+        logger.exception("Could not read bot setting: %s", key)
+        return default
+
+
+def set_bot_setting(key: str, value: str, user_id: int) -> None:
+    db_transaction(lambda conn: (
+        conn.execute(
+            "INSERT INTO bot_settings(setting_key,setting_value,updated_at,updated_by) VALUES(?,?,?,?) "
+            "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value, updated_at=excluded.updated_at, updated_by=excluded.updated_by",
+            (key, str(value), now(), int(user_id)),
+        ), conn.commit()
+    ))
+
+
+def owner_panel_keyboard() -> InlineKeyboardMarkup:
+    announcements = get_bot_setting("scheduled_announcements", "0") == "1"
+    label = "🔔 Напоминания об играх: ВКЛ" if announcements else "🔕 Напоминания об играх: ВЫКЛ"
+    return InlineKeyboardMarkup(inline_keyboard=[
+        [InlineKeyboardButton(text="📊 Сводка", callback_data="ownerpanel:dashboard"), InlineKeyboardButton(text="🚪 Заявки", callback_data="ownerpanel:applications")],
+        [InlineKeyboardButton(text="⚠️ Предупреждения", callback_data="ownerpanel:warnings"), InlineKeyboardButton(text="🥹 Рест-лист", callback_data="ownerpanel:rests")],
+        [InlineKeyboardButton(text="🎭 Проверка ролей", callback_data="ownerpanel:roles"), InlineKeyboardButton(text="⚙️ Пользовательские команды", callback_data="ownerpanel:commands")],
+        [InlineKeyboardButton(text=label, callback_data="ownerpanel:toggle_announcements")],
+        [InlineKeyboardButton(text="📚 Все команды и справка", callback_data="ownerpanel:help")],
+    ])
+
+
+@dp.message(Command("admin", "panel"), F.chat.type == "private")
+async def owner_panel_cmd(message: Message):
+    if not message.from_user or message.from_user.id != ADMIN_ID:
+        return
+    enabled = get_bot_setting("scheduled_announcements", "0") == "1"
+    await message.answer(
+        "༺ 𓆩 ✧ 𓆪 ༻\n\n🌿 **Панель управления Justice Faite**\n\n"
+        "Выбирай действие кнопками ниже. Автоматические сообщения о начале игр по умолчанию отключены.\n"
+        f"Напоминания за 30 минут: {'включены' if enabled else 'выключены'}\n\n"
+        "Токен и ID чата/владельца намеренно остаются в переменных окружения: менять секреты через сообщения небезопасно.",
+        reply_markup=owner_panel_keyboard(), parse_mode="Markdown"
+    )
+
+
+@dp.callback_query(F.data.startswith("ownerpanel:"))
+async def owner_panel_callback(callback: CallbackQuery):
+    if not callback.from_user or callback.from_user.id != ADMIN_ID or not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Нет доступа.", show_alert=True)
+        return
+    action = (callback.data or "").split(":", 1)[-1]
+    if action == "toggle_announcements":
+        value = "0" if get_bot_setting("scheduled_announcements", "0") == "1" else "1"
+        set_bot_setting("scheduled_announcements", value, callback.from_user.id)
+        await callback.message.edit_reply_markup(reply_markup=owner_panel_keyboard())
+        await callback.answer("Напоминания включены." if value == "1" else "Автоматические напоминания отключены.")
+        return
+    command_map = {
+        "dashboard": ("/jf_dashboard", "Сводка по флуду и административным данным."),
+        "applications": ("/jf_applications", "Просмотр и обработка заявок на вступление."),
+        "warnings": ("/jf_warnings", "История предупреждений; для выдачи/снятия есть /jf_warn и /jf_warn_remove."),
+        "rests": ("/jf_restlist", "Список участников на рест; /rest — оформить или продлить."),
+        "roles": ("/roles_audit", "Проверка ролей; /bindrole — ручная привязка."),
+        "commands": ("/manage_commands", "Создание и удаление пользовательских команд."),
+        "help": ("/help", "Основные команды и их назначение. Для расширенного перечня см. README.md."),
+    }
+    if action not in command_map:
+        await callback.answer("Неизвестный раздел.", show_alert=True)
+        return
+    command, description = command_map[action]
+    await callback.message.answer(f"{description}\n\nОткрой раздел командой {command}.")
+    await callback.answer()
+
+
+# =========================================================
 # COMMANDS
 # =========================================================
 
@@ -6550,6 +6644,7 @@ async def setup_commands():
     ]
     owner_private = [
         *private_user,
+        BotCommand(command="admin", description="⚙️ Панель управления кнопками"),
         BotCommand(command="jf_applications", description="🚪 Заявки на вступление"),
         BotCommand(command="jf_awards", description="🏆 Кандидаты на достижения"),
         BotCommand(command="jf_award", description="🏵 Выдать достижение"),
