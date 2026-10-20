@@ -1,15 +1,32 @@
-# Changelog — manual-control revision
+## 2026-10 — Надёжное сопоставление списка Ирис
+- Статистика в скобках (`36,5k`, `902`, `233`) удаляется из отображаемого имени перед запасным текстовым поиском.
+- Кликабельная подпись сопоставляется по Telegram ID или точному username из URL, даже когда подпись не совпадает с именем профиля.
+- Если ссылка непонятна или ссылка ведёт на пользователя, которого нет в локальной базе, отключается нечёткий поиск по подписи: так бот не выдаст награду случайному участнику.
+- Добавлен регрессионный тест на все 29 строк из предоставленного примера ответа Ирис.
 
-- Disabled the scheduled announcement worker completely; it only sleeps and never posts game-start messages.
-- Removed the join button and stopped registering the application, join-request, and application-review routers. Legacy application tables remain in SQLite only to avoid destructive migrations on existing installations.
-- Reworked `/jf_awards` and `/jf_iris_sync`: the owner asks Iris for `!олды` in the flood, forwards Iris' response into the bot DM, and receives one separate award command per qualifying member/milestone. The bot does not send award commands into the flood.
-- Fixed Iris old-list row parsing: numbered rows such as `1. 🔥 Name (36,2k) — 3 месяца 2 дн` are now recognized correctly; stylized Unicode names are normalized without fuzzy guessing.
-- Fixed identity resolution returning `sqlite3.Row` where a dictionary is expected, and added support for forwarded caption text and Telegram `t.me` profile links.
-- The owner DM now includes a complete roster of all generated commands (split safely if long), plus a separate list of unmatched/ambiguous old-list rows. A non-list message no longer consumes the pending scan.
-- Added per-command enable/disable controls under `/admin` → `Настройки команд`, including custom commands. Settings persist in `bot_settings`.
-- Added per-reward audit buttons: mark manually issued or cancel the prepared reward so it can be prepared again. This is an owner assertion, not an Iris delivery receipt.
-- Updated `COMMANDS.md`, `README.md`, and offline regression tests.
+# Что изменено
 
-## Verification
+## Удалено
+- Вход во флуд через бота: заявки, фото документа, invite-ссылки, join request, кнопка «Хочу вступить», `/jf_applications`, подбор «желаемой роли».
+- Автоматическая отправка команд Ирис ботом (Ирис не отвечает ботам) — заменена пересылкой через ЛС.
 
-`python -m py_compile bot.py justice_features.py tests/simulation.py` and `python tests/simulation.py` pass in the build environment. The environment does not have `aiogram` installed and cannot reach Telegram, so runtime startup and live callback/API tests remain unverified. Do not treat static tests as proof of successful Telegram delivery.
+## Исправленные ошибки исходника
+1. **Все личные сообщения и пользовательские команды в ЛС перехватывались** обработчиком заявок: `/rules` и т.п. в ЛС не работали, ответы игрока в «Шпионе» не доходили до игры.
+2. `/spy` числился командой для всех, но молча игнорировал всех, кроме владельца.
+3. `/setrole @user …` и `refresh_roster` падали с `NameError` (`resolve_target_user`, `update_group_roster` не существовали).
+4. `/who` (`member_info_cmd`) не была зарегистрирована.
+5. Поиск `@username` с заглавными буквами не находил участника (`/jf_warn`, `/jf_award`).
+6. Разбор ссылок/упоминаний в списке Ирис сравнивал `str(entity.type)` — для enum aiogram это `MessageEntityType.TEXT_MENTION`, совпадений не было. Добавлены t.me-ссылки.
+7. Напоминания об играх терялись (окно 20 с при опросе раз в 30 с), а «захват» напоминания не коммитился.
+8. Лобби мафии не закрывалось и повторный запуск не блокировался: изменения статуса не коммитились. Теперь `db_transaction` фиксирует успешные операции сам. Фоновый воркер больше не закрывает лобби с набранным минимумом.
+9. `{MAX_MESSAGE_LENGTH}` печатался буквально; настройка `JF_ANON_COOLDOWN_SECONDS` ничего не делала.
+10. Упоминание без username в сообщениях реста печатало сырые HTML-теги.
+11. Приём «калл» работал только если сохранена «желаемая роль» из заявки — теперь роль указывается в самой команде.
+12. `/mafia` создавала лобби в любых группах, `/mafia_leave` — только в основном.
+
+## Углублено
+- Рест: `15.09`, `15 сентября`, `на 7 дней`, `2 недели`, ответом на сообщение, заметка, продление, `/unrest`, «снять рест»; лимит срока; список с остатком.
+- Предупреждения: цель по ответу/@/ID, уровень = число активных + 1, `force`, участник видит свои.
+- Дни рождения: владелец задаёт дату другим, `удалить`, «24 марта», поздравление в выбранный час по местному времени, окно «ближайшие N дней».
+- `/bindrole @user Роль` (основной чат по умолчанию), `/help` и меню Telegram строятся из реестра.
+- Производительность: троттлинг записи в БД на каждое сообщение флуда, `synchronous=NORMAL`.

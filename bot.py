@@ -30,7 +30,6 @@ from aiogram.exceptions import (
     TelegramUnauthorizedError,
 )
 from aiogram.filters import Command, CommandStart
-from aiogram.dispatcher.middlewares.base import BaseMiddleware
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -51,6 +50,12 @@ from aiogram.types import (
     Message,
 )
 
+import cmdcfg
+import cmdspecs
+import settings_panel
+import ui as jfui
+from ui import title, section, bullet, note, divider, warning
+
 
 # =========================================================
 # CONFIG
@@ -58,8 +63,8 @@ from aiogram.types import (
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
-PRIMARY_CHAT_ID = int(os.getenv("PRIMARY_CHAT_ID", "0") or "0")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "1682289834") or "1682289834")
+PRIMARY_CHAT_ID = int(os.getenv("PRIMARY_CHAT_ID", "-1004313546398") or "-1004313546398")
 
 DB_PATH = os.getenv("DB_PATH", "users.db").strip() or "users.db"
 PORT = int(os.getenv("PORT", "10000"))
@@ -107,10 +112,6 @@ MEMBER_ACTIVE_PERMISSIONS = ChatPermissions(
 
 if not BOT_TOKEN:
     raise RuntimeError("BOT_TOKEN is not set")
-if ADMIN_ID <= 0:
-    raise RuntimeError("ADMIN_ID is not set or invalid; configure the owner Telegram user ID")
-if PRIMARY_CHAT_ID >= 0:
-    raise RuntimeError("PRIMARY_CHAT_ID is not set or invalid; configure the Telegram supergroup ID (usually starts with -100)")
 
 
 # =========================================================
@@ -215,29 +216,7 @@ async def global_error_handler(event: ErrorEvent):
 # =========================================================
 # DESIGN
 # =========================================================
-
-def title(text: str) -> str:
-    return f"༺ 𓆩 ✧ 𓆪 ༻\n🌸 {text}"
-
-
-def section(text: str) -> str:
-    return f"✧ {text}"
-
-
-def bullet(text: str) -> str:
-    return f"✦ {text}"
-
-
-def note(text: str) -> str:
-    return f"♡ {text}"
-
-
-def divider() -> str:
-    return "༺ 𓆩 ✧ 𓆪 ༻"
-
-
-def warning(text: str) -> str:
-    return f"⚠️ {text}"
+# Оформление вынесено в ui.py (title/section/bullet/note/divider/warning).
 
 
 # =========================================================
@@ -276,12 +255,25 @@ class RoleAssignSearchState(StatesGroup):
 # DATABASE
 # =========================================================
 
+def anon_max_len() -> int:
+    return max(100, min(MAX_MESSAGE_LENGTH, cmdcfg.get_int("anon", "max_len")))
+
+
+def report_cooldown_seconds() -> int:
+    return cmdcfg.get_int("report", "cooldown_seconds")
+
+
+def report_max_reason() -> int:
+    return max(100, min(3500, cmdcfg.get_int("report", "max_reason")))
+
+
 def db():
     conn = sqlite3.connect(DB_PATH, timeout=30)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
     conn.execute("PRAGMA busy_timeout = 30000")
     conn.execute("PRAGMA journal_mode = WAL")
+    conn.execute("PRAGMA synchronous = NORMAL")
     return conn
 
 
@@ -290,10 +282,23 @@ def now():
 
 
 def db_transaction(callback, *args):
+    """Выполняет callback в транзакции.
+
+    Раньше изменения, не завершённые явным commit() (например, закрытие лобби мафии
+    или «захват» напоминания), тихо откатывались при закрытии соединения.
+    Теперь успешный callback фиксируется автоматически, а при исключении — откат.
+    """
     with DB_LOCK:
         conn = db()
         try:
-            return callback(conn, *args)
+            result = callback(conn, *args)
+            if conn.in_transaction:
+                conn.commit()
+            return result
+        except Exception:
+            with suppress(Exception):
+                conn.rollback()
+            raise
         finally:
             conn.close()
 
@@ -320,13 +325,6 @@ def init_db():
     def create(conn):
         conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS bot_settings (
-                setting_key TEXT PRIMARY KEY,
-                setting_value TEXT NOT NULL,
-                updated_at TEXT NOT NULL,
-                updated_by INTEGER NOT NULL DEFAULT 0
-            );
-
             CREATE TABLE IF NOT EXISTS users (
                 user_id INTEGER PRIMARY KEY,
                 first_name TEXT NOT NULL DEFAULT '',
@@ -757,7 +755,7 @@ async def update_role_snapshot(chat_id: int):
         tag=row["tag"] or ""
         if uname.lower()=="@justice_faite_bot": continue
         visible.append(f"Роль участника — {role_name} — {uname}" + (f" — {tag}" if tag else ""))
-    lines=["༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Снимок ролей","",f"Основной чат: {chat_id}",f"Участников в базе: {len(visible)}",""]+ (visible or ["Пока нет сохранённых участников."])
+    lines=["◈ 🎭 Снимок ролей","",f"Основной чат: {chat_id}",f"Участников в базе: {len(visible)}",""]+ (visible or ["Пока нет сохранённых участников."])
     text="\n".join(lines)[:3900]
     state=group_db_op(lambda conn: conn.execute("SELECT owner_message_id FROM role_snapshot_state WHERE chat_id=?",(chat_id,)).fetchone())
     mid=state["owner_message_id"] if state else None
@@ -952,7 +950,7 @@ def report_cooldown_left(user_id):
         return 0
     return max(
         0,
-        int(REPORT_COOLDOWN_SECONDS - elapsed),
+        int(report_cooldown_seconds() - elapsed),
     )
 
 
@@ -1601,18 +1599,16 @@ async def send_long_message(
 # =========================================================
 
 def main_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🤫 Анонимная связь", callback_data="u:send")],
-        [InlineKeyboardButton(text="⚠ Жалоба", callback_data="u:report")],
-        [InlineKeyboardButton(text="✦ Как это работает", callback_data="u:info")],
-    ])
+    rows = []
+    if cmdcfg.is_enabled("anon") and cmdcfg.get_bool("start", "show_anon"):
+        rows.append([InlineKeyboardButton(text="🤫 Анонимная связь", callback_data="u:send")])
+    if cmdcfg.is_enabled("report") and cmdcfg.get_bool("start", "show_report"):
+        rows.append([InlineKeyboardButton(text="⚠ Жалоба", callback_data="u:report")])
+    rows.append([InlineKeyboardButton(text="✦ Как это работает", callback_data="u:info")])
+    return InlineKeyboardMarkup(inline_keyboard=rows)
 
 def member_main_kb():
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="🌸 Justice Faite", callback_data="u:info")],
-        [InlineKeyboardButton(text="🤫 Анонимная связь", callback_data="u:send")],
-        [InlineKeyboardButton(text="⚠ Жалоба", callback_data="u:report")],
-    ])
+    return main_kb()
 
 def cancel_kb():
     return InlineKeyboardMarkup(
@@ -1788,15 +1784,19 @@ def report_admin_kb(
 # =========================================================
 
 def home_text():
-    return (
-        f"{title('Justice Faite')}\n\n"
-        "Добро пожаловать.\n\n"
-        f"{bullet('🚪 Новичок — начните с «Хочу вступить».')}\n"
-        f"{bullet('🤫 Анонимная связь — сообщение администрации без раскрытия автора.')}\n"
-        f"{bullet('⚠ Жалоба — обращение по нарушению правил.')}\n\n"
-        f"{divider()}\n"
-        "♡ Выберите действие"
-    )
+    items = []
+    if cmdcfg.is_enabled("anon") and cmdcfg.get_bool("start", "show_anon"):
+        items.append(bullet("🤫 Анонимная связь — сообщение администрации без раскрытия автора."))
+    if cmdcfg.is_enabled("report") and cmdcfg.get_bool("start", "show_report"):
+        items.append(bullet("⚠ Жалоба — обращение по нарушению правил."))
+    extra = cmdcfg.get_str("start", "home_note").strip()
+    parts = [title("Justice Faite"), "Добро пожаловать."]
+    if items:
+        parts.append("\n".join(items))
+    if extra:
+        parts.append(extra)
+    parts.append(f"{divider()}\n♡ Выберите действие")
+    return "\n\n".join(parts)
 
 def admin_home_text():
     return (
@@ -1830,6 +1830,8 @@ async def start(
         if m:
             await spy_handle_deep_link(message, int(m.group(1)))
             return
+    if not await cmdcfg.gate(message, "start"):
+        return
     await state.clear()
     register_user(message.from_user)
     await delete_user_message(message)
@@ -1841,19 +1843,17 @@ async def start(
         )
         return
 
-    is_member = False
-    with suppress(Exception):
-        cm = await bot.get_chat_member(PRIMARY_CHAT_ID, message.from_user.id)
-        is_member = _chat_member_is_active(cm)
     await send_screen(
         message,
         state,
         home_text(),
-        member_main_kb() if is_member else main_kb(),
+        main_kb(),
     )
 
 @dp.message(Command("anon"), F.chat.type == "private")
 async def anon_command(message: Message, state: FSMContext):
+    if not await cmdcfg.gate(message, "anon", commit=False):
+        return
     if is_blocked(message.from_user.id):
         await message.answer(
             f"{title('Доступ ограничен')}\n\n"
@@ -1867,7 +1867,7 @@ async def anon_command(message: Message, state: FSMContext):
         f"{title('Анонимная связь')}\n\n"
         f"{bullet('Ваш текст увидит только администрация.')}\n"
         f"{bullet('Имя, username и ID не отображаются в интерфейсе обращения.')}\n"
-        f"{bullet('Максимальная длина — {MAX_MESSAGE_LENGTH} символов.')}\n\n"
+        f"{bullet(f'Максимальная длина — {anon_max_len()} символов.')}\n\n"
         f"{divider()}\n"
         "♡ Напишите сообщение следующим сообщением.",
         cancel_kb(),
@@ -1907,9 +1907,8 @@ async def user_info(
         callback,
         state,
         f"{title('Как это работает')}\n\n"
-        "Бот объединяет вступление, анонимную связь и внутренние функции Justice Faite. "
-        "поделиться своим мнением, предложением, советом "
-        "или своими предпочтениями.\n\n"
+        "Бот Justice Faite — анонимная связь с администрацией, жалобы и внутренние функции флуда. "
+        "Напишите сообщение, и оно дойдёт до администрации без раскрытия автора в интерфейсе обращения.\n\n"
         f"{divider()}\n"
         "♡ Напишите сообщение через бота.\n"
         "♡ Выберите нужное действие в меню.\n\n"
@@ -1988,6 +1987,8 @@ async def user_send(
     callback: CallbackQuery,
     state: FSMContext,
 ):
+    if not await cmdcfg.gate_callback(callback, "anon", commit=False):
+        return
     if is_blocked(callback.from_user.id):
         await safe_callback_answer(callback, "Доступ ограничен.", True)
         return
@@ -1998,7 +1999,7 @@ async def user_send(
         state,
         f"{title('Новое сообщение')}\n\n"
         f"{bullet('Напишите сообщение следующим сообщением.')}\n"
-        f"{bullet('Максимальная длина — 4000 символов.')}\n\n"
+        f"{bullet(f'Максимальная длина — {anon_max_len()} символов.')}\n\n"
         f"{divider()}\n"
         "♡ Вы можете написать всё, что хотите сообщить.",
         cancel_kb(),
@@ -2100,15 +2101,20 @@ async def feedback(
         )
         return
 
-    if len(text) > MAX_MESSAGE_LENGTH:
+    if len(text) > anon_max_len():
         await delete_user_message(message)
         await edit_state_screen(
             state, bot, message.chat.id,
             f"{title('Новое сообщение')}\n\n"
             f"{bullet('Сообщение слишком длинное.')}\n"
-            f"{bullet('Максимум — 4000 символов.')}",
+            f"{bullet(f'Максимум — {anon_max_len()} символов.')}",
             cancel_kb(),
         )
+        return
+
+    if not await cmdcfg.gate(message, "anon"):
+        await delete_user_message(message)
+        await state.clear()
         return
 
     screen_message_id = (await state.get_data()).get("screen_message_id")
@@ -2161,7 +2167,7 @@ async def feedback(
 
     success = (
         f"{title('Сообщение отправлено')}\n\n"
-        f"{bullet('Ваше сообщение успешно передано.')}\n"
+        f"{bullet(cmdcfg.get_str('anon', 'thanks_text') or 'Ваше сообщение успешно передано.')}\n"
         f"{bullet('При необходимости вы получите ответ через бота.')}\n\n"
         f"{divider()}\n"
         "♡ Спасибо за обратную связь."
@@ -2214,6 +2220,8 @@ async def report_start(
     callback: CallbackQuery,
     state: FSMContext,
 ):
+    if not await cmdcfg.gate_callback(callback, "report"):
+        return
     if is_blocked(callback.from_user.id):
         await safe_callback_answer(callback, "Доступ ограничен.", True)
         return
@@ -2360,7 +2368,7 @@ async def report_reason(
         )
         return
 
-    if len(reason) > MAX_REPORT_REASON_LENGTH:
+    if len(reason) > report_max_reason():
         await delete_user_message(message)
         await edit_state_screen(
             state,
@@ -4630,6 +4638,17 @@ async def sync_member_tag(chat_id, user_id, *, user=None, refresh_roster=False, 
     return role or prev_role
 
 
+async def update_group_roster(chat_id: int):
+    """Обновляет снимок ролей у владельца. Раньше функции не было — refresh_roster=True падал с NameError."""
+    with suppress(Exception):
+        await update_role_snapshot(chat_id)
+
+
+async def resolve_target_user(chat_id, target_text):
+    """Участник по @username: только если он действительно сейчас в чате."""
+    return await _active_member_from_username(chat_id, normalize_target_text(target_text))
+
+
 async def adopt_external_roles(chat_id: int, user_ids: set[int]):
     adopted=[]; skipped_bot=skipped_no_tag=skipped_unknown=skipped_admin=conflicts=errors=0; checked=0
     for user_id in sorted(user_ids):
@@ -4686,6 +4705,9 @@ def role_for_tag(tag):
     return None
 
 
+_PASSIVE_SEEN: dict = {}
+
+
 async def send_or_edit_welcome(chat_id, user_id):
     row = get_member(chat_id, user_id)
     if not row or not row["active"]:
@@ -4700,21 +4722,15 @@ async def send_or_edit_welcome(chat_id, user_id):
         if not row or not row["active"]:
             return
 
+        if not cmdcfg.get_bool("newcomers", "welcome"):
+            return
         display = (row["username"] and "@" + row["username"]) or row["first_name"] or "участник"
-        text = (
-            "༺ 𓆩 ✧ 𓆪 ༻\n\n"
-            f"🌸 Добро пожаловать, {display}!\n\n"
-            "✦ Рады видеть тебя в Justice Faite.\n"
-            "✦ Правила флуда доступны в информационном канале.\n"
-            "✦ По важным вопросам используй обратную связь бота.\n\n"
-            "༺ 𓆩 ✧ 𓆪 ༻"
-        )
+        text = f"{title('🌸 Justice Faite')}\n\n" + jfui.render_template(cmdcfg.get_str("newcomers", "welcome_text"), name=display)
         rows = []
-        rules_url = os.getenv("JF_RULES_URL", "").strip()
+        rules_url = cmdcfg.get_str("newcomers", "rules_url").strip() or os.getenv("JF_RULES_URL", "").strip()
         if rules_url:
             rows.append([InlineKeyboardButton(text="📜 Правила", url=rules_url)])
-        bot_username = os.getenv("BOT_USERNAME", "justice_faite_bot").strip().lstrip("@")
-        rows.append([InlineKeyboardButton(text="🌸 Открыть бота", url=f"https://t.me/{bot_username}?start=home")])
+        rows.append([InlineKeyboardButton(text="🌸 Открыть бота", url=f"https://t.me/{BOT_USERNAME}?start=home")])
         markup = InlineKeyboardMarkup(inline_keyboard=rows)
 
         if row["welcome_message_id"]:
@@ -4785,15 +4801,16 @@ async def group_member_update(event: ChatMemberUpdated):
         await sync_member_tag(chat_id, user.id, user=user, refresh_roster=False, force=True)
         # Role assignment is deliberately NOT automatic.
         # The owner/admin performs the Call ID flow manually after the participant enters.
-        try:
-            await bot.restrict_chat_member(
-                chat_id,
-                user.id,
-                permissions=NEW_MEMBER_RESTRICTION,
-                use_independent_chat_permissions=True,
-            )
-        except Exception:
-            logger.exception("Could not restrict new member | chat=%s user=%s", chat_id, user.id)
+        if cmdcfg.get_bool("newcomers", "restrict"):
+            try:
+                await bot.restrict_chat_member(
+                    chat_id,
+                    user.id,
+                    permissions=NEW_MEMBER_RESTRICTION,
+                    use_independent_chat_permissions=True,
+                )
+            except Exception:
+                logger.exception("Could not restrict new member | chat=%s user=%s", chat_id, user.id)
         await send_or_edit_welcome(chat_id, user.id)
         return
 
@@ -4816,16 +4833,18 @@ async def group_member_update(event: ChatMemberUpdated):
             with suppress(Exception):
                 await bot.delete_message(chat_id, welcome_message_id)
 
-        with suppress(Exception):
-            await bot.send_message(
-                ADMIN_ID,
-                "𝗠𝗘𝗠𝗕𝗘𝗥 𝗟𝗘𝗙𝗧\n\n"
-                f"Участник: {username}\n"
-                f"ID: {user.id}\n"
-                f"Последняя роль: {role_text}"
-                + (f"\nTelegram-тег: {old_tag}" if old_tag and old_tag != role_text else ""),
-            )
+        if cmdcfg.get_bool("newcomers", "notify_leave"):
+            with suppress(Exception):
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"{title('👋 Участник вышел')}\n\n"
+                    f"{bullet('Участник: ' + username)}\n"
+                    f"{bullet(f'ID: {user.id}')}\n"
+                    f"{bullet('Последняя роль: ' + role_text)}"
+                    + (f"\n{bullet('Telegram-тег: ' + old_tag)}" if old_tag and old_tag != role_text else ""),
+                )
         return
+
 
 
 @dp.callback_query(F.data.startswith("fm:confirm:"))
@@ -4856,7 +4875,7 @@ async def group_confirm(callback: CallbackQuery):
     with suppress(Exception):
         await bot.send_message(
             ADMIN_ID,
-            "༺ 𓆩 ✧ 𓆪 ༻\n\n📜 Правила подтверждены\n\n"
+            "◈ 📜 Правила подтверждены\n\n"
             f"Участник: {username}\n"
             f"ID: {target_user_id}\n"
             "Подтвердил(а) ознакомление с правилами флуда.\n"
@@ -4879,7 +4898,7 @@ async def group_confirm(callback: CallbackQuery):
     await callback.answer("Правила подтверждены. Роль участника назначается отдельно.")
 
 
-@dp.message(F.chat.type.in_({"group", "supergroup"}), F.from_user.is_bot == False, F.text.regexp(r"(?is)^\s*(?!/)(?!калл(?:\s|$))(?!рестники(?:\s|$))(?!выдать\s+рест(?:\s|$)).+"))
+@dp.message(F.chat.type.in_({"group", "supergroup"}), F.from_user.is_bot == False, F.text.regexp(r"(?is)^\s*(?!/)(?!калл(?:\s|$))(?!рестники(?:\s|$))(?!(?:выдать|снять)\s+рест(?:\s|$)).+"))
 async def group_passive_member_sync(message: Message):
     if not is_primary_chat(message.chat.id):
         return
@@ -4889,6 +4908,15 @@ async def group_passive_member_sync(message: Message):
         return
     if not message.from_user or message.from_user.is_bot:
         return
+    # Троттлинг: в живом флуде раньше каждое сообщение вызывало 3-4 записи в SQLite.
+    seen_key = (int(message.chat.id), int(message.from_user.id))
+    mono = asyncio.get_running_loop().time()
+    if mono - _PASSIVE_SEEN.get(seen_key, -1e9) < 45:
+        return
+    _PASSIVE_SEEN[seen_key] = mono
+    if len(_PASSIVE_SEEN) > 5000:
+        for stale in [k for k, t in _PASSIVE_SEEN.items() if mono - t > 600]:
+            _PASSIVE_SEEN.pop(stale, None)
     try:
         group_db_op(lambda conn: (
             conn.execute(
@@ -4909,78 +4937,77 @@ async def group_passive_member_sync(message: Message):
 
 @dp.message(F.chat.type.in_({"group", "supergroup"}), F.from_user.is_bot == False, F.text.regexp(r"(?iu)^\s*калл\s+.+$"))
 async def call_assign_role(message: Message):
-    """The ONLY role/tag assignment trigger: `калл <роль>`.
-    It targets the single newest pending member, sets the Telegram tag, marks
-    the rules as acknowledged and lifts the new-member restriction.
+    """Единственный триггер назначения роли новичку: `калл <роль>`.
+
+    Берёт самого свежего новичка без роли, ставит Telegram-тег, отмечает
+    правила подтверждёнными и (по настройке) снимает ограничение.
     """
-    if not message.from_user or message.from_user.id != ADMIN_ID:
+    if not await cmdcfg.gate(message, "call"):
         return
 
     role_text = re.sub(r"^\s*калл\s*", "", message.text or "", flags=re.IGNORECASE).strip()
     role = role_for(role_text) if role_text else None
+    if not role:
+        await message.reply(f"{title('🎭 Назначение роли')}\n\n{bullet(f'Роль «{role_text}» не найдена в каталоге. Проверьте написание.')}")
+        return
 
     pending = latest_pending_member(message.chat.id)
     if not pending:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nНе найден новый участник без назначенной роли.")
-        return
-
-    if role is None:
-        try:
-            role = jf_latest_requested_role(message.chat.id)
-        except Exception:
-            role = None
-    if not role:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nДля последнего кандидата не сохранена желаемая роль. Укажите её после команды «калл».")
+        window = max(1, ROLE_ASSIGNMENT_WINDOW_SECONDS // 60)
+        await message.reply(f"{title('🎭 Назначение роли')}\n\n{bullet(f'Нет новичка без роли за последние {window} мин.')}\n{note('Для старых участников используйте /setrole.')}")
         return
 
     try:
         target_member = await bot.get_chat_member(message.chat.id, pending["user_id"])
         if not _chat_member_is_active(target_member):
-            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nУчастник уже не находится в чате.")
+            await message.reply(f"{title('🎭 Назначение роли')}\n\n{bullet('Участник уже не находится в чате.')}")
             return
         target = target_member.user
 
         current = get_member(message.chat.id, target.id)
         if current and current["role_key"] == normalize_role(role["name"]):
+            await message.reply(f"{title('🎭 Назначение роли')}\n\n{bullet('Эта роль уже назначена участнику.')}")
             return
 
         tag, role_key = assign_role_db_atomic(message.chat.id, target, role)
         ok, actual = await apply_member_tag(message.chat.id, target.id, tag)
         if not ok:
             release_role_assignment(message.chat.id, target.id, role_key)
-            await message.reply("𝗧𝗘𝗟𝗘𝗚𝗥𝗔𝗠 𝗧𝗔𝗚\n\nНе удалось установить Telegram-тег. Роль освобождена.")
+            await message.reply(f"{title('🏷 Тег Telegram')}\n\n{bullet('Не удалось установить Telegram-тег. Роль освобождена.')}")
             return
 
         finalize_role_assignment(message.chat.id, target.id, role_key, actual or tag)
         confirm_member(message.chat.id, target.id)
-        restriction_lifted = await lift_member_restriction(message.chat.id, target.id)
+        restriction_lifted = await lift_member_restriction(message.chat.id, target.id) if cmdcfg.get_bool("call", "lift_restriction") else False
         await send_or_edit_welcome(message.chat.id, target.id)
 
         username = display_username_for_group(target)
-        with suppress(Exception):
-            await bot.send_message(
-                ADMIN_ID,
-                "༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Роль назначена\n\n"
-                f"Участник: {username}\n"
-                f"Роль: {role['name']}\n"
-                f"Тег: {actual or tag}\n"
-                f"Ограничение снято: {'да' if restriction_lifted else 'нет'}"
-            )
+        if cmdcfg.get_bool("call", "notify_owner"):
+            with suppress(Exception):
+                await bot.send_message(
+                    ADMIN_ID,
+                    f"{title('🎭 Роль назначена')}\n\n"
+                    f"{bullet('Участник: ' + username)}\n"
+                    f"{bullet('Роль: ' + role['name'])}\n"
+                    f"{bullet('Тег: ' + (actual or tag))}\n"
+                    f"{bullet('Ограничение снято: ' + ('да' if restriction_lifted else 'нет'))}",
+                )
 
-        await message.reply(
-            "✅ Назначено\n"
-            f"{username}\n"
-            f"Роль: {role['name']}\n"
-            f"Тег: {actual or tag}"
+        await cmdcfg.respond(
+            message, "call",
+            f"{title('✅ Назначено')}\n\n"
+            f"{bullet(username)}\n"
+            f"{bullet('Роль: ' + role['name'])}\n"
+            f"{bullet('Тег: ' + (actual or tag))}",
         )
     except ValueError as exc:
         if str(exc) == "ROLE_OCCUPIED":
-            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Роль занята\n\nЭта роль уже занята.")
+            await message.reply(f"{title('🎭 Роль занята')}\n\n{bullet('Эта роль уже занята.')}")
         else:
             logger.exception("Kall role assignment failed")
     except Exception:
         logger.exception("Kall role assignment failed")
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nНе удалось назначить роль.")
+        await message.reply(f"{title('🎭 Назначение роли')}\n\n{bullet('Не удалось назначить роль.')}")
 
 
 async def resolve_bind_target(chat_id, target_text):
@@ -5001,87 +5028,88 @@ async def resolve_bind_target(chat_id, target_text):
 
 
 async def bind_role_from_private_admin(message: Message):
-    if not message.from_user or message.from_user.id != ADMIN_ID:
-        return
+    """/bindrole @user Роль — основной чат по умолчанию; либо /bindrole CHAT_ID USER Роль."""
     raw = (message.text or "").strip()
     parts = raw.split(maxsplit=3)
-    if len(parts) < 4:
+    legacy = len(parts) >= 4 and re.fullmatch(r"-?\d{5,}", parts[1] or "") is not None
+    if legacy:
+        chat_raw, target_raw, role_text = parts[1], parts[2], parts[3].strip()
+    elif len(parts) >= 3:
+        chat_raw = str(PRIMARY_CHAT_ID)
+        target_raw = parts[1]
+        role_text = raw.split(maxsplit=2)[2].strip()
+    else:
         await message.reply(
-            "༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\n"
-            "Формат:\n"
-            "/bindrole CHAT_ID USER_ID РОЛЬ\n\n"
-            "Пример:\n"
-            "/bindrole -1001234567890 123456789 Кокоми\n\n"
-            "Можно указать @username вместо USER_ID, если участник уже сохранён ботом."
+            f"{title('🔗 Привязка роли')}\n\n"
+            f"{bullet('/bindrole @username Роль')}\n"
+            f"{bullet('/bindrole USER_ID Роль')}\n"
+            f"{bullet('/bindrole CHAT_ID USER_ID Роль — для другого чата')}\n\n"
+            f"{note('Участник должен быть в чате или уже сохранён ботом.')}"
         )
         return
 
-    chat_raw, target_raw, role_text = parts[1], parts[2], parts[3].strip()
     try:
         chat_obj = await bot.get_chat(chat_raw)
         chat_id = int(chat_obj.id)
     except Exception:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nНе удалось найти этот чат. Укажи корректный CHAT_ID.")
+        await message.reply(f"{title('🔗 Привязка роли')}\n\n{bullet('Не удалось найти этот чат. Проверьте CHAT_ID.')}")
         return
 
     if not is_primary_chat(chat_id):
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nЭтот чат не является основным чатом бота.")
+        await message.reply(f"{title('🔗 Привязка роли')}\n\n{bullet('Этот чат не является основным чатом бота.')}")
         return
     role = role_for(role_text)
     if not role:
-        await message.reply(f"༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nРоль «{role_text}» не найдена в каталоге 148 ролей.")
+        await message.reply(f"{title('🔗 Привязка роли')}\n\n{bullet(f'Роль «{role_text}» не найдена в каталоге из 148 ролей.')}")
         return
 
     target = await resolve_bind_target(chat_id, target_raw)
     if not target:
-        await message.reply(
-            "༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\n"
-            "Участник не найден. Он должен находиться в чате или уже быть сохранён в базе.\n"
-            "Используй USER_ID или @username."
-        )
+        await message.reply(f"{title('🔗 Привязка роли')}\n\n{bullet('Участник не найден. Он должен быть в чате или уже сохранён в базе.')}\n{note('Используйте USER_ID или @username.')}")
         return
 
     try:
         cm = await bot.get_chat_member(chat_id, target.id)
         if not _chat_member_is_active(cm):
-            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nЭтот пользователь сейчас не является участником чата.")
+            await message.reply(f"{title('🔗 Привязка роли')}\n\n{bullet('Этот пользователь сейчас не является участником чата.')}")
             return
         target = cm.user
     except Exception:
         pass
 
-    current = get_member(chat_id, target.id)
     try:
         tag, role_key = assign_role_db_atomic(chat_id, target, role)
         ok, actual = await apply_member_tag(chat_id, target.id, tag)
         if not ok:
             release_role_assignment(chat_id, target.id, role_key)
-            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nTelegram не разрешил установить тег. Изменение откатано.")
+            await message.reply(f"{title('🔗 Привязка роли')}\n\n{bullet('Telegram не разрешил установить тег. Изменение отменено.')}")
             return
         finalize_role_assignment(chat_id, target.id, role_key, actual or tag)
-        await lift_member_restriction(chat_id, target.id)
+        if cmdcfg.get_bool("bindrole", "lift_restriction"):
+            await lift_member_restriction(chat_id, target.id)
         await send_or_edit_welcome(chat_id, target.id)
         await message.reply(
-            "༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\n"
-            f"Участник: {display_username_for_group(target)}\n"
-            f"ID: {target.id}\n"
-            f"Роль: {role['name']}\n"
-            f"Тег: {actual or tag}\n\n"
-            "Роль сохранена в базе."
+            f"{title('✅ Роль привязана')}\n\n"
+            f"{bullet('Участник: ' + display_username_for_group(target))}\n"
+            f"{bullet(f'ID: {target.id}')}\n"
+            f"{bullet('Роль: ' + role['name'])}\n"
+            f"{bullet('Тег: ' + (actual or tag))}"
         )
     except ValueError as exc:
         if str(exc) == "ROLE_OCCUPIED":
-            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nЭта роль уже занята в указанном чате.")
+            await message.reply(f"{title('🔗 Привязка роли')}\n\n{bullet('Эта роль уже занята в основном чате.')}")
         else:
             logger.exception("Private bind role failed")
-            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nНе удалось привязать роль.")
+            await message.reply(f"{title('🔗 Привязка роли')}\n\n{bullet('Не удалось привязать роль.')}")
     except Exception:
         logger.exception("Private bind role failed")
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Привязка роли\n\nНе удалось привязать роль. Подробность записана в лог.")
+        await message.reply(f"{title('🔗 Привязка роли')}\n\n{bullet('Не удалось привязать роль. Подробности в логе.')}")
 
 
 @dp.message(Command("bindrole"), F.chat.type == "private")
 async def bindrole_private_command(message: Message):
+    if not await cmdcfg.gate(message, "bindrole"):
+        return
     await bind_role_from_private_admin(message)
 
 
@@ -5125,55 +5153,72 @@ async def _active_member_from_username(chat_id: int, username: str):
 
 @dp.message(Command("setrole"))
 async def setrole_cmd(message: Message):
-    if not require_primary_group(message) or not is_group_admin_user(message):
+    if not await cmdcfg.gate(message, "setrole"):
         return
-    text=(message.text or "").strip()
-    m=re.match(r"^\s*/setrole(?:@[A-Za-z0-9_]+)?(?:\s+|$)", text, re.IGNORECASE)
-    remainder=text[m.end():].strip() if m else ""
-    target=None; role_text=""
-    if message.reply_to_message and message.reply_to_message.from_user:
-        target=message.reply_to_message.from_user
-        role_text=remainder
+    text = (message.text or "").strip()
+    m = re.match(r"^\s*/setrole(?:@[A-Za-z0-9_]+)?(?:\s+|$)", text, re.IGNORECASE)
+    remainder = text[m.end():].strip() if m else ""
+    target = None
+    role_text = ""
+    reply_user = message.reply_to_message.from_user if message.reply_to_message else None
+    if reply_user and not reply_user.is_bot:
+        target = reply_user
+        role_text = remainder
     else:
-        parts=remainder.split(maxsplit=1)
-        if len(parts)==2:
-            target_text,role_text=parts
+        parts = remainder.split(maxsplit=1)
+        if len(parts) == 2:
+            target_text, role_text = parts
             if target_text.startswith("@"):
-                row=find_group_member(message.chat.id,target_text)
-                target=_user_object_from_row(row) if row else None
+                row = find_group_member(message.chat.id, target_text)
+                target = _user_object_from_row(row) if row else None
                 if not target:
-                    target=await resolve_target_user(message.chat.id,target_text)
+                    target = await resolve_target_user(message.chat.id, target_text)
             elif target_text.lstrip("-").isdigit():
-                with suppress(Exception): target=(await bot.get_chat_member(message.chat.id,int(target_text))).user
+                with suppress(Exception):
+                    target = (await bot.get_chat_member(message.chat.id, int(target_text))).user
     if not target or not role_text:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nОтветьте на сообщение участника: /setrole Роль\nИли: /setrole @username Роль")
+        await message.reply(
+            f"{title('🎭 Назначение роли')}\n\n"
+            f"{bullet('Ответьте на сообщение участника: /setrole Роль')}\n"
+            f"{bullet('Или: /setrole @username Роль')}"
+        )
         return
-    role=role_for(role_text)
+    role = role_for(role_text)
     if not role:
-        await message.reply(f"༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nРоль «{role_text}» не найдена в каталоге 148 ролей.")
+        await message.reply(f"{title('🎭 Назначение роли')}\n\n{bullet(f'Роль «{role_text}» не найдена в каталоге из 148 ролей.')}")
         return
     try:
-        cm=await bot.get_chat_member(message.chat.id,target.id)
-        if not _chat_member_is_active(cm): raise RuntimeError("NOT_MEMBER")
-        target=cm.user
-        tag,key=assign_role_db_atomic(message.chat.id,target,role)
-        ok,actual=await apply_member_tag(message.chat.id,target.id,tag)
+        cm = await bot.get_chat_member(message.chat.id, target.id)
+        if not _chat_member_is_active(cm):
+            raise RuntimeError("NOT_MEMBER")
+        target = cm.user
+        tag, key = assign_role_db_atomic(message.chat.id, target, role)
+        ok, actual = await apply_member_tag(message.chat.id, target.id, tag)
         if not ok:
-            release_role_assignment(message.chat.id,target.id,key)
+            release_role_assignment(message.chat.id, target.id, key)
             raise RuntimeError("TAG_FAIL")
-        finalize_role_assignment(message.chat.id,target.id,key,actual or tag)
-        confirm_member(message.chat.id,target.id)
-        lifted=await lift_member_restriction(message.chat.id,target.id)
-        await message.reply(f"✅ Назначено\n{display_username_for_group(target)}\nРоль: {role['name']}\nТег: {actual or tag}\nОграничение снято: {'да' if lifted else 'нет'}")
-        with suppress(Exception): await bot.send_message(ADMIN_ID,f"༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Роль назначена\n\nУчастник: {display_username_for_group(target)}\nРоль участника: {role['name']}\nТег: {actual or tag}")
+        finalize_role_assignment(message.chat.id, target.id, key, actual or tag)
+        confirm_member(message.chat.id, target.id)
+        lifted = await lift_member_restriction(message.chat.id, target.id) if cmdcfg.get_bool("setrole", "lift_restriction") else False
+        await cmdcfg.respond(
+            message, "setrole",
+            f"{title('✅ Роль назначена')}\n\n"
+            f"{bullet('Участник: ' + display_username_for_group(target))}\n"
+            f"{bullet('Роль: ' + role['name'])}\n"
+            f"{bullet('Тег: ' + (actual or tag))}\n"
+            f"{bullet('Ограничение снято: ' + ('да' if lifted else 'нет'))}",
+        )
+        if cmdcfg.get_bool("setrole", "notify_owner"):
+            with suppress(Exception):
+                await bot.send_message(ADMIN_ID, f"{title('🎭 Роль назначена')}\n\n{bullet('Участник: ' + display_username_for_group(target))}\n{bullet('Роль: ' + role['name'])}\n{bullet('Тег: ' + (actual or tag))}")
     except ValueError as exc:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Роль занята\n\nЭта роль уже занята." if str(exc)=="ROLE_OCCUPIED" else "༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nНе удалось назначить роль.")
+        await message.reply(f"{title('🎭 Роль занята')}\n\n{bullet('Эта роль уже занята.')}" if str(exc) == "ROLE_OCCUPIED" else f"{title('🎭 Назначение роли')}\n\n{bullet('Не удалось назначить роль.')}")
     except RuntimeError as exc:
-        msg="Участник сейчас не в чате." if str(exc)=="NOT_MEMBER" else "Telegram не разрешил установить тег. Назначение отменено."
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\n"+msg)
+        msg = "Участник сейчас не в чате." if str(exc) == "NOT_MEMBER" else "Telegram не разрешил установить тег. Назначение отменено."
+        await message.reply(f"{title('🎭 Назначение роли')}\n\n{bullet(msg)}")
     except Exception:
         logger.exception("setrole failed")
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nНе удалось назначить роль.")
+        await message.reply(f"{title('🎭 Назначение роли')}\n\n{bullet('Не удалось назначить роль.')}")
 
 
 def _normalize_custom_command_name(value: str) -> str:
@@ -5184,12 +5229,18 @@ def _normalize_custom_command_name(value: str) -> str:
     return value
 
 
-BUILTIN_COMMANDS = {
-    "help", "mafia", "mafia_leave",
-    "syncroles", "game_poll",
-    "manage_commands", "addcommand", "delcommand", "commands",
-    "bindrole", "setrole", "spy",
-}
+def _reserved_command_names() -> set[str]:
+    """Имена, которые нельзя занимать своими командами: все встроенные из реестра и меню."""
+    names = {"start", "help", "cancel", "addcommand", "delcommand", "commands", "manage_commands", "settings"}
+    for spec in cmdcfg.REGISTRY.values():
+        if spec.custom:
+            continue
+        for trig in spec.triggers:
+            if trig.startswith("/"):
+                names.add(trig[1:].split()[0].split("@")[0].lower())
+        for cmd, _ in spec.menu:
+            names.add(cmd)
+    return names
 
 
 def get_custom_commands(*, enabled_only=True):
@@ -5208,7 +5259,7 @@ def get_custom_command(command: str):
 
 def save_custom_command(command: str, description: str, response: str, scope: str, created_by: int):
     name = _normalize_custom_command_name(command)
-    if name in BUILTIN_COMMANDS:
+    if name in _reserved_command_names():
         raise ValueError("BUILTIN_COMMAND")
     scope = scope.strip().lower()
     if scope not in {"all", "group", "admin", "private"}:
@@ -5230,30 +5281,51 @@ def save_custom_command(command: str, description: str, response: str, scope: st
         )
         conn.commit()
     group_db_op(op)
+    key = "cc_" + name
+    for param in ("response", "description"):
+        cmdcfg.STORE.drop(key, param)          # новое значение из команды перекрывает старую правку
+    cmdcfg.register(custom_spec(get_custom_command(name)))
     return name
 
 
 def delete_custom_command(command: str) -> bool:
     name = _normalize_custom_command_name(command)
-    return group_db_op(lambda conn: (
+    deleted = group_db_op(lambda conn: (
         conn.execute("DELETE FROM custom_commands WHERE command=?", (name,)).rowcount,
         conn.commit(),
     )[0] > 0)
+    if deleted:
+        cmdcfg.unregister("cc_" + name)
+        cmdcfg.STORE.drop("cc_" + name)
+    return deleted
 
 
-def _custom_command_allowed(row, message: Message) -> bool:
-    scope = row["scope"]
-    if scope == "all":
-        return True
-    if scope == "private":
-        return message.chat.type == "private" and bool(message.from_user and message.from_user.id == ADMIN_ID)
-    if scope == "group":
-        return message.chat.type in {"group", "supergroup"}
-    if scope == "admin":
-        if message.chat.type == "private":
-            return bool(message.from_user and message.from_user.id == ADMIN_ID)
-        return is_group_admin_user(message)
-    return False
+_CUSTOM_SCOPE_DEFAULTS = {"all": ("both", "all"), "group": ("group", "all"), "admin": ("both", "owner"), "private": ("private", "owner")}
+
+
+def custom_spec(row) -> "cmdcfg.Spec":
+    """Карточка настроек для своей команды (ключ cc_<имя>)."""
+    where, access = _CUSTOM_SCOPE_DEFAULTS.get(row["scope"], ("both", "all"))
+    name = row["command"]
+    return cmdcfg.Spec(
+        key="cc_" + name, title="/" + name, emoji="✨", category="custom",
+        desc=row["description"] or "Своя команда", triggers=("/" + name,),
+        access=access, where=where, menu=((name, (row["description"] or name)[:256]),), custom=True,
+        params=(
+            cmdcfg.Param("response", "Текст ответа", "text", row["response"],
+                         "Доступно: {user}, {username}, {user_id}, {chat_id}, {chat}.", max_len=TELEGRAM_TEXT_LIMIT),
+            cmdcfg.Param("description", "Описание в меню", "text", row["description"], max_len=256),
+            cmdcfg.Param("reply_mode", "Как отвечать", "choice", "reply",
+                         choices=(("reply", "↩️ ответом на сообщение"), ("plain", "💬 обычным сообщением"))),
+        ),
+    )
+
+
+def register_custom_specs() -> None:
+    for row in get_custom_commands(enabled_only=False):
+        cmdcfg.register(custom_spec(row))
+        if not row["enabled"] and cmdcfg.STORE.raw("cc_" + row["command"], "enabled") is None:
+            cmdcfg.STORE.put("cc_" + row["command"], "enabled", "0")
 
 
 def render_custom_response(response: str, message: Message) -> str:
@@ -5272,35 +5344,21 @@ def render_custom_response(response: str, message: Message) -> str:
     return text
 
 
-@dp.message(Command("manage_commands"))
-async def manage_commands_cmd(message: Message):
-    if message.chat.type != "private" or not message.from_user or message.from_user.id != ADMIN_ID:
-        return
-    rows = get_custom_commands()
-    if not rows:
-        text = "༺ 𓆩 ✧ 𓆪 ༻\n\n⚙️ Управление командами\n\nПока нет пользовательских команд.\n\nИспользуйте /addcommand для добавления."
-    else:
-        lines = ["༺ 𓆩 ✧ 𓆪 ༻\n\n⚙️ Управление командами", "", "Ваши пользовательские команды:", ""]
-        for row in rows:
-            lines.append(f"/{row['command']} — {row['description']} [{row['scope']}]")
-        lines += ["", "/addcommand — добавить или изменить", "/delcommand <команда> — удалить", "/commands — показать полный список"]
-        text = "\n".join(lines)
-    await message.reply(text)
+# /manage_commands и /commands открывает панель «Свои команды» (settings_panel.py).
 
 
 @dp.message(Command("addcommand"))
 async def addcommand_cmd(message: Message):
-    if message.chat.type != "private" or not message.from_user or message.from_user.id != ADMIN_ID:
+    if not await cmdcfg.gate(message, "manage_commands"):
         return
     raw = (message.text or "").split(maxsplit=1)
     if len(raw) < 2 or "|" not in raw[1]:
         await message.reply(
-            "༺ 𓆩 ✧ 𓆪 ༻\n\n⚙️ Добавление команды\n\n"
-            "Формат:\n"
-            "/addcommand имя | описание | ответ | область\n\n"
-            "Область: all / group / admin / private\n\n"
-            "Пример:\n"
-            "/addcommand rules | Правила чата | Пожалуйста, соблюдайте правила. | group"
+            f"{title('✨ Добавление команды')}\n\n"
+            f"{bullet('/addcommand имя | описание | ответ | область')}\n"
+            f"{bullet('Область: all / group / admin / private')}\n"
+            f"{note('Проще: /settings → Свои команды → ➕ Новая команда.')}\n\n"
+            "Пример:\n/addcommand rules | Правила чата | Соблюдайте правила. | group"
         )
         return
     parts = [x.strip() for x in raw[1].split("|", 3)]
@@ -5309,29 +5367,29 @@ async def addcommand_cmd(message: Message):
         return
     try:
         name = save_custom_command(parts[0], parts[1], parts[2], parts[3], message.from_user.id)
-        await setup_commands()
-        await message.reply(f"༺ 𓆩 ✧ 𓆪 ༻\n\n✅ Команда сохранена\n\n/{name} сохранена и добавлена в меню.")
+        await refresh_command_menu()
+        await message.reply(f"{title('✅ Команда сохранена')}\n\n{bullet(f'/{name} сохранена и добавлена в меню.')}\n{note('Тонкие настройки: /settings → Свои команды.')}")
     except ValueError as exc:
         messages = {
             "INVALID_COMMAND": "Название команды должно быть на английском: a-z, 0-9, _. Максимум 32 символа.",
-            "BUILTIN_COMMAND": "Это уже встроенная команда бота.",
+            "BUILTIN_COMMAND": "Это имя занято встроенной командой бота.",
             "INVALID_SCOPE": "Область должна быть: all, group, admin или private.",
             "EMPTY_VALUE": "Описание и ответ не могут быть пустыми.",
             "RESPONSE_TOO_LONG": "Ответ слишком длинный.",
         }
-        await message.reply(f"༺ 𓆩 ✧ 𓆪 ༻\n\n⚠️ Ошибка\n\n{messages.get(str(exc), 'Не удалось сохранить команду.')}")
+        await message.reply(f"{title('⚠️ Ошибка')}\n\n{bullet(messages.get(str(exc), 'Не удалось сохранить команду.'))}")
     except Exception:
         logger.exception("Custom command save failed")
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n⚠️ Ошибка\n\nНе удалось сохранить команду.")
+        await message.reply(f"{title('⚠️ Ошибка')}\n\n{bullet('Не удалось сохранить команду.')}")
 
 
 @dp.message(Command("delcommand"))
 async def delcommand_cmd(message: Message):
-    if message.chat.type != "private" or not message.from_user or message.from_user.id != ADMIN_ID:
+    if not await cmdcfg.gate(message, "manage_commands"):
         return
     parts = (message.text or "").split(maxsplit=1)
     if len(parts) < 2:
-        await message.reply("Формат: /delcommand <команда>")
+        await message.reply("Формат: /delcommand имя")
         return
     try:
         deleted = delete_custom_command(parts[1])
@@ -5341,125 +5399,80 @@ async def delcommand_cmd(message: Message):
     if not deleted:
         await message.reply("Такой пользовательской команды нет.")
         return
-    await setup_commands()
-    await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🗑 Команда удалена\n\nКоманда удалена.")
-
-
-@dp.message(Command("commands"))
-async def commands_cmd(message: Message):
-    if message.chat.type != "private" or not message.from_user or message.from_user.id != ADMIN_ID:
-        return
-    rows = get_custom_commands()
-    lines = ["༺ 𓆩 ✧ 𓆪 ༻\n\n⚙️ Команды", "", "Встроенные:", "/help", "/mafia", "/mafia_leave", "/game_poll", "/spy", "/setrole", "/syncroles", ]
-    lines += ["", "Пользовательские:"]
-    if rows:
-        for row in rows:
-            lines.append(f"/{row['command']} — {row['description']} [{row['scope']}]")
-    else:
-        lines.append("нет")
-    await message.reply("\n".join(lines))
+    await refresh_command_menu()
+    await message.reply(f"{title('🗑 Команда удалена')}\n\n{bullet('Готово.')}")
 
 
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
     if message.chat.type in {"group", "supergroup"} and not is_primary_chat(message.chat.id):
         return
-
-    if message.chat.type == "private":
-        lines = [
-            title("Помощь"),
-            "",
-            section("Личные функции"),
-            bullet("/start — вход в Justice Faite и главное меню"),
-            bullet("/anon — анонимно написать администрации"),
-        ]
-        is_member = False
-        if message.from_user:
-            try:
-                cm = await bot.get_chat_member(PRIMARY_CHAT_ID, message.from_user.id)
-                is_member = _chat_member_is_active(cm)
-            except Exception:
-                is_member = False
-        if is_member:
-            lines += [
-                "", section("🎂 Дни рождения"),
-                bullet("/jf_birthday — ♡ сохранить или изменить свою дату"),
-                bullet("/jf_birthdays — ✦ ближайшие дни рождения участников"),
-            ]
-        if message.from_user and message.from_user.id == ADMIN_ID:
-            lines += [
-                "", section("Владелец · только это ЛС"),
-                                bullet("/jf_awards — подготовить команды наград по пересланному ответу Ирис «олды»"),
-                bullet("/jf_award — выдать достижение"),
-                bullet("/jf_iris_sync — открыть сценарий ручной подготовки наград"),
-                bullet("/jf_dashboard — сводка Justice Faite"),
-                bullet("/jf_warn — выдать предупреждение"),
-                bullet("/jf_warnings — история предупреждений"),
-                bullet("/jf_warn_remove — снять предупреждение"),
-                bullet("/rest — оформить или продлить рест"),
-                bullet("/jf_restlist — список рестников (владельцу)"),
-                bullet("/roles_audit — аудит ролей"),
-                bullet("/bindrole — привязать роль"),
-                bullet("/manage_commands — управление пользовательскими командами"),
-                bullet("/addcommand — добавить пользовательскую команду"),
-                bullet("/delcommand — удалить пользовательскую команду"),
-                bullet("/commands — список пользовательских команд"),
-            ]
-        custom = [r for r in get_custom_commands() if _custom_command_allowed(r, message)]
-        if custom:
-            lines += ["", section("Дополнительные")]
-            lines.extend(bullet(f"/{r['command']} — {r['description']}") for r in custom)
-        await message.reply("\n".join(lines))
+    if not await cmdcfg.gate(message, "help"):
         return
-
-    lines = [
-        title("Команды флуда"),
-        "",
-        section("Игры"),
-        bullet("/mafia — 🎭 открыть игровое лобби"),
-        bullet("/mafia_leave — 🚪 покинуть игровое лобби"),
-        bullet("/spy — 🕵️ запустить игру «Шпион»"),
-        bullet("рестники — 🥹 показать участников на ресте"),
-    ]
-    if is_group_admin_user(message):
-        lines += [
-            "", section("Администрирование"),
-            bullet("/setrole — 🎭 назначить роль участнику"),
-            bullet("/syncroles — ♻️ обновить роли"),
-            bullet("/game_poll — 🎮 создать опрос на игру"),
-            bullet("/spy_kick — 🕵️ исключить из «Шпион»"),
-            bullet("/spy_end — завершить «Шпион»"),
-        ]
-    custom = [r for r in get_custom_commands() if _custom_command_allowed(r, message)]
-    if custom:
-        lines += ["", section("Дополнительные")]
-        lines.extend(bullet(f"/{r['command']} — {r['description']}") for r in custom)
-    await message.reply("\n".join(lines))
+    uid = int(message.from_user.id) if message.from_user else 0
+    level = await cmdcfg.level_of(uid)
+    chat_type = message.chat.type
+    compact = cmdcfg.get_bool("help", "compact")
+    show_custom = cmdcfg.get_bool("help", "show_custom")
+    blocks = []
+    for cat, (emoji, label) in cmdcfg.CATEGORIES.items():
+        if cat == "custom" and not show_custom:
+            continue
+        items = []
+        for spec in sorted(cmdcfg.specs_in(cat), key=lambda s: s.title):
+            if spec.feature or not spec.triggers:
+                continue
+            if not cmdcfg.visible(spec.key, chat_type=chat_type, level=level):
+                continue
+            trigger = next((t for t in spec.triggers if t != "кнопка в меню"), None)
+            if not trigger:
+                continue
+            items.append(bullet(trigger if compact else f"{trigger} — {spec.emoji} {spec.title}"))
+        if items:
+            blocks.append("\n".join([section(f"{emoji} {label}")] + items))
+    head = "Команды флуда" if chat_type in {"group", "supergroup"} else "Справка"
+    tail = note("Настройки каждой команды: /settings") if level == "owner" and chat_type == "private" else None
+    body = "\n\n".join([title(head)] + (blocks or [bullet("Нет доступных команд.")]) + ([tail] if tail else []))
+    for i, chunk in enumerate(jfui.split_chunks(body)):
+        if i == 0:
+            await cmdcfg.respond(message, "help", chunk)
+        else:
+            await message.answer(chunk)
 
 
 @dp.message(Command("roles_audit"), F.chat.type == "private")
 async def roles_audit_cmd(message: Message):
-    if not message.from_user or message.from_user.id != ADMIN_ID:
+    if not await cmdcfg.gate(message, "roles_audit"):
         return
-    chat_id=PRIMARY_CHAT_ID
-    active=group_db_op(lambda conn: conn.execute("SELECT COUNT(*) AS n FROM group_members WHERE chat_id=? AND active=1",(chat_id,)).fetchone())["n"]
-    assigned=group_db_op(lambda conn: conn.execute("SELECT COUNT(*) AS n FROM group_members WHERE chat_id=? AND active=1 AND role_key IS NOT NULL",(chat_id,)).fetchone())["n"]
-    recent=group_db_op(lambda conn: conn.execute("SELECT h.user_id,h.role_name,h.event,h.created_at,COALESCE(m.username,m.first_name,CAST(h.user_id AS TEXT)) AS who FROM role_history h LEFT JOIN group_members m ON m.chat_id=h.chat_id AND m.user_id=h.user_id WHERE h.chat_id=? ORDER BY h.id DESC LIMIT 12",(chat_id,)).fetchall())
-    lines=["༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Аудит ролей","",f"Основной чат: {chat_id}",f"Активных участников: {active}",f"С назначенной ролью: {assigned}",f"Без роли: {active-assigned}","","Последние изменения:"]
+    chat_id = PRIMARY_CHAT_ID
+    limit = cmdcfg.get_int("roles_audit", "history_limit")
+    active = group_db_op(lambda conn: conn.execute("SELECT COUNT(*) AS n FROM group_members WHERE chat_id=? AND active=1", (chat_id,)).fetchone())["n"]
+    assigned = group_db_op(lambda conn: conn.execute("SELECT COUNT(*) AS n FROM group_members WHERE chat_id=? AND active=1 AND role_key IS NOT NULL", (chat_id,)).fetchone())["n"]
+    recent = group_db_op(lambda conn: conn.execute(
+        "SELECT h.user_id,h.role_name,h.event,h.created_at,COALESCE(m.username,m.first_name,CAST(h.user_id AS TEXT)) AS who "
+        "FROM role_history h LEFT JOIN group_members m ON m.chat_id=h.chat_id AND m.user_id=h.user_id "
+        "WHERE h.chat_id=? ORDER BY h.id DESC LIMIT ?", (chat_id, limit)).fetchall())
+    lines = [
+        title("🔎 Аудит ролей"), "",
+        bullet(f"Основной чат: {chat_id}"),
+        bullet(f"Активных участников: {active}"),
+        bullet(f"С назначенной ролью: {assigned}"),
+        bullet(f"Без роли: {active - assigned}"),
+        "", section("Последние изменения"),
+    ]
     if recent:
         for r in recent:
-            who=f"@{r['who']}" if r['who'] and not str(r['who']).startswith('@') and not str(r['who']).isdigit() else str(r['who'])
-            lines.append(f"• {who} — {r['role_name']} ({r['event']})")
+            who = f"@{r['who']}" if r["who"] and not str(r["who"]).startswith("@") and not str(r["who"]).isdigit() else str(r["who"])
+            lines.append(bullet(f"{who} — {r['role_name']} ({r['event']})"))
     else:
-        lines.append("• пока нет записей")
+        lines.append(bullet("пока нет записей"))
     await message.reply("\n".join(lines))
 
 
 @dp.message(Command("syncroles"))
 async def sync_roles_cmd(message: Message):
-    if not require_primary_group(message): return
-    if not is_group_admin_user(message):
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🔐 Доступ\n\nУ вас нет прав для этой команды."); return
+    if not await cmdcfg.gate(message, "syncroles"):
+        return
     chat_id=PRIMARY_CHAT_ID
     rows=group_db_op(lambda conn: conn.execute("SELECT DISTINCT user_id FROM participant_roster WHERE chat_id=? AND user_id IS NOT NULL",(chat_id,)).fetchall())
     rows2=group_db_op(lambda conn: conn.execute("SELECT DISTINCT user_id FROM group_members WHERE chat_id=? AND user_id IS NOT NULL",(chat_id,)).fetchall())
@@ -5500,43 +5513,46 @@ async def sync_roles_cmd(message: Message):
         except Exception as exc:
             errors+=1; details.append(f"{uid}: {type(exc).__name__}"); logger.exception("Role sync failed | chat=%s user=%s",chat_id,uid)
     with suppress(Exception): await update_role_snapshot(chat_id)
-    lines=["༺ 𓆩 ✧ 𓆪 ༻\n\n🔄 Синхронизация ролей","",f"Проверено участников: {checked}",f"Ролей распознано: {recognized}",f"Новых/обновлённых ролей: {adopted}",f"Без роли: {without_role}",f"Ботов пропущено: {bots}",f"Администраторов проверено: {admins_checked}",f"Вышедших: {left}",f"Ошибок проверки: {errors}"]
+    lines=["◈ 🔄 Синхронизация ролей","",f"Проверено участников: {checked}",f"Ролей распознано: {recognized}",f"Новых/обновлённых ролей: {adopted}",f"Без роли: {without_role}",f"Ботов пропущено: {bots}",f"Администраторов проверено: {admins_checked}",f"Вышедших: {left}",f"Ошибок проверки: {errors}"]
     if details: lines += ["","Ошибки:"]+[f"• {x}" for x in details[:12]]
-    await bot.send_message(ADMIN_ID,"\n".join(lines))
+    report_to = ADMIN_ID if cmdcfg.get_str("syncroles", "report_to") != "here" else message.chat.id
+    await bot.send_message(report_to, "\n".join(lines))
 
 
 
+@dp.message(Command("who"))
 async def member_info_cmd(message: Message):
-    if not _is_group_message(message):
+    if not await cmdcfg.gate(message, "who"):
         return
-    if not is_group_admin_user(message):
-        return
-    target = message.reply_to_message.from_user if message.reply_to_message and message.reply_to_message.from_user else None
-    if not target:
-        parts = (message.text or "").split()
-        row = find_group_member(message.chat.id, parts[1]) if len(parts) == 2 and parts[1].startswith("@") else None
+    chat_id = PRIMARY_CHAT_ID
+    row = None
+    reply_user = message.reply_to_message.from_user if message.reply_to_message else None
+    if reply_user:
+        row = get_member(chat_id, reply_user.id)
     else:
-        row = get_member(message.chat.id, target.id)
+        parts = (message.text or "").split()
+        if len(parts) >= 2:
+            key = parts[1]
+            row = get_member(chat_id, int(key)) if key.lstrip("-").isdigit() else find_group_member(chat_id, key)
     if not row:
-        await message.reply("𝗠𝗘𝗠𝗕𝗘𝗥\n\nУчастник не найден.")
+        await message.reply(f"{title('🪪 Участник')}\n\n{bullet('Участник не найден.')}\n{note('/who @username или ответом на сообщение.')}")
         return
-    # Read the real Telegram member tag before showing role information.
-    # The local DB may know the participant but not yet know the tag->role mapping.
     try:
-        await sync_member_tag(message.chat.id, int(row["user_id"]), force=True)
-        row = get_member(message.chat.id, int(row["user_id"])) or row
+        await sync_member_tag(chat_id, int(row["user_id"]), force=True)
+        row = get_member(chat_id, int(row["user_id"])) or row
     except Exception:
-        logger.exception("Live member-role sync failed | chat=%s user=%s", message.chat.id, row["user_id"])
-    await message.reply(
-        f"𝗠𝗘𝗠𝗕𝗘𝗥\n\n"
-        f"Участник: {('@'+row['username']) if row['username'] else row['first_name']}\n"
-        f"ID: {row['user_id']}\n"
-        f"Роль участника: {row['role_name'] or '—'}\n"
-        f"Тег: {row['tag'] or '—'}\n"
-        f"Подтверждение: {'да' if row['confirmed'] else 'нет'}\n"
-        f"Активен: {'да' if row['active'] else 'нет'}"
+        logger.exception("Live member-role sync failed | chat=%s user=%s", chat_id, row["user_id"])
+    who = ("@" + row["username"]) if row["username"] else row["first_name"]
+    await cmdcfg.respond(
+        message, "who",
+        f"{title('🪪 Участник')}\n\n"
+        f"{bullet('Участник: ' + str(who))}\n"
+        f"{bullet('ID: ' + str(row['user_id']))}\n"
+        f"{bullet('Роль: ' + (row['role_name'] or '—'))}\n"
+        f"{bullet('Тег: ' + (row['tag'] or '—'))}\n"
+        f"{bullet('Правила подтверждены: ' + ('да' if row['confirmed'] else 'нет'))}\n"
+        f"{bullet('Во флуде: ' + ('да' if row['active'] else 'нет'))}",
     )
-
 
 
 # =========================================================
@@ -5625,7 +5641,7 @@ def schedule_text(chat_id):
     rows=group_db_op(lambda conn: conn.execute(
         "SELECT * FROM schedule_cycle WHERE chat_id=? AND enabled=1 ORDER BY slot_index",(chat_id,)
     ).fetchall())
-    lines=["𝗦𝗖𝗛𝗘𝗗𝗨𝗟𝗘","","Игры · МСК",""]
+    lines=["◈ Schedule","","Игры · МСК",""]
     for row in rows:
         slot=int(row["slot_index"])
         day_name=SCHEDULE_CYCLE_DAYS[slot][0] if 0<=slot<7 else str(slot)
@@ -5754,24 +5770,25 @@ def poll_duration_keyboard():
 
 @dp.message(Command("game_poll"))
 async def game_poll_cmd(message: Message):
-    if not require_primary_group(message) or not is_group_admin_user(message): return
+    if not await cmdcfg.gate(message, "game_poll"):
+        return
     ensure_default_schedule(message.chat.id)
     games=get_games()
     if len(games)<2:
-        await message.reply("𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟\n\nНужно минимум две игры в списке.")
+        await message.reply("◈ Опрос на игру\n\nНужно минимум две игры в списке.")
         return
     open_poll=group_db_op(lambda conn: conn.execute("SELECT 1 FROM game_polls WHERE chat_id=? AND status='OPEN'",(message.chat.id,)).fetchone())
     if open_poll:
-        await message.reply("𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟\n\nОпрос уже идёт.")
+        await message.reply("◈ Опрос на игру\n\nОпрос уже идёт.")
         return
-    await message.reply("𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟\n\nНа сколько оставить опрос?",reply_markup=poll_duration_keyboard())
+    await message.reply("◈ Опрос на игру\n\nНа сколько оставить опрос?",reply_markup=poll_duration_keyboard())
 
 
 def game_poll_text(poll, games, counts):
     expires = datetime.fromisoformat(poll["expires_at"]).astimezone(timezone(timedelta(hours=DEFAULT_TIMEZONE_OFFSET_HOURS)))
     total_votes = sum(int(counts.get(int(g["id"]), 0)) for g in games)
     lines = [
-        "𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟",
+        "◈ Опрос на игру",
         "",
         "Выберите одну игру. Нажатие на название меняет ваш голос.",
         "Нажмите ℹ рядом с игрой, чтобы открыть описание.",
@@ -5901,7 +5918,7 @@ async def game_poll_callback(callback: CallbackQuery):
         voters=poll_voter_mentions(pid,gid)
         voter_block="\n".join(voters) if voters else "Никто не указан."
         schedule_line=(f"Начало по расписанию: {selected_slot[0]} · {selected_slot[1]} МСК" if selected_slot else "Время игры определяется расписанием.")
-        final=("𝗚𝗔𝗠𝗘 𝗖𝗛𝗢𝗦𝗘𝗡\n\n"
+        final=("◈ Game Chosen\n\n"
                f"Победила игра: {game['name']}\n"
                "Результат определён администратором после повторной ничьей.\n\n"
                "За неё проголосовали:\n" + voter_block + "\n\n" + schedule_line + ".")
@@ -5997,7 +6014,7 @@ async def expire_game_poll(poll_id, seconds):
     if not leaders:
         await bot.send_message(
             int(poll["chat_id"]),
-            "𝗚𝗔𝗠𝗘 𝗣𝗢𝗟𝗟 · 𝗙𝗜𝗡𝗔𝗟\n\nНикто не проголосовал. Опрос закрыт.",
+            "◈ Game Poll · Final\n\nНикто не проголосовал. Опрос закрыт.",
         )
         return
 
@@ -6011,7 +6028,7 @@ async def expire_game_poll(poll_id, seconds):
             ]
             await bot.send_message(
                 int(poll["chat_id"]),
-                "𝗧𝗜𝗘𝗕𝗥𝗘𝗔𝗞 𝗥𝗘𝗦𝗨𝗟𝗧\n\n"
+                "◈ Tiebreak Result\n\n"
                 "Повторная ничья. Администратор выбирает победителя:",
                 reply_markup=InlineKeyboardMarkup(inline_keyboard=rows),
             )
@@ -6044,7 +6061,7 @@ async def expire_game_poll(poll_id, seconds):
         asyncio.create_task(expire_game_poll(tie_id, tie_minutes * 60))
         await bot.send_message(
             int(poll["chat_id"]),
-            "𝗧𝗜𝗘𝗕𝗥𝗘𝗔𝗞\n\n" + "\n".join(f"• {g['name']} — {counts.get(int(g['id']), 0)}" for g in tie_games)
+            "◈ Tiebreak\n\n" + "\n".join(f"• {g['name']} — {counts.get(int(g['id']), 0)}" for g in tie_games)
             + f"\n\nЗапущен короткий дополнительный тур на {tie_minutes} минут.",
         )
         return
@@ -6061,7 +6078,7 @@ async def expire_game_poll(poll_id, seconds):
         if selected_slot else "Время игры определяется расписанием."
     )
     final = (
-        "𝗚𝗔𝗠𝗘 𝗖𝗛𝗢𝗦𝗘𝗡\n\n"
+        "◈ Game Chosen\n\n"
         f"Победила игра: {winner['name']}\n"
         f"Голосов: {counts.get(int(winner['id']), 0)}\n\n"
         "За неё проголосовали:\n"
@@ -6106,17 +6123,20 @@ async def game_poll_expiry_recovery_worker():
 
 
 async def mafia_expiry_recovery_worker():
+    """Закрывает забытые лобби. Лобби, где уже набран минимум, не трогаем (раньше закрывались все через 5 минут)."""
     while True:
         try:
-            cutoff=(datetime.now(timezone.utc)-timedelta(minutes=5)).isoformat()
-            rows=group_db_op(lambda conn: conn.execute("SELECT id,chat_id,lobby_message_id FROM mafia_games WHERE status='WAITING' AND created_at<=?",(cutoff,)).fetchall())
+            cutoff = (datetime.now(timezone.utc) - timedelta(seconds=mafia_ttl_seconds())).isoformat()
+            rows = group_db_op(lambda conn: conn.execute("SELECT id,chat_id,lobby_message_id FROM mafia_games WHERE status='WAITING' AND created_at<=?", (cutoff,)).fetchall())
             for row in rows:
                 try:
+                    if len(mafia_player_rows(int(row["id"]))) >= mafia_min():
+                        continue
                     if mafia_stop(int(row["id"])) and row["lobby_message_id"]:
-                        with suppress(Exception): await bot.delete_message(int(row["chat_id"]),int(row["lobby_message_id"]))
-                        with suppress(Exception): await bot.unpin_chat_message(int(row["chat_id"]),int(row["lobby_message_id"]))
+                        with suppress(Exception): await bot.delete_message(int(row["chat_id"]), int(row["lobby_message_id"]))
+                        with suppress(Exception): await bot.unpin_chat_message(int(row["chat_id"]), int(row["lobby_message_id"]))
                 except Exception:
-                    logger.exception("Mafia expiry recovery failed | game=%s",row["id"])
+                    logger.exception("Mafia expiry recovery failed | game=%s", row["id"])
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -6125,10 +6145,54 @@ async def mafia_expiry_recovery_worker():
 
 
 async def schedule_worker():
-    """Disabled by design: never post unsolicited game messages to the flood."""
-    while True:
-        await asyncio.sleep(max(30, SCHEDULE_CHECK_SECONDS))
+    """Напоминает в основном чате о близкой игре по расписанию; игру сам не запускает.
 
+    Раньше окно проверки было 20 секунд при опросе раз в 30 секунд, поэтому каждое третье напоминание терялось.
+    Теперь окно — от 1 минуты до заданного времени, а повтор исключён записью в schedule_runs.
+    """
+    while True:
+        try:
+            local = datetime.now(timezone.utc) + timedelta(hours=DEFAULT_TIMEZONE_OFFSET_HOURS)
+            if PRIMARY_CHAT_ID and cmdcfg.is_enabled("schedule"):
+                slot = next_cycle_slot(PRIMARY_CHAT_ID, local)
+                if slot:
+                    candidate, slot_index, time_hm = slot
+                    delta = candidate - local
+                    chat_id = PRIMARY_CHAT_ID
+                    lead_minutes = cmdcfg.get_int("schedule", "lead_minutes")
+                    if timedelta(minutes=1) <= delta <= timedelta(minutes=lead_minutes, seconds=SCHEDULE_CHECK_SECONDS):
+                        game_name = group_db_op(lambda conn: conn.execute(
+                            "SELECT game_name FROM schedule_cycle WHERE chat_id=? AND slot_index=? AND enabled=1",
+                            (chat_id, slot_index),
+                        ).fetchone())
+                        if game_name:
+                            run_key = f"reminder{lead_minutes}:{candidate.isoformat()}"
+                            def _claim(conn):
+                                cur = conn.execute(
+                                    "INSERT OR IGNORE INTO schedule_runs(chat_id,run_date,time_hm,game_name,source,created_at) VALUES(?,?,?,?,?,?)",
+                                    (chat_id, candidate.date().isoformat(), time_hm, game_name["game_name"], run_key, now()),
+                                )
+                                conn.commit()          # db_transaction сам не коммитит: без этого повтор не исключался
+                                return cur.rowcount == 1
+                            claimed = group_db_op(_claim)
+                            if claimed:
+                                minutes_left = max(1, int(round(delta.total_seconds() / 60)))
+                                zone = "МСК" if DEFAULT_TIMEZONE_OFFSET_HOURS == 3 else f"UTC{DEFAULT_TIMEZONE_OFFSET_HOURS:+d}"
+                                await bot.send_message(
+                                    chat_id,
+                                    f"{title('⏰ Игра скоро')}\n\n{html.escape(game_name['game_name'])} начнётся через {minutes_left} мин.\nВремя начала: {time_hm} {zone}.",
+                                    parse_mode="HTML",
+                                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Schedule worker failed")
+        await asyncio.sleep(SCHEDULE_CHECK_SECONDS)
+
+
+# =========================================================
+# MAFIA
+# =========================================================
 
 async def _assign_access(callback, chat_id):
     if callback.from_user.id == ADMIN_ID:
@@ -6168,33 +6232,33 @@ async def role_assign_from_text(message: Message, state: FSMContext):
     chat_id=int(data.get("chat_id",0)); target_id=int(data.get("target_id",0))
     await state.clear()
     if message.chat.type not in {"group","supergroup"} or not is_group_admin_user(message) or message.chat.id!=chat_id:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nНет доступа к этому назначению.")
+        await message.reply("◈ 🎭 Назначение роли\n\nНет доступа к этому назначению.")
         return
     role=role_for((message.text or "").strip())
     if not role:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nТакой роли нет в каталоге 148 ролей.")
+        await message.reply("◈ 🎭 Назначение роли\n\nТакой роли нет в каталоге 148 ролей.")
         return
     try:
         member=await bot.get_chat_member(chat_id,target_id)
         if not _chat_member_is_active(member):
-            await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nУчастник больше не находится в чате.")
+            await message.reply("◈ 🎭 Назначение роли\n\nУчастник больше не находится в чате.")
             return
         target=member.user
         tag,key=assign_role_db_atomic(chat_id,target,role)
         ok,actual=await apply_member_tag(chat_id,target.id,tag)
         if not ok:
             release_role_assignment(chat_id,target.id,key)
-            await message.reply("𝗧𝗘𝗟𝗘𝗚𝗥𝗔𝗠 𝗧𝗔𝗚\n\nНе удалось установить тег. Назначение отменено.")
+            await message.reply("◈ Тег Telegram\n\nНе удалось установить тег. Назначение отменено.")
             return
         finalize_role_assignment(chat_id,target.id,key,actual or tag)
         confirm_member(chat_id,target.id)
         lifted=await lift_member_restriction(chat_id,target.id)
         await message.reply(f"✅ Назначено\n{display_username_for_group(target)}\nРоль: {role['name']}\nТег: {actual or tag}\nОграничение снято: {'да' if lifted else 'нет'}")
     except ValueError as exc:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Роль занята\n\nЭта роль уже занята." if str(exc)=="ROLE_OCCUPIED" else "༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nНе удалось назначить роль.")
+        await message.reply("◈ 🎭 Роль занята\n\nЭта роль уже занята." if str(exc)=="ROLE_OCCUPIED" else "◈ 🎭 Назначение роли\n\nНе удалось назначить роль.")
     except Exception:
         logger.exception("Role assignment from welcome button failed")
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Назначение роли\n\nНе удалось назначить роль.")
+        await message.reply("◈ 🎭 Назначение роли\n\nНе удалось назначить роль.")
 
 
 def _message_with_text(message, text):
@@ -6213,13 +6277,13 @@ async def sign_assigned_role_for_user(message: Message):
     ).fetchall())
     if not rows:
         await message.reply(
-            "༺ 𓆩 ✧ 𓆪 ༻\n\n🏷 Тег роли\n\n"
+            "◈ 🏷 Тег роли\n\n"
             "У тебя пока нет назначенной роли.\n"
             "Попроси администратора назначить её через «калл <роль>»."
         )
         return
     if len(rows) > 1:
-        lines = ["༺ 𓆩 ✧ 𓆪 ༻\n\n🏷 Тег роли", "", "Найдено несколько ролей в активных чатах:", ""]
+        lines = ["◈ 🏷 Тег роли", "", "Найдено несколько ролей в активных чатах:", ""]
         for row in rows:
             lines.append(f"{row['role_name']} — {row['tag'] or 'тег не установлен'} — чат {row['chat_id']}")
         lines.append("\nВыбери нужную группу, если понадобится повторная установка тега.")
@@ -6228,16 +6292,16 @@ async def sign_assigned_role_for_user(message: Message):
     row = rows[0]
     role = role_for(row["role_name"])
     if not role:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n🏷 Тег роли\n\nНазначенная роль больше не найдена в каталоге.")
+        await message.reply("◈ 🏷 Тег роли\n\nНазначенная роль больше не найдена в каталоге.")
         return
     desired = make_tag(role["english"])
     ok, actual = await apply_member_tag(int(row["chat_id"]), user_id, desired)
     if not ok:
-        await message.reply("𝗧𝗔𝗚 𝗘𝗥𝗥𝗢𝗥\n\nНе удалось установить Telegram-тег. Проверь права бота в чате.")
+        await message.reply("◈ Ошибка тега\n\nНе удалось установить Telegram-тег. Проверь права бота в чате.")
         return
     finalize_role_assignment(int(row["chat_id"]), user_id, normalize_role(role["name"]), actual or desired)
     await message.reply(
-        "༺ 𓆩 ✧ 𓆪 ༻\n\n🏷 Тег роли\n\n"
+        "◈ 🏷 Тег роли\n\n"
         f"Роль: {role['name']}\n"
         f"Тег: {actual or desired}\n\n"
         "Готово."
@@ -6246,6 +6310,8 @@ async def sign_assigned_role_for_user(message: Message):
 
 @dp.message(F.chat.type == "private", F.text.regexp(r"(?iu)^\s*подпиши\s+роль\s*$"))
 async def sign_assigned_role_private(message: Message):
+    if not await cmdcfg.gate(message, "signrole"):
+        return
     await sign_assigned_role_for_user(message)
 
 
@@ -6273,20 +6339,31 @@ async def _update_mafia_lobby_message(game):
         return
     players=mafia_player_rows(game["id"])
     try:
-        await bot.edit_message_text(chat_id=game["chat_id"],message_id=game["lobby_message_id"],text=mafia_lobby_text(game),reply_markup=mafia_kb(game["id"],len(players)>=5,True))
+        await bot.edit_message_text(chat_id=game["chat_id"],message_id=game["lobby_message_id"],text=mafia_lobby_text(game),reply_markup=mafia_kb(game["id"],len(players)>=mafia_min(),True))
     except Exception:
         logger.exception("Could not update mafia lobby | game=%s",game["id"])
 
 
+def mafia_min() -> int:
+    return cmdcfg.get_int("mafia", "min_players")
+
+
+def mafia_ttl_seconds() -> int:
+    return cmdcfg.get_int("mafia", "lobby_minutes") * 60
+
+
 def mafia_lobby_text(game):
-    players=mafia_player_rows(game["id"])
-    lines=["𝗠𝗔𝗙𝗜𝗔 𝗟𝗢𝗕𝗕𝗬","","Собираем минимум пять участников для запуска MafiaAzBot.","",f"Участники: {len(players)}/5",""]
+    players = mafia_player_rows(game["id"])
+    need = mafia_min()
+    lines = [title("🎭 Мафия · лобби"), "", f"Собираем минимум {need} участников для запуска MafiaAzBot.", "", f"Участники: {len(players)}/{need}", ""]
     if players:
-        lines.extend([f"{i}. {('@'+p['username']) if p['username'] else p['first_name']}" for i,p in enumerate(players,1)])
+        lines.extend([f"{i}. {('@' + p['username']) if p['username'] else p['first_name']}" for i, p in enumerate(players, 1)])
     else:
         lines.append("Никто не вошёл.")
-    lines += ["","Минимум: 5 игроков.","Лобби автоматически закроется через 5 минут, если набор не состоится."]
+    minutes = max(1, mafia_ttl_seconds() // 60)
+    lines += ["", note(f"Минимум: {need} игроков."), note(f"Лобби закроется через {minutes} мин, если набор не состоится.")]
     return "\n".join(lines)
+
 
 def mafia_kb(game_id, can_start=False, can_stop=False):
     rows = [[
@@ -6347,11 +6424,11 @@ def mafia_stop(game_id):
 
 
 async def expire_mafia_lobby(chat_id, game_id, message_id):
-    await asyncio.sleep(300)
+    await asyncio.sleep(mafia_ttl_seconds())
     game = group_db_op(lambda conn: conn.execute("SELECT * FROM mafia_games WHERE id=?", (game_id,)).fetchone())
     if not game or game["status"] != "WAITING":
         return
-    if len(mafia_player_rows(game_id)) >= 5:
+    if len(mafia_player_rows(game_id)) >= mafia_min():
         return
     mafia_stop(game_id)
     with suppress(Exception):
@@ -6362,7 +6439,7 @@ async def expire_mafia_lobby(chat_id, game_id, message_id):
 
 @dp.message(Command("mafia"))
 async def mafia_cmd(message: Message):
-    if message.chat.type not in {"group","supergroup"} or not message.from_user:
+    if not message.from_user or not await cmdcfg.gate(message, "mafia"):
         return
     if mafia_is_banned(message.chat.id,message.from_user.id):
         await message.reply("Вам запрещено участвовать в мафии.")
@@ -6372,20 +6449,21 @@ async def mafia_cmd(message: Message):
         game=mafia_create_game(message.chat.id,message.from_user)
         sent=await message.answer(mafia_lobby_text(game),reply_markup=mafia_kb(game["id"],False,True))
         group_db_op(lambda conn:(conn.execute("UPDATE mafia_games SET lobby_message_id=? WHERE id=?",(sent.message_id,game["id"])),conn.commit()))
-        await _pin_lobby_message(message.chat.id,sent.message_id)
+        if cmdcfg.get_bool("mafia", "pin_lobby"):
+            await _pin_lobby_message(message.chat.id,sent.message_id)
         asyncio.create_task(expire_mafia_lobby(message.chat.id, game["id"], sent.message_id))
     else:
         if game["lobby_message_id"]:
             await _update_mafia_lobby_message(game)
         else:
-            sent=await message.answer(mafia_lobby_text(game),reply_markup=mafia_kb(game["id"],len(mafia_player_rows(game["id"]))>=5,True))
+            sent=await message.answer(mafia_lobby_text(game),reply_markup=mafia_kb(game["id"],len(mafia_player_rows(game["id"]))>=mafia_min(),True))
             group_db_op(lambda conn:(conn.execute("UPDATE mafia_games SET lobby_message_id=? WHERE id=?",(sent.message_id,game["id"])),conn.commit()))
             await _pin_lobby_message(message.chat.id,sent.message_id)
 
 
 @dp.message(Command("mafia_leave"))
 async def mafia_leave_cmd(message: Message):
-    if not require_primary_group(message):
+    if not message.from_user or not await cmdcfg.gate(message, "mafia_leave"):
         return
     game = mafia_open_game(message.chat.id)
     if not game:
@@ -6419,7 +6497,7 @@ async def mafia_callback(callback: CallbackQuery):
         if not ok:
             await safe_callback_answer(callback,text,True); return
         players=mafia_player_rows(game_id)
-        if len(players) >= 5:
+        if len(players) >= mafia_min():
             claimed = group_db_op(lambda conn: conn.execute(
                 "UPDATE mafia_games SET status='STARTING',started_at=? WHERE id=? AND status='WAITING'",
                 (now(),game_id)
@@ -6451,8 +6529,8 @@ async def mafia_callback(callback: CallbackQuery):
         if callback.from_user.id not in {game['creator_id'], ADMIN_ID}:
             await safe_callback_answer(callback,'Нет доступа.',True); return
         players=mafia_player_rows(game_id)
-        if len(players)<5:
-            await safe_callback_answer(callback,'Нужно минимум 5 игроков.',True); return
+        if len(players)<mafia_min():
+            await safe_callback_answer(callback,f'Нужно минимум {mafia_min()} игроков.',True); return
         claimed=group_db_op(lambda conn: conn.execute(
             "UPDATE mafia_games SET status='STARTING',started_at=? WHERE id=? AND status='WAITING'",
             (now(),game_id)
@@ -6475,162 +6553,12 @@ async def mafia_callback(callback: CallbackQuery):
             await safe_callback_answer(callback,'Нет доступа.',True); return
         mafia_stop(game_id)
         with suppress(Exception):
-            await callback.message.edit_text('𝗟𝗜𝗙𝗘 𝗢𝗙 𝗝𝗨𝗦𝗧𝗜𝗖𝗘 𝗙𝗔𝗜𝗧𝗘\n\nЛобби закрыто.')
+            await callback.message.edit_text('◈ Life Of Justice Faite\n\nЛобби закрыто.')
         await safe_callback_answer(callback,'Лобби закрыто.')
         return
     active=mafia_open_game(callback.message.chat.id)
     if active:
         await _update_mafia_lobby_message(active)
-
-
-# =========================================================
-# OWNER CONTROL PANEL / PERSISTENT SETTINGS
-# =========================================================
-
-def get_bot_setting(key: str, default: str = "0") -> str:
-    try:
-        row = db_transaction(lambda conn: conn.execute(
-            "SELECT setting_value FROM bot_settings WHERE setting_key=?", (key,)
-        ).fetchone())
-        return str(row["setting_value"]) if row else default
-    except Exception:
-        logger.exception("Could not read bot setting: %s", key)
-        return default
-
-
-def set_bot_setting(key: str, value: str, user_id: int) -> None:
-    db_transaction(lambda conn: (
-        conn.execute(
-            "INSERT INTO bot_settings(setting_key,setting_value,updated_at,updated_by) VALUES(?,?,?,?) "
-            "ON CONFLICT(setting_key) DO UPDATE SET setting_value=excluded.setting_value, updated_at=excluded.updated_at, updated_by=excluded.updated_by",
-            (key, str(value), now(), int(user_id)),
-        ), conn.commit()
-    ))
-
-
-# Per-command controls. Settings are stored in SQLite and applied by middleware.
-COMMAND_SETTING_NAMES = {
-    "help": "Справка", "anon": "Анонимное обращение", "mafia": "Мафия",
-    "mafia_leave": "Выход из Мафии", "spy": "Шпион", "spy_kick": "Исключить из Шпиона",
-    "spy_end": "Завершить Шпиона", "game_poll": "Опрос игр", "setrole": "Назначение роли",
-    "syncroles": "Синхронизация ролей", "bindrole": "Привязка роли", "roles_audit": "Аудит ролей",
-    "jf_dashboard": "Сводка", "jf_awards": "Подготовка наград", "jf_award": "Локальная награда",
-    "jf_iris_sync": "Синхронизация наград", "jf_rest": "Рест (алиас)", "jf_warn": "Выдать предупреждение",
-    "jf_warnings": "История предупреждений", "jf_warn_remove": "Снять предупреждение",
-    "rest": "Рест", "jf_restlist": "Список рестов", "jf_birthday": "День рождения",
-    "jf_birthdays": "Дни рождения", "manage_commands": "Управление командами",
-    "addcommand": "Добавить пользовательскую команду", "delcommand": "Удалить пользовательскую команду",
-    "commands": "Список пользовательских команд",
-}
-
-def command_settings_keyboard():
-    rows = []
-    names = dict(COMMAND_SETTING_NAMES)
-    for custom in get_custom_commands():
-        names[custom["command"]] = f"Пользовательская: {custom['description'][:28]}"
-    for command, label in names.items():
-        enabled = get_bot_setting(f"cmd:{command}:enabled", "1") == "1"
-        mark = "🟢" if enabled else "🔴"
-        rows.append([InlineKeyboardButton(text=f"{mark} /{command} — {label}", callback_data=f"cmdcfg:toggle:{command}")])
-    rows.append([InlineKeyboardButton(text="↻ Обновить", callback_data="cmdcfg:refresh")])
-    rows.append([InlineKeyboardButton(text="‹ Назад в панель", callback_data="cmdcfg:back")])
-    return InlineKeyboardMarkup(inline_keyboard=rows)
-
-async def show_command_settings(message: Message, owner_id: int):
-    text = "⚙️ **Персональные настройки команд**\n\nНажми на команду, чтобы включить или отключить её. Настройки сохраняются в SQLite. Системные права доступа всё равно проверяются отдельно."
-    if message.text or message.caption:
-        await message.answer(text, reply_markup=command_settings_keyboard(), parse_mode="Markdown")
-    else:
-        await message.edit_text(text, reply_markup=command_settings_keyboard(), parse_mode="Markdown")
-
-@dp.callback_query(F.data.startswith("cmdcfg:"))
-async def command_settings_callback(callback: CallbackQuery):
-    if not callback.from_user or callback.from_user.id != ADMIN_ID or not callback.message or callback.message.chat.type != "private":
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    parts = (callback.data or "").split(":")
-    custom_names = {row["command"] for row in get_custom_commands()}
-    if len(parts) == 3 and parts[1] == "toggle" and (parts[2] in COMMAND_SETTING_NAMES or parts[2] in custom_names):
-        key = f"cmd:{parts[2]}:enabled"
-        value = "0" if get_bot_setting(key, "1") == "1" else "1"
-        set_bot_setting(key, value, callback.from_user.id)
-    if len(parts) == 2 and parts[1] == "back":
-        await callback.message.edit_text(
-            "༺ 𓆩 ✧ 𓆪 ༻\n\n🌿 **Панель управления Justice Faite**\n\nБот не публикует автоматические объявления об играх и не принимает заявки на вступление во флуд.",
-            reply_markup=owner_panel_keyboard(), parse_mode="Markdown"
-        )
-    else:
-        await callback.message.edit_text(
-            "⚙️ **Персональные настройки команд**\n\nНажми на команду, чтобы включить или отключить её. Настройки сохраняются в SQLite. Системные права доступа всё равно проверяются отдельно.",
-            reply_markup=command_settings_keyboard(), parse_mode="Markdown"
-        )
-    await callback.answer("Настройки обновлены")
-
-class PerCommandSettingsMiddleware(BaseMiddleware):
-    async def __call__(self, handler, event, data):
-        text_value = getattr(event, "text", None) or ""
-        match = re.match(r"^/([a-zA-Z0-9_]+)(?:@\w+)?(?:\s|$)", text_value)
-        if match:
-            command = match.group(1).lower()
-            # Never lock the owner out of the panel or help while tuning commands.
-            if command not in {"admin", "panel", "help", "start"} and get_bot_setting(f"cmd:{command}:enabled", "1") != "1":
-                if getattr(event, "chat", None) and event.chat.type == "private":
-                    await event.answer(f"Команда /{command} сейчас отключена владельцем.")
-                return
-        return await handler(event, data)
-
-dp.message.middleware(PerCommandSettingsMiddleware())
-
-def owner_panel_keyboard() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="📊 Сводка", callback_data="ownerpanel:dashboard"), InlineKeyboardButton(text="⚠️ Предупреждения", callback_data="ownerpanel:warnings")],
-        [InlineKeyboardButton(text="🥹 Рест-лист", callback_data="ownerpanel:rests"), InlineKeyboardButton(text="🎭 Аудит ролей", callback_data="ownerpanel:roles")],
-        [InlineKeyboardButton(text="🏆 Награды Ирис", callback_data="ownerpanel:awards"), InlineKeyboardButton(text="⚙️ Настройки команд", callback_data="ownerpanel:cmdsettings")],
-        [InlineKeyboardButton(text="🧩 Пользовательские команды", callback_data="ownerpanel:commands")],
-        [InlineKeyboardButton(text="📚 Справка", callback_data="ownerpanel:help")],
-    ])
-
-
-@dp.message(Command("admin", "panel"), F.chat.type == "private")
-async def owner_panel_cmd(message: Message):
-    if not message.from_user or message.from_user.id != ADMIN_ID:
-        return
-    await message.answer(
-        "༺ 𓆩 ✧ 𓆪 ༻\n\n🌿 **Панель управления Justice Faite**\n\n"
-        "Управление через кнопки. Бот не публикует автоматические объявления об играх и не принимает заявки на вступление во флуд.\n\n"
-        "Токен и ID чата/владельца остаются в переменных окружения для безопасности.",
-        reply_markup=owner_panel_keyboard(), parse_mode="Markdown"
-    )
-
-
-@dp.callback_query(F.data.startswith("ownerpanel:"))
-async def owner_panel_callback(callback: CallbackQuery):
-    if not callback.from_user or callback.from_user.id != ADMIN_ID or not callback.message or callback.message.chat.type != "private":
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-    action = (callback.data or "").split(":", 1)[-1]
-    if action == "cmdsettings":
-        await show_command_settings(callback.message, callback.from_user.id)
-        await callback.answer()
-        return
-    if action == "awards":
-        await callback.message.answer("🏆 Награды\n\nНажми /jf_awards, затем перешли сюда ответ Ирис на команду «олды». Бот подготовит команды для ручной пересылки во флуд.")
-        await callback.answer()
-        return
-    command_map = {
-        "dashboard": ("/jf_dashboard", "Сводка по флуду и административным данным."),
-        "warnings": ("/jf_warnings", "История предупреждений; для выдачи/снятия есть /jf_warn и /jf_warn_remove."),
-        "rests": ("/jf_restlist", "Список участников на рест; /rest — оформить или продлить."),
-        "roles": ("/roles_audit", "Проверка ролей; /bindrole — ручная привязка."),
-        "commands": ("/manage_commands", "Создание и удаление пользовательских команд."),
-        "help": ("/help", "Основные команды и их назначение. Для расширенного перечня см. COMMANDS.md."),
-    }
-    if action not in command_map:
-        await callback.answer("Неизвестный раздел.", show_alert=True)
-        return
-    command, description = command_map[action]
-    await callback.message.answer(f"{description}\n\nОткрой раздел командой {command}.")
-    await callback.answer()
 
 
 # =========================================================
@@ -6642,62 +6570,25 @@ def seed_default_games():
         add_game(name, description, launch_text)
 
 
-async def setup_commands():
-    # Private menu for all users. Admin-only commands are exposed only to OWNER_ID.
-    # The default private menu is intentionally minimal. Birthday commands are
-    # documented by /help only after membership is confirmed, so a newcomer
-    # is not presented with functions that cannot be used before joining.
-    private_user = [
-        BotCommand(command="start", description="🌸 Меню Justice Faite"),
-        BotCommand(command="help", description="✦ Навигация и команды"),
-        BotCommand(command="anon", description="🤫 Анонимное обращение"),
-    ]
-    group_user = [
-        BotCommand(command="help", description="Команды"),
-        BotCommand(command="mafia", description="🎭 Открыть игровое лобби"),
-        BotCommand(command="mafia_leave", description="✦ Выйти из лобби"),
-        BotCommand(command="spy", description="🕵️ Запустить «Шпион»"),
-    ]
-    group_admin = group_user + [
-        BotCommand(command="setrole", description="🎭 Назначить роль участнику"),
-        BotCommand(command="syncroles", description="✦ Синхронизировать роли"),
-        BotCommand(command="game_poll", description="🎮 Создать опрос на игру"),
-        BotCommand(command="spy_kick", description="🕵️ Исключить из игры"),
-        BotCommand(command="spy_end", description="🏁 Завершить «Шпион»"),
-    ]
-    owner_private = [
-        *private_user,
-        BotCommand(command="admin", description="⚙️ Панель управления кнопками"),
-        BotCommand(command="jf_awards", description="🏆 Кандидаты на достижения"),
-        BotCommand(command="jf_award", description="🏵 Выдать достижение"),
-        BotCommand(command="jf_iris_sync", description="✦ Подготовить награды для Ирис"),
-        BotCommand(command="jf_dashboard", description="🌸 Панель Justice Faite"),
-        BotCommand(command="jf_warn", description="⚠️ Выдать предупреждение"),
-        BotCommand(command="jf_warnings", description="📜 История предупреждений"),
-        BotCommand(command="jf_warn_remove", description="↩️ Снять предупреждение"),
-        BotCommand(command="rest", description="🥹 Оформить или продлить рест"),
-        BotCommand(command="jf_restlist", description="📋 Проверить рестников"),
-        BotCommand(command="roles_audit", description="🔎 Проверить роли"),
-        BotCommand(command="bindrole", description="🎭 Привязать роль"),
-        BotCommand(command="manage_commands", description="⚙️ Управление командами"),
-        BotCommand(command="addcommand", description="➕ Добавить команду"),
-        BotCommand(command="delcommand", description="🗑 Удалить команду"),
-        BotCommand(command="commands", description="📚 Список команд"),
-    ]
-
-    custom = get_custom_commands()
-    for row in custom:
-        try:
-            cmd = BotCommand(command=row["command"], description=row["description"][:256])
-        except Exception:
+def _menu_entries(level: str, chat_type: str):
+    seen, result = set(), []
+    for spec in cmdcfg.REGISTRY.values():
+        if not spec.menu or not cmdcfg.visible(spec.key, chat_type=chat_type, level=level):
             continue
-        if row["scope"] in {"all", "group"}:
-            group_user.append(cmd)
-            group_admin.append(cmd)
-        if row["scope"] == "all":
-            private_user.append(cmd)
-        if row["scope"] in {"all", "admin", "private"}:
-            owner_private.append(cmd)
+        for cmd, desc in spec.menu:
+            if cmd in seen:
+                continue
+            seen.add(cmd)
+            result.append(BotCommand(command=cmd, description=(desc or cmd)[:256]))
+    return result[:100]
+
+
+async def setup_commands():
+    """Меню команд строится из реестра: выключенные и недоступные команды в нём не показываются."""
+    private_user = _menu_entries("all", "private")
+    group_user = _menu_entries("members", "supergroup")
+    group_admin = _menu_entries("admins", "supergroup")
+    owner_private = _menu_entries("owner", "private")
 
     stale_scopes = [
         BotCommandScopeDefault(),
@@ -6717,9 +6608,45 @@ async def setup_commands():
     await bot.set_my_commands(private_user, scope=BotCommandScopeDefault())
     await bot.set_my_commands(owner_private, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     if PRIMARY_CHAT_ID:
-        # Commands are intentionally published only in the actual Justice Faite chat.
+        # Команды публикуются только в основном флуде.
         await bot.set_my_commands(group_user, scope=BotCommandScopeChat(chat_id=PRIMARY_CHAT_ID))
         await bot.set_my_commands(group_admin, scope=BotCommandScopeChatAdministrators(chat_id=PRIMARY_CHAT_ID))
+
+
+async def refresh_command_menu():
+    try:
+        await setup_commands()
+    except Exception:
+        logger.exception("Could not refresh command menu")
+
+
+_SETTING_GLOBALS = {
+    ("spy", "min_players"): ("SPY_MIN_PLAYERS", 1),
+    ("spy", "max_players"): ("SPY_MAX_PLAYERS", 1),
+    ("spy", "round_minutes"): ("SPY_ROUND_SECONDS", 60),
+    ("spy", "discussion_seconds"): ("SPY_DISCUSSION_SECONDS", 1),
+    ("spy", "final_vote_seconds"): ("SPY_FINAL_VOTE_SECONDS", 1),
+    ("spy", "final_guess_seconds"): ("SPY_FINAL_GUESS_SECONDS", 1),
+    ("spy", "max_hints"): ("SPY_MAX_HINTS", 1),
+    ("game_poll", "max_minutes"): ("GAME_POLL_MAX_MINUTES", 1),
+    ("call", "window_minutes"): ("ROLE_ASSIGNMENT_WINDOW_SECONDS", 60),
+}
+
+
+def apply_setting(command: str, key: str, value) -> None:
+    """Настройки, которые живут в глобальных константах движка, применяются сразу, без перезапуска."""
+    target = _SETTING_GLOBALS.get((command, key))
+    if not target:
+        return
+    name, factor = target
+    globals()[name] = int(cmdcfg.get_int(command, key)) * factor
+    if name in ("SPY_MIN_PLAYERS", "SPY_MAX_PLAYERS") and globals()["SPY_MIN_PLAYERS"] > globals()["SPY_MAX_PLAYERS"]:
+        globals()["SPY_MIN_PLAYERS"] = globals()["SPY_MAX_PLAYERS"]
+
+
+def apply_all_settings() -> None:
+    for (command, key) in _SETTING_GLOBALS:
+        apply_setting(command, key, None)
 
 
 # =========================================================
@@ -7203,7 +7130,7 @@ def _spy_lobby_keyboard(game_id, can_start=False):
 def _spy_lobby_text(game_id):
     players = _spy_players(game_id)
     lines = [
-        "𝗦𝗣𝗬𝗙𝗔𝗟𝗟",
+        "◈ Шпион",
         "",
         "Нажмите «🎮 Участвовать» — Telegram откроет ЛС с ботом и сразу подключит вас к игре.",
         "",
@@ -7316,7 +7243,7 @@ def _spy_round_summary_text(game_id, round_no):
     ).fetchall())
     if not rows:
         return ""
-    lines = [f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ИТОГИ КРУГА {round_no}", "", "Вопросы и ответы по порядку:", ""]
+    lines = [f"◈ Spyfall · ИТОГИ КРУГА {round_no}", "", "Вопросы и ответы по порядку:", ""]
     for idx, row in enumerate(rows, 1):
         asker = _spy_display(_spy_player(game_id, int(row["asker_id"])))
         target = _spy_display(_spy_player(game_id, int(row["target_id"])))
@@ -7345,7 +7272,7 @@ async def _spy_send_round_summary(game_id, round_no):
     try:
         await bot.send_message(
             int(game["chat_id"]),
-            f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · КРУГ {round_no} ЗАВЕРШЁН\n\n"
+            f"◈ Spyfall · КРУГ {round_no} ЗАВЕРШЁН\n\n"
             f"Вопросов сыграно: {count}.\n"
             "Переходим к следующему этапу.",
         )
@@ -7481,14 +7408,14 @@ async def _spy_send_card(game_id, user_id, location, role_name, is_spy):
     hints_used = int(player["hints_used"] or 0) if player else 0
     if is_spy:
         text = (
-            "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
+            "◈ Шпион\n\n"
             "🕵️ Ты — ШПИОН.\n\n"
             "Ты не знаешь локацию. Твоя задача — вычислить её по вопросам и ответам, не выдать себя и при необходимости попытаться угадать её.\n\n"
             "У тебя две подсказки: первая после полного круга вопросов, вторая — после следующего. Они дают направление, а не название места. Хорошей игры!"
         )
     else:
         text = (
-            "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
+            "◈ Шпион\n\n"
             f"Локация: {location}\n\n"
             "Не называй локацию напрямую. Отвечай на вопросы так, чтобы не помочь шпиону слишком легко вычислить место.\n\n"
             "Хорошей игры!"
@@ -7607,7 +7534,7 @@ async def _spy_prepare_turn_dm(game_id, asker_id):
     turn_no = int(game["turn_count"] or 0) + 1
     await bot.send_message(
         int(asker_id),
-        "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
+        "◈ Шпион\n\n"
         f"Твой ход.\nТы задаёшь вопрос: {_spy_display(target)}\n\n"
         "Сформулируй вопрос на конце со знаком «?».\n"
         "На него должно быть возможно ответить только «Да» или «Нет».",
@@ -7617,7 +7544,7 @@ async def _spy_prepare_turn_dm(game_id, asker_id):
         await bot.edit_message_text(
             chat_id=int(game["chat_id"]),
             message_id=int(game["lobby_message_id"]),
-            text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ХОД\n\n"
+            text=("◈ Spyfall · ХОД\n\n"
                   f"Сейчас ходит {_spy_display(asker)}.\n"
                   f"Вопрос: {_spy_display(target)}\n\n"
                   f"Вопрос №{turn_no}.") if game["lobby_message_id"] else "",
@@ -7674,7 +7601,7 @@ async def _spy_start_discussion(game_id):
             await bot.edit_message_text(
                 chat_id=int(game["chat_id"]),
                 message_id=int(control_id),
-                text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ОБСУЖДЕНИЕ\n\n"
+                text=("◈ Spyfall · ОБСУЖДЕНИЕ\n\n"
                       "Вопросы закончены. У вас 2 минуты на обсуждение.\n\n"
                       "Можно дождаться таймера или сразу перейти к голосованию."),
                 reply_markup=_spy_group_controls(game_id, discussion=True),
@@ -7733,7 +7660,7 @@ async def _spy_start_vote(game_id):
         conn.commit(),
     ))
     text = (
-        "𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ГОЛОСОВАНИЕ\n\n"
+        "◈ Spyfall · ГОЛОСОВАНИЕ\n\n"
         f"Раунд {int(game["vote_round"] or 0) + 1}/{SPY_MAX_VOTE_ROUNDS}.\n"
         "Выберите подозреваемого. Голос можно изменить до завершения голосования.\n\n"
         "○ — никто не голосовал\n● — есть голоса"
@@ -7771,7 +7698,7 @@ async def _spy_start_final_guess(game_id, reason="После шести раун
         with suppress(Exception):
             await bot.send_message(
                 int(spy["user_id"]),
-                "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
+                "◈ Шпион\n\n"
                 f"{reason}.\nУ тебя 60 секунд на финальную догадку.",
                 reply_markup=_spy_guess_keyboard(game_id),
             )
@@ -7780,7 +7707,7 @@ async def _spy_start_final_guess(game_id, reason="После шести раун
             await bot.edit_message_text(
                 chat_id=int(game["chat_id"]),
                 message_id=int(game["lobby_message_id"]),
-                text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ФИНАЛЬНАЯ ДОГАДКА\n\n"
+                text=("◈ Spyfall · ФИНАЛЬНАЯ ДОГАДКА\n\n"
                       "Оставшимся шпионам дано 60 секунд, чтобы назвать локацию."),
                 reply_markup=None,
             )
@@ -7801,7 +7728,7 @@ async def _spy_resolve_vote_session(game_id, vote_session):
         return
     label = "Никто не набрал большинства." if not result["tie"] else "Получилась ничья — единого решения нет."
     with suppress(Exception):
-        await bot.send_message(int(game["chat_id"]), f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n{label} Продолжаем игру.")
+        await bot.send_message(int(game["chat_id"]), f"◈ Шпион\n\n{label} Продолжаем игру.")
     await _spy_resume_question_cycle(game_id)
 
 
@@ -7837,7 +7764,7 @@ async def _spy_resolve_accusation(game_id, suspect_id):
                 await bot.edit_message_text(
                     chat_id=int(game["chat_id"]),
                     message_id=int(game["lobby_message_id"]),
-                    text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ШПИОН РАСКРЫТ\n\n"
+                    text=("◈ Spyfall · ШПИОН РАСКРЫТ\n\n"
                           f"Подозреваемый: {_spy_display(suspect)}.\n"
                           "У него 60 секунд на последнюю попытку угадать локацию."),
                     reply_markup=None,
@@ -7845,7 +7772,7 @@ async def _spy_resolve_accusation(game_id, suspect_id):
         with suppress(Exception):
             await bot.send_message(
                 int(suspect_id),
-                "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
+                "◈ Шпион\n\n"
                 "Тебя раскрыли. У тебя 60 секунд на последнюю попытку угадать локацию.",
                 reply_markup=_spy_guess_keyboard(game_id),
             )
@@ -7865,7 +7792,7 @@ async def _spy_resolve_accusation(game_id, suspect_id):
     current_round = int(game["vote_round"] or 0) + 1
     _spy_set_state(game_id, vote_round=current_round, accusation_suspect_id=int(suspect_id))
     with suppress(Exception):
-        await bot.send_message(int(game["chat_id"]), f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nВы ошиблись: {_spy_display(suspect)} — не шпион. Игра продолжается.")
+        await bot.send_message(int(game["chat_id"]), f"◈ Шпион\n\nВы ошиблись: {_spy_display(suspect)} — не шпион. Игра продолжается.")
     if current_round >= SPY_MAX_VOTE_ROUNDS:
         await _spy_start_final_guess(game_id)
     else:
@@ -7886,7 +7813,7 @@ async def _spy_finish_message(game_id, winner, reason, location_override=None):
             await bot.edit_message_text(
                 chat_id=int(game["chat_id"]),
                 message_id=int(game["lobby_message_id"]),
-                text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ИГРА ОКОНЧЕНА\n\n"
+                text=("◈ Spyfall · ИГРА ОКОНЧЕНА\n\n"
                       f"Победитель: {winner}\n{reason}\n\n"
                       f"Локация: {location}\nШпион(ы): {spy_names}"),
                 reply_markup=None,
@@ -7896,7 +7823,7 @@ async def _spy_finish_message(game_id, winner, reason, location_override=None):
     with suppress(Exception):
         await bot.send_message(
             int(game["chat_id"]),
-            "𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ФИНАЛ\n\n"
+            "◈ Spyfall · ФИНАЛ\n\n"
             f"Победитель: {winner}\n{reason}\n\n"
             f"Локация: {location}\n"
             f"Шпион(ы): {spy_names}",
@@ -7905,7 +7832,7 @@ async def _spy_finish_message(game_id, winner, reason, location_override=None):
         with suppress(Exception):
             await bot.send_message(
                 int(p["user_id"]),
-                "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
+                "◈ Шпион\n\n"
                 "Раунд завершён.\n"
                 f"Локация: {location}\n"
                 f"Шпион(ы): {spy_names}",
@@ -8003,7 +7930,7 @@ async def _spy_force_resume_after_kick(game_id: int, kicked_id: int):
                         chat_id=int(current["chat_id"]),
                         message_id=int(current["lobby_message_id"]),
                         text=(
-                            "𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ГОЛОСОВАНИЕ\n\n"
+                            "◈ Spyfall · ГОЛОСОВАНИЕ\n\n"
                             f"Раунд {int(current['vote_round'] or 0) + 1}/{SPY_MAX_VOTE_ROUNDS}.\n"
                             "Выберите подозреваемого. Голос можно изменить до завершения голосования.\n\n"
                             "○ — нет голосов\n● — есть голоса"
@@ -8088,11 +8015,11 @@ async def _spy_force_resume_after_kick(game_id: int, kicked_id: int):
 
 @dp.message(Command("spy_kick"))
 async def spy_kick_cmd(message: Message):
-    if not await _spy_command_admin_ok(message):
+    if not await cmdcfg.gate(message, "spy_kick"):
         return
     game = _spy_open_game(message.chat.id)
     if not game:
-        await message.reply("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nСейчас нет активной игры.")
+        await message.reply("◈ Шпион\n\nСейчас нет активной игры.")
         return
 
     raw = _spy_command_arg(message)
@@ -8103,7 +8030,7 @@ async def spy_kick_cmd(message: Message):
         target = _spy_find_player_for_command(game["id"], raw)
 
     if not target or not int(target["active"] or 0):
-        await message.reply("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nНе удалось найти активного участника. Используй /spy_kick @username или ответь этой командой на сообщение участника.")
+        await message.reply("◈ Шпион\n\nНе удалось найти активного участника. Используй /spy_kick @username или ответь этой командой на сообщение участника.")
         return
     if int(target["user_id"]) == int(message.from_user.id):
         await message.reply("Себя кикнуть этой командой нельзя.")
@@ -8117,7 +8044,7 @@ async def spy_kick_cmd(message: Message):
         with suppress(Exception):
             await bot.send_message(
                 message.chat.id,
-                "𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ШПИОН РАСКРЫТ\n\n"
+                "◈ Spyfall · ШПИОН РАСКРЫТ\n\n"
                 f"Администратор исключил {_spy_display(target)}.\n"
                 "Это оказался шпион. Ему даётся 60 секунд на последнюю попытку угадать локацию.",
             )
@@ -8131,18 +8058,18 @@ async def spy_kick_cmd(message: Message):
         conn.commit(),
     ))
     with suppress(Exception):
-        await bot.send_message(message.chat.id, f"𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n🚫 {_spy_display(target)} исключён администратором из игры.")
+        await bot.send_message(message.chat.id, f"◈ Шпион\n\n🚫 {_spy_display(target)} исключён администратором из игры.")
     await _spy_force_resume_after_kick(game_id, target_id)
     await message.reply(f"Участник {_spy_display(target)} исключён. Состояние игры восстановлено.")
 
 
 @dp.message(Command("spy_end"))
 async def spy_end_cmd(message: Message):
-    if not await _spy_command_admin_ok(message):
+    if not await cmdcfg.gate(message, "spy_end"):
         return
     game = _spy_open_game(message.chat.id)
     if not game:
-        await message.reply("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nСейчас нет активной игры.")
+        await message.reply("◈ Шпион\n\nСейчас нет активной игры.")
         return
     await _spy_finish_message(
         int(game["id"]),
@@ -8154,7 +8081,8 @@ async def spy_end_cmd(message: Message):
 
 @dp.message(Command("spy"))
 async def spy_cmd(message: Message):
-    if not require_primary_group(message) or not is_group_admin_user(message):
+    # Раньше /spy молча игнорировал всех, кроме владельца, хотя числился в списке команд для всех.
+    if not await cmdcfg.gate(message, "spy"):
         return
     existing = _spy_open_game(message.chat.id)
     if existing:
@@ -8164,7 +8092,7 @@ async def spy_cmd(message: Message):
                 reply_markup=_spy_lobby_keyboard(existing["id"], len(_spy_players(existing["id"])) >= SPY_MIN_PLAYERS),
             )
         else:
-            await message.reply("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nВ этом чате уже идёт игра.", reply_markup=_spy_group_controls(existing["id"]))
+            await message.reply("◈ Шпион\n\nВ этом чате уже идёт игра.", reply_markup=_spy_group_controls(existing["id"]))
         return
     game = _spy_create_game(message.chat.id, message.from_user.id)
     sent = await message.answer(_spy_lobby_text(game["id"]), reply_markup=_spy_lobby_keyboard(game["id"], False))
@@ -8181,7 +8109,7 @@ async def spy_handle_deep_link(message: Message, game_id: int):
     if not game or message.chat.type != "private" or not message.from_user:
         return
     if game["status"] != "WAITING":
-        await message.answer("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nЭто лобби уже закрыто или игра началась.")
+        await message.answer("◈ Шпион\n\nЭто лобби уже закрыто или игра началась.")
         return
     if getattr(message.from_user, "is_bot", False):
         await message.answer("Боты не участвуют.")
@@ -8189,7 +8117,7 @@ async def spy_handle_deep_link(message: Message, game_id: int):
     try:
         member = await bot.get_chat_member(int(game["chat_id"]), int(message.from_user.id))
         if getattr(member, "status", "") in {"left", "kicked"}:
-            await message.answer("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nТы сейчас не являешься участником чата игры.")
+            await message.answer("◈ Шпион\n\nТы сейчас не являешься участником чата игры.")
             return
     except Exception:
         logger.debug("Spy membership lookup failed | game=%s user=%s", game_id, message.from_user.id, exc_info=True)
@@ -8212,17 +8140,17 @@ async def spy_handle_deep_link(message: Message, game_id: int):
                 )
         if existed:
             await message.answer(
-                "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n✅ Ты уже участвуешь в этом лобби.\n"
+                "◈ Шпион\n\n✅ Ты уже участвуешь в этом лобби.\n"
                 "Повторное нажатие ничего не меняет. ЛС подключён."
             )
         else:
             await message.answer(
-                "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n✅ Ты подключён к игре.\n"
+                "◈ Шпион\n\n✅ Ты подключён к игре.\n"
                 "Вернись в чат — после старта твоя секретная карточка придёт сюда."
             )
     else:
         await message.answer(
-            "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n" + (
+            "◈ Шпион\n\n" + (
                 "✅ Ты уже участвуешь в этом лобби. Повторное нажатие ничего не меняет." if existed else text
             )
         )
@@ -8249,7 +8177,7 @@ async def _spy_launch_game_task(game_id: int, chat_id: int, lobby_message_id: in
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=lobby_message_id,
-                    text="𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n❌ Игра не запущена.\n\n"
+                    text="◈ Шпион\n\n❌ Игра не запущена.\n\n"
                          f"Не подключили ЛС: {names}{more}\n\n"
                          "Пусть эти участники снова нажмут «🎮 Участвовать»." ,
                     reply_markup=_spy_lobby_keyboard(game_id, len(players) >= SPY_MIN_PLAYERS),
@@ -8260,7 +8188,7 @@ async def _spy_launch_game_task(game_id: int, chat_id: int, lobby_message_id: in
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=lobby_message_id,
-                text="𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n⏳ Подготавливаю игру…\n"
+                text="◈ Шпион\n\n⏳ Подготавливаю игру…\n"
                      "Раздаю секретные карточки участникам.",
                 reply_markup=None,
             )
@@ -8272,7 +8200,7 @@ async def _spy_launch_game_task(game_id: int, chat_id: int, lobby_message_id: in
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=lobby_message_id,
-                    text="𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n❌ Игра не запущена.\n" + str(msg),
+                    text="◈ Шпион\n\n❌ Игра не запущена.\n" + str(msg),
                     reply_markup=_spy_lobby_keyboard(game_id, len(_spy_players(game_id)) >= SPY_MIN_PLAYERS),
                 )
             return
@@ -8284,7 +8212,7 @@ async def _spy_launch_game_task(game_id: int, chat_id: int, lobby_message_id: in
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=lobby_message_id,
-                text="𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
+                text="◈ Шпион\n\n"
                      "Игра началась.\n\n"
                      "Очередность вопросов:\n" + order_text + "\n\n"
                      "Сообщение закреплено и будет показывать текущую фазу игры.",
@@ -8300,7 +8228,7 @@ async def _spy_launch_game_task(game_id: int, chat_id: int, lobby_message_id: in
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=lobby_message_id,
-                text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n❌ Запуск занял слишком много времени и был отменён.\n\n"
+                text=("◈ Шпион\n\n❌ Запуск занял слишком много времени и был отменён.\n\n"
                       f"{diagnostic}"),
                 reply_markup=_spy_lobby_keyboard(game_id, len(_spy_players(game_id)) >= SPY_MIN_PLAYERS),
             )
@@ -8312,7 +8240,7 @@ async def _spy_launch_game_task(game_id: int, chat_id: int, lobby_message_id: in
             await bot.edit_message_text(
                 chat_id=chat_id,
                 message_id=lobby_message_id,
-                text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n❌ При запуске произошла ошибка.\n\n"
+                text=("◈ Шпион\n\n❌ При запуске произошла ошибка.\n\n"
                       f"{diagnostic}\n\n"
                       "Лобби возвращено в состояние ожидания — данные участников сохранены."),
                 reply_markup=_spy_lobby_keyboard(game_id, len(_spy_players(game_id)) >= SPY_MIN_PLAYERS),
@@ -8379,7 +8307,7 @@ async def spy_callback(callback: CallbackQuery):
             return
         _spy_set_state(game_id, status="CANCELLED", phase="FINISHED", expires_at=None)
         with suppress(Exception):
-            await callback.message.edit_text("𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\nЛобби отменено.", reply_markup=None)
+            await callback.message.edit_text("◈ Шпион\n\nЛобби отменено.", reply_markup=None)
         with suppress(Exception):
             await bot.unpin_chat_message(callback.message.chat.id, callback.message.message_id)
         await callback.answer("Лобби отменено.")
@@ -8587,7 +8515,7 @@ async def spy_callback(callback: CallbackQuery):
                     await bot.edit_message_text(
                         chat_id=int(current["chat_id"]),
                         message_id=int(current["lobby_message_id"]),
-                        text=("𝗦𝗣𝗬𝗙𝗔𝗟𝗟 · ГОЛОСОВАНИЕ\n\n"
+                        text=("◈ Spyfall · ГОЛОСОВАНИЕ\n\n"
                               f"Раунд {int(current['vote_round'] or 0) + 1}/{SPY_MAX_VOTE_ROUNDS}.\n"
                               "Выберите подозреваемого. Голос можно изменить до завершения голосования.\n\n"
                               "○ — нет голосов\n● — есть голоса"),
@@ -8678,19 +8606,27 @@ async def spy_callback(callback: CallbackQuery):
 # =========================================================
 
 try:
+    cmdspecs.load()
+    cmdcfg.configure(bot=bot, owner_id=ADMIN_ID, primary_chat_id=PRIMARY_CHAT_ID)
+    cmdcfg.bind_db(group_db_op)
+    cmdcfg.STORE.on_change(apply_setting)
     from justice_features import (
         register_justice_features,
         init_justice_features_db,
-        latest_requested_role_for_chat as jf_latest_requested_role,
         feature_maintenance_worker,
     )
     register_justice_features(globals())
+    settings_panel.register(
+        dp, bot=bot, owner_id=ADMIN_ID, refresh_menu=refresh_command_menu,
+        custom_list=get_custom_commands, custom_save=save_custom_command,
+        custom_delete=delete_custom_command, custom_normalize=_normalize_custom_command_name,
+    )
 except Exception:
     logger.exception("Could not register Justice Faite features")
     raise
 
 
-@dp.message(F.chat.type == "private", F.text)
+@dp.message(F.chat.type == "private", F.text, ~F.text.startswith("/"))
 async def spy_private_text(message: Message):
     if not message.from_user or not message.text or message.text.startswith("/"):
         return
@@ -8752,7 +8688,7 @@ async def spy_private_text(message: Message):
             _spy_set_state(game["id"], phase="ANSWERING")
             await bot.send_message(
                 int(target["user_id"]),
-                "𝗦𝗣𝗬𝗙𝗔𝗟𝗟\n\n"
+                "◈ Шпион\n\n"
                 f"Тебе задали вопрос:\n\n«{text}»\n\n"
                 "Выбери ответ:",
                 reply_markup=_spy_answer_keyboard(game["id"], next_turn_no),
@@ -8906,17 +8842,25 @@ async def _spy_recovery_worker():
 # /roles, etc. would swallow native commands that are not custom commands.
 @dp.message(F.text.regexp(r"^\s*/[A-Za-z][A-Za-z0-9_]{0,31}(?:@[A-Za-z0-9_]+)?(?:\s.*)?$"))
 async def custom_command_dispatch(message: Message):
-    if message.chat.type in {"group", "supergroup"} and not is_primary_chat(message.chat.id):
-        return
     text = message.text or ""
-    m = re.match(r"^\s*/([A-Za-z][A-Za-z0-9_]{0,31})", text)
+    m = re.match(r"^\s*/([A-Za-z][A-Za-z0-9_]{0,31})(?:@([A-Za-z0-9_]+))?", text)
     if not m:
         return
-    command = m.group(1).lower()
-    row = get_custom_command(command)
-    if not row or not _custom_command_allowed(row, message):
+    if m.group(2) and BOT_USERNAME and m.group(2).lower() != BOT_USERNAME.lower():
+        return                                   # команда адресована другому боту
+    key = "cc_" + m.group(1).lower()
+    if key not in cmdcfg.REGISTRY:
         return
-    await message.reply(render_custom_response(row["response"], message))
+    if not await cmdcfg.gate(message, key, notify=False):
+        return
+    response = render_custom_response(cmdcfg.get_str(key, "response"), message)
+    if cmdcfg.get_str(key, "reply_mode") == "plain":
+        sent = await message.answer(response)
+    else:
+        sent = await message.reply(response)
+    delay = cmdcfg.get_int(key, "autodelete")
+    if delay and message.chat.type in {"group", "supergroup"}:
+        cmdcfg.schedule_delete(int(message.chat.id), int(sent.message_id), delay)
 
 
 async def main():
@@ -8931,6 +8875,8 @@ async def main():
     seed_role_catalog()
     seed_default_games()
     migrate_group_state()
+    register_custom_specs()
+    apply_all_settings()
 
     _spy_ensure_schema()
     asyncio.create_task(_spy_recovery_worker())
@@ -8948,6 +8894,8 @@ async def main():
             me.id,
             me.username or "unknown",
         )
+        global BOT_USERNAME
+        BOT_USERNAME = (me.username or BOT_USERNAME).lstrip("@")
         await bot.delete_webhook(drop_pending_updates=False)
         logger.info("Old Telegram webhook removed.")
     except TelegramUnauthorizedError:

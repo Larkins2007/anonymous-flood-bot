@@ -1,110 +1,57 @@
-"""Justice Faite-specific features layered on top of the existing bot.
+"""Justice Faite: функции сообщества поверх основного бота.
 
-This module deliberately avoids cloning Iris commands. It owns community-only
-features: admission workflow, persistent age-document review, rewards,
-old/active checks, warning lifecycle, rest/birthday records, a dashboard,
-and optional Iris hand-off for awards.
+Здесь живут: предупреждения, рест, дни рождения, сводка и фоновый обработчик.
+Награды вынесены в `awards.py`. Заявки и вступление через бота удалены.
+
+Все команды проходят через `cmdcfg.gate`, поэтому у каждой есть собственная
+карточка настроек (ЛС владельца → /settings).
 """
 from __future__ import annotations
 
 import asyncio
-import json
-import os
+import html
+import logging
 import re
-import sqlite3
-import difflib
-import time
-import unicodedata
 from contextlib import suppress
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timedelta, timezone
 from typing import Any, Optional
 
 from aiogram import F
 from aiogram.filters import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
-from aiogram.types import (
-    CallbackQuery,
-    ChatJoinRequest,
-    InlineKeyboardButton,
-    InlineKeyboardMarkup,
-    Message,
-)
-from aiogram.exceptions import TelegramBadRequest, TelegramForbiddenError, TelegramNetworkError
+from aiogram.types import Message
 
+import awards
+import cmdcfg
+import ui
 
-# Runtime-bound in register_justice_features().
+logger = logging.getLogger("justice_features")
+
+# Привязываются в register_justice_features().
 _bot = None
 _dp = None
-_db = None
 _db_op = None
 _now = None
-_role_for = None
-_role_for_tag = None
-_normalize_role = None
-_group_member_is_active = None
 _upsert_group_member = None
 _get_member = None
-_assign_role_db_atomic = None
-_apply_member_tag = None
-_finalize_role_assignment = None
-_confirm_member = None
-_lift_member_restriction = None
-_send_or_edit_welcome = None
-_display_username = None
-_primary_chat_id = None
+_primary_chat_id = 0
+_admin_id = 0
 _is_primary_chat = None
-_admin_id = None
-_register_user = None
 
-FEATURE_PREFIX = "jf:"
-_PENDING_ADMIN_MESSAGE: dict[int, int] = {}
-
-# Unified Justice Faite visual style for all newly added messages.
-def _fmt(text: str) -> str:
-    return f"༺ 𓆩 ✧ 𓆪 ༻\n\n🌸 {text}"
-
-def _back_home_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="↩ Назад", callback_data="u:home")]
-    ])
-
-IRIS_COMMAND = os.getenv("IRIS_AWARD_COMMAND", "наградить")
-IRIS_AWARD_PREFIX = os.getenv("IRIS_AWARD_PREFIX", "!")
-# Levels/titles are configurable because the exact Iris award scale is a community decision.
-IRIS_30D_LEVEL = max(1, min(8, int(os.getenv("IRIS_30D_AWARD_LEVEL", "5"))))
-IRIS_60D_LEVEL = max(1, min(8, int(os.getenv("IRIS_60D_AWARD_LEVEL", "6"))))
-IRIS_120D_LEVEL = max(1, min(8, int(os.getenv("IRIS_120D_AWARD_LEVEL", "7"))))
-IRIS_OLD_THRESHOLDS = (
-    (30, IRIS_30D_LEVEL, "🌱 30 дней в Justice Faite"),
-    (60, IRIS_60D_LEVEL, "🌿 60 дней в Justice Faite"),
-    (120, IRIS_120D_LEVEL, "🌳 120 дней в Justice Faite"),
-)
-INVITE_TTL_HOURS = max(1, min(168, int(os.getenv("JF_INVITE_TTL_HOURS", "24"))))
-ANON_COOLDOWN_SECONDS = max(0, int(os.getenv("JF_ANON_COOLDOWN_SECONDS", "300")))
-WELCOME_RULES_URL = os.getenv("JF_RULES_URL", "").strip()
-
-ROLE_SCAN_LIMIT = 180
+GROUP_TYPES = {"group", "supergroup"}
 
 
 class BirthdayState(StatesGroup):
     waiting_date = State()
 
 
-class JoinApplicationState(StatesGroup):
-    waiting_rules = State()
-    waiting_role = State()
-    waiting_document = State()
-
-
-class AdminApplicationMessageState(StatesGroup):
-    waiting_text = State()
-
+# --------------------------------------------------------------------------
+# База данных
+# --------------------------------------------------------------------------
 
 def _q(fn, *args):
-    if _db_op is not None:
-        return _db_op(fn, *args)
-    return fn(_db(), *args)
+    return _db_op(fn, *args)
 
 
 def _utc_iso() -> str:
@@ -115,47 +62,6 @@ def init_justice_features_db() -> None:
     def op(conn):
         conn.executescript(
             """
-            CREATE TABLE IF NOT EXISTS jf_invites (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                invite_link TEXT NOT NULL UNIQUE,
-                chat_id INTEGER NOT NULL,
-                created_by INTEGER NOT NULL,
-                created_at TEXT NOT NULL,
-                expires_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'active',
-                used_by INTEGER,
-                used_at TEXT,
-                revoked_at TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_jf_invites_status ON jf_invites(status);
-            CREATE INDEX IF NOT EXISTS idx_jf_invites_user ON jf_invites(used_by);
-
-            CREATE TABLE IF NOT EXISTS jf_applications (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                chat_id INTEGER NOT NULL,
-                invite_id INTEGER,
-                invite_link TEXT,
-                requested_role TEXT NOT NULL DEFAULT '',
-                requested_role_key TEXT NOT NULL DEFAULT '',
-                birth_date TEXT NOT NULL DEFAULT '',
-                document_file_id TEXT NOT NULL DEFAULT '',
-                document_message_id INTEGER,
-                status TEXT NOT NULL DEFAULT 'awaiting_data',
-                join_request_chat_id INTEGER,
-                join_request_user_chat_id INTEGER,
-                join_request_at TEXT,
-                reviewed_by INTEGER,
-                reviewed_at TEXT,
-                review_reason TEXT NOT NULL DEFAULT '',
-                approved_invite_link TEXT NOT NULL DEFAULT '',
-                approved_invite_expires_at TEXT,
-                created_at TEXT NOT NULL,
-                updated_at TEXT NOT NULL
-            );
-            CREATE INDEX IF NOT EXISTS idx_jf_applications_user_status ON jf_applications(user_id,status);
-            CREATE INDEX IF NOT EXISTS idx_jf_applications_chat_status ON jf_applications(chat_id,status);
-
             CREATE TABLE IF NOT EXISTS jf_warnings (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
@@ -216,18 +122,6 @@ def init_justice_features_db() -> None:
                 PRIMARY KEY(chat_id,person_key)
             );
 
-            CREATE TABLE IF NOT EXISTS jf_anonymous_messages (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                user_id INTEGER NOT NULL,
-                chat_id INTEGER NOT NULL,
-                text TEXT NOT NULL,
-                created_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'new',
-                replied_at TEXT,
-                last_user_sent_at TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_jf_anon_status ON jf_anonymous_messages(status,created_at);
-
             CREATE TABLE IF NOT EXISTS jf_award_audit (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
@@ -239,14 +133,6 @@ def init_justice_features_db() -> None:
                 external_ref TEXT NOT NULL DEFAULT ''
             );
 
-            CREATE TABLE IF NOT EXISTS jf_iris_scan (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                chat_id INTEGER NOT NULL,
-                requested_at TEXT NOT NULL,
-                status TEXT NOT NULL DEFAULT 'waiting',
-                finished_at TEXT
-            );
-            CREATE INDEX IF NOT EXISTS idx_jf_iris_scan_status ON jf_iris_scan(chat_id,status);
             CREATE TABLE IF NOT EXISTS jf_birthday_notices (
                 chat_id INTEGER NOT NULL,
                 user_id INTEGER NOT NULL,
@@ -254,1642 +140,445 @@ def init_justice_features_db() -> None:
                 sent_at TEXT NOT NULL,
                 PRIMARY KEY(chat_id,user_id,year)
             );
-        """)
-        # Forward-compatible migrations for an existing SQLite database.
-        existing = {row[1] for row in conn.execute("PRAGMA table_info(jf_applications)").fetchall()}
-        if "approved_invite_link" not in existing:
-            conn.execute("ALTER TABLE jf_applications ADD COLUMN approved_invite_link TEXT NOT NULL DEFAULT ''")
-        if "approved_invite_expires_at" not in existing:
-            conn.execute("ALTER TABLE jf_applications ADD COLUMN approved_invite_expires_at TEXT")
-        rest_existing = {row[1] for row in conn.execute("PRAGMA table_info(jf_rest)").fetchall()}
-        if "ended_notified_at" not in rest_existing:
+            """
+        )
+        rest_cols = {row[1] for row in conn.execute("PRAGMA table_info(jf_rest)").fetchall()}
+        if "ended_notified_at" not in rest_cols:
             conn.execute("ALTER TABLE jf_rest ADD COLUMN ended_notified_at TEXT")
         conn.commit()
+
     _q(op)
 
 
-def _admin_only(message: Message) -> bool:
-    return bool(message.from_user and int(message.from_user.id) == int(_admin_id))
+# --------------------------------------------------------------------------
+# Участники
+# --------------------------------------------------------------------------
+
+def _active_member_rows() -> list[dict[str, Any]]:
+    rows = _q(lambda conn: conn.execute(
+        "SELECT * FROM group_members WHERE chat_id=? AND active=1", (int(_primary_chat_id),)).fetchall())
+    return [dict(r) for r in rows]
 
 
-def _mention_user(user_id: int, name: str, username: str | None) -> str:
-    if username:
-        return f"@{username}"
-    safe = (name or "участник").replace("<", "&lt;").replace(">", "&gt;")
-    return f'<a href="tg://user?id={int(user_id)}">{safe}</a>'
+def member_by_id(user_id: int, *, active_only: bool = False) -> Optional[dict]:
+    sql = "SELECT * FROM group_members WHERE chat_id=? AND user_id=?" + (" AND active=1" if active_only else "")
+    row = _q(lambda conn: conn.execute(sql, (int(_primary_chat_id), int(user_id))).fetchone())
+    return dict(row) if row else None
 
 
-def _role_candidates_from_catalog() -> list[tuple[str, str, str]]:
-    out = []
-    try:
-        from bot import ROLE_CATALOG
-        for name, english, region in ROLE_CATALOG:
-            out.append((name, english, region))
-    except Exception:
-        pass
-    return out
-
-
-def _role_match_key(value: str) -> str:
-    """Normalize a role/name for tolerant Russian user input."""
-    value = (value or "").casefold().replace("ё", "е")
-    return re.sub(r"[^a-zа-я0-9]+", "", value)
-
-
-def _role_word_stem(value: str) -> str:
-    """Lightweight Russian case normalization (not a linguistic stemmer)."""
-    value = _role_match_key(value)
-    if len(value) < 5:
-        return value
-    for suffix in ("ами", "ями", "ого", "ему", "ому", "ыми", "ими", "ами", "ями", "ах", "ях", "ам", "ям", "ом", "ем", "ой", "ей", "ую", "ю", "ов", "ев", "ы", "и", "е", "о", "у", "а", "я"):
-        if value.endswith(suffix) and len(value) - len(suffix) >= 4:
-            return value[:-len(suffix)]
-    return value
-
-
-def _role_variants(name: str, english: str) -> set[str]:
-    variants: set[str] = set()
-    for value in (name, english):
-        compact = _role_match_key(value)
-        if compact:
-            variants.add(compact)
-        for word in re.split(r"\s+", value.casefold().replace("ё", "е")):
-            stem = _role_word_stem(word)
-            if stem:
-                variants.add(stem)
-    return variants
-
-
-def find_requested_role(text: str):
-    """Resolve a role from exact names, natural phrases and common typos.
-
-    The user can type e.g. ``кадзуха``, ``казуха``, ``я хочу казуху``,
-    ``чжун ли``, ``чжунли`` or ``син цю``.  Fuzzy matching is only accepted
-    when the candidate is unambiguous, preventing random role assignment.
-    """
-    raw = re.sub(r"\s+", " ", (text or "").strip())
-    if not raw:
+def member_by_username(username: str, *, active_only: bool = True) -> Optional[dict]:
+    name = (username or "").strip().lstrip("@").lower()
+    if not name:
         return None
-
-    candidates = _role_candidates_from_catalog()
-    if not candidates:
-        return None
-
-    # 1) Exact/substring matching is deterministic and preferred.
-    hay = raw.casefold().replace("ё", "е")
-    compact_hay = _role_match_key(raw)
-    exact_hits = []
-    for name, english, region in candidates:
-        variants = _role_variants(name, english)
-        normalized_name = re.sub(r"\s+", " ", name.casefold().replace("ё", "е")).strip()
-        normalized_en = re.sub(r"\s+", " ", english.casefold()).strip()
-        if normalized_name in hay or normalized_en in hay or _role_match_key(name) in compact_hay or _role_match_key(english) in compact_hay:
-            exact_hits.append((name, english, region))
-    if exact_hits:
-        # Longest exact role wins; duplicate aliases of the same role collapse naturally.
-        exact_hits.sort(key=lambda x: max(len(x[0]), len(x[1])), reverse=True)
-        role = _role_for(exact_hits[0][0])
-        if role:
-            return role
-
-    # 2) Compare individual words after removing simple grammatical endings.
-    tokens = [_role_word_stem(t) for t in re.findall(r"[a-zа-яё0-9]+", raw.casefold())]
-    tokens = [t for t in tokens if len(t) >= 4]
-    if not tokens:
-        return None
-
-    scored = []
-    for name, english, region in candidates:
-        variants = _role_variants(name, english)
-        best = 0.0
-        for token in tokens:
-            for variant in variants:
-                if not variant:
-                    continue
-                ratio = difflib.SequenceMatcher(None, token, variant).ratio()
-                if ratio > best:
-                    best = ratio
-        scored.append((best, name, english, region))
-
-    scored.sort(reverse=True, key=lambda x: x[0])
-    if not scored:
-        return None
-    best = scored[0]
-    second = scored[1][0] if len(scored) > 1 else 0.0
-    # 0.78 catches typos such as "казуха" while requiring a clear winner.
-    if best[0] >= 0.78 and best[0] - second >= 0.045:
-        return _role_for(best[1])
-    return None
+    sql = ("SELECT * FROM group_members WHERE chat_id=? AND lower(username)=?"
+           + (" AND active=1" if active_only else "") + " ORDER BY active DESC LIMIT 1")
+    row = _q(lambda conn: conn.execute(sql, (int(_primary_chat_id), name)).fetchone())
+    return dict(row) if row else None
 
 
-def pending_application(user_id: int, chat_id: int | None = None):
-    def op(conn):
-        if chat_id is None:
-            return conn.execute(
-                "SELECT * FROM jf_applications WHERE user_id=? AND status IN ('awaiting_data','awaiting_document','ready','pending_review') ORDER BY id DESC LIMIT 1",
-                (int(user_id),),
-            ).fetchone()
-        return conn.execute(
-            "SELECT * FROM jf_applications WHERE user_id=? AND chat_id=? AND status IN ('awaiting_data','awaiting_document','ready','pending_review') ORDER BY id DESC LIMIT 1",
-            (int(user_id), int(chat_id)),
-        ).fetchone()
-    return _q(op)
-
-
-def _latest_requested_role_for_chat(chat_id: int):
-    def op(conn):
-        row = conn.execute(
-            "SELECT requested_role,requested_role_key FROM jf_applications WHERE chat_id=? AND status IN ('awaiting_data','awaiting_document','ready','pending_review') AND requested_role!='' ORDER BY id DESC LIMIT 1",
-            (int(chat_id),),
-        ).fetchone()
-        if not row:
-            return None
-        return _role_for(row["requested_role"]) if row["requested_role"] else None
-    return _q(op)
-
-
-def latest_requested_role_for_chat(chat_id: int):
-    return _latest_requested_role_for_chat(chat_id)
-
-
-def _set_application_field(application_id: int, **fields):
-    allowed = {
-        "requested_role", "requested_role_key", "birth_date", "document_file_id",
-        "document_message_id", "status", "reviewed_by", "reviewed_at",
-        "review_reason", "join_request_at", "join_request_chat_id",
-        "join_request_user_chat_id", "approved_invite_link",
-        "approved_invite_expires_at", "updated_at"
-    }
-    fields = {k: v for k, v in fields.items() if k in allowed}
-    if not fields:
-        return
-    fields["updated_at"] = _utc_iso()
-    def op(conn):
-        sets = ", ".join(f"{k}=?" for k in fields)
-        conn.execute(f"UPDATE jf_applications SET {sets} WHERE id=?", (*fields.values(), int(application_id)))
-        conn.commit()
-    _q(op)
-
-
-async def _member_is_active_in_primary(user_id: int) -> bool:
+async def lookup_member(user_id: int) -> Optional[dict]:
+    """Проверяет участника через Telegram и добавляет в базу (для ссылок из списка Ирис)."""
     try:
         member = await _bot.get_chat_member(int(_primary_chat_id), int(user_id))
     except Exception:
-        return False
-    status = getattr(member, "status", None)
-    return status in {"member", "administrator", "creator"} or (status == "restricted" and bool(getattr(member, "is_member", False)))
-
-
-def _join_rules_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Да, ознакомлен", callback_data=FEATURE_PREFIX + "join_rules_yes")],
-        [InlineKeyboardButton(text="❌ Нет", callback_data=FEATURE_PREFIX + "join_rules_no")],
-        [InlineKeyboardButton(text="‹ Назад", callback_data=FEATURE_PREFIX + "join_back")],
-    ])
-
-
-def _join_back_kb() -> InlineKeyboardMarkup:
-    return InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="‹ Назад", callback_data=FEATURE_PREFIX + "join_back")]])
-
-
-def _application_ready(row) -> bool:
-    return bool(row and str(row["requested_role"] or "").strip() and str(row["document_file_id"] or "").strip())
-
-
-def _application_open_for_user(user_id: int):
-    return _q(lambda conn: conn.execute(
-        "SELECT * FROM jf_applications WHERE user_id=? AND status IN ('awaiting_rules','awaiting_data','awaiting_document','ready','pending_review','approved_waiting_join') ORDER BY id DESC LIMIT 1",
-        (int(user_id),),
-    ).fetchone())
-
-
-def _create_application(user_id: int) -> int:
-    def op(conn):
-        cur = conn.execute(
-            "INSERT INTO jf_applications(user_id,chat_id,status,created_at,updated_at) VALUES(?,?,?,?,?)",
-            (int(user_id), int(_primary_chat_id), "awaiting_rules", _utc_iso(), _utc_iso()),
-        )
-        conn.commit()
-        return int(cur.lastrowid)
-    return _q(op)
-
-
-def _join_application_kb(app_id: int):
-    return InlineKeyboardMarkup(inline_keyboard=[
-        [InlineKeyboardButton(text="✅ Принять", callback_data=f"{FEATURE_PREFIX}app_ok:{int(app_id)}"), InlineKeyboardButton(text="❌ Отклонить", callback_data=f"{FEATURE_PREFIX}app_no:{int(app_id)}")],
-        [InlineKeyboardButton(text="🎭 Изменить роль", callback_data=f"{FEATURE_PREFIX}app_role:{int(app_id)}")],
-        [InlineKeyboardButton(text="💬 Написать кандидату", callback_data=f"{FEATURE_PREFIX}app_msg:{int(app_id)}")],
-    ])
-
-
-def _application_summary(app) -> str:
-    username = str(app['username'] or '').strip() if 'username' in app.keys() else ''
-    first_name = str(app['first_name'] or '').strip() if 'first_name' in app.keys() else ''
-    if not username and not first_name:
-        user_row = _q(lambda conn: conn.execute(
-            "SELECT username,first_name FROM users WHERE user_id=? LIMIT 1", (int(app['user_id']),)
-        ).fetchone())
-        if user_row:
-            username = str(user_row['username'] or '').strip()
-            first_name = str(user_row['first_name'] or '').strip()
-    user_line = f"@{username}" if username else (first_name or '—')
-    return (
-        "༺ 𓆩 ✧ 𓆪 ༻\n\n"
-        "🌸 Новая заявка Justice Faite\n\n"
-        f"№ {int(app['id'])}\n"
-        f"Пользователь: {user_line}\n"
-        f"Желаемая роль: {app['requested_role'] or '—'}\n"
-        f"Документ: {'получен' if app['document_file_id'] else 'ожидается'}\n\n"
-        "✦ Документ предназначен только для проверки возраста."
-    )
-
-
-async def begin_join_application(callback: CallbackQuery, state: FSMContext):
-    if callback.message.chat.type != "private":
-        await callback.answer()
-        return
-    if await _member_is_active_in_primary(callback.from_user.id):
-        await callback.answer("Вы уже состоите во флуде.", show_alert=True)
-        return
-
-    app = _application_open_for_user(callback.from_user.id)
-    if not app:
-        app_id = _create_application(callback.from_user.id)
-        app = _q(lambda conn: conn.execute("SELECT * FROM jf_applications WHERE id=?", (app_id,)).fetchone())
-
-    status = str(app["status"] or "")
-    if status == "pending_review":
-        await state.clear()
-        await callback.message.edit_text(
-            _fmt("Заявка уже отправлена") + "\n\n✦ Документ получен владельцем.\n✦ Дождитесь подтверждения.",
-            reply_markup=_back_home_kb(),
-        )
-        await callback.answer()
-        return
-
-    if status == "approved_waiting_join":
-        await state.clear()
-        link = app["approved_invite_link"] or ""
-        if link:
-            await callback.message.edit_text(
-                _fmt("Заявка одобрена") + f"\n\n✦ Ваша персональная ссылка:\n\n{link}\n\n✦ Ссылка предназначена только для вас.",
-                reply_markup=_back_home_kb(),
-            )
-        else:
-            await callback.message.edit_text(_fmt("Заявка одобрена") + "\n\n✦ Ожидайте персональную ссылку.", reply_markup=_back_home_kb())
-        await callback.answer()
-        return
-
-    rules_text = (f"\n\n✦ Информация: {WELCOME_RULES_URL}" if WELCOME_RULES_URL else "")
-    if status == "awaiting_data":
-        await state.set_state(JoinApplicationState.waiting_role)
-        await callback.message.edit_text(
-            _fmt("Желаемая роль") + "\n\n"
-            "✦ Напишите персонажа, которого хотите взять.\n"
-            "✦ Можно обычной фразой — бот распознает роль.\n"
-            "✦ Занятые роли не показываются.",
-            reply_markup=_join_back_kb(),
-        )
-        await callback.answer()
-        return
-
-    if status == "awaiting_document" and app["requested_role"]:
-        await state.set_state(JoinApplicationState.waiting_document)
-        await callback.message.edit_text(
-            _fmt("Подтверждение возраста") + "\n\n"
-            "✦ Отправьте фотографию документа, подтверждающего возраст 16+.\n"
-            "✦ Дата рождения должна быть видна.\n"
-            "✦ Остальные данные можно скрыть.\n\n"
-            "♡ Документ увидит только владелец.",
-            reply_markup=_join_back_kb(),
-        )
-        await callback.answer()
-        return
-
-    await state.set_state(JoinApplicationState.waiting_rules)
-    await callback.message.edit_text(
-        _fmt("Вступление в Justice Faite") + "\n\n"
-        "✦ Перед вступлением ознакомьтесь с информационным каналом и правилами флуда."
-        + rules_text + "\n\n"
-        "Ознакомились с правилами?",
-        reply_markup=_join_rules_kb(),
-    )
-    _set_application_field(int(app["id"]), status="awaiting_rules")
-    await callback.answer()
-
-
-async def join_rules_callback(callback: CallbackQuery, state: FSMContext):
-    if not callback.message or callback.message.chat.type != "private":
-        await callback.answer()
-        return
-    if callback.from_user.id is None:
-        return
-    data = callback.data or ""
-    if data.endswith("join_rules_yes"):
-        app = _application_open_for_user(callback.from_user.id)
-        if not app:
-            app_id = _create_application(callback.from_user.id)
-            app = _q(lambda conn: conn.execute("SELECT * FROM jf_applications WHERE id=?", (app_id,)).fetchone())
-        _set_application_field(int(app["id"]), status="awaiting_data")
-        await state.set_state(JoinApplicationState.waiting_role)
-        await callback.message.edit_text(
-            "༺ 𓆩 ✧ 𓆪 ༻\n\n"
-            "🎭 Желаемая роль\n\n"
-            "✦ Напишите персонажа, которого хотите взять.\n"
-            "✦ Можно написать обычной фразой — бот попробует распознать роль.\n"
-            "✦ Занятые роли не показываются.",
-            reply_markup=_join_back_kb(),
-        )
-    elif data.endswith("join_rules_no"):
-        await state.clear()
-        await callback.message.edit_text(
-            "༺ 𓆩 ✧ 𓆪 ༻\n\n"
-            "🌸 Тогда беги читать правила 😭\n\n"
-            "✦ Без этого дальше не пускаем. Когда ознакомишься — возвращайся.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(text="↩ Назад", callback_data="u:home")]]),
-        )
-    elif data.endswith("join_back"):
-        await state.clear()
-        await callback.message.edit_text(
-            "༺ 𓆩 ✧ 𓆪 ༻\n\n🌸 Justice Faite\n\n✦ Нажмите «Хочу вступить», чтобы подать заявку.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="🚪 Хочу вступить", callback_data="u:join")],
-                [InlineKeyboardButton(text="🤫 Анонимная связь", callback_data="u:send")],
-                [InlineKeyboardButton(text="⚠ Жалоба", callback_data="u:report")],
-                [InlineKeyboardButton(text="✦ Информация", callback_data="u:info")],
-            ]),
-        )
-    await callback.answer()
-
-
-async def _live_role_occupied(role: dict[str, Any]) -> bool:
-    """Check role_state, local roster and live Telegram member tags.
-
-    This closes the stale-database hole where a role is already visible in the
-    chat but role_state/group_members missed it.
-    """
-    role_key = _normalize_role(role["name"])
-    row = _q(lambda conn: conn.execute(
-        "SELECT user_id,status FROM role_state WHERE chat_id=? AND role_key=? LIMIT 1",
-        (int(_primary_chat_id), role_key),
-    ).fetchone())
-    if row and (row["user_id"] is not None or row["status"] == "taken"):
-        return True
-
-    local = _q(lambda conn: conn.execute(
-        "SELECT user_id FROM group_members WHERE chat_id=? AND active=1 AND (role_key=? OR lower(replace(role_name,'ё','е'))=lower(replace(?,'ё','е'))) LIMIT 1",
-        (int(_primary_chat_id), role_key, role["name"]),
-    ).fetchone())
-    if local:
-        with suppress(Exception):
-            _q(lambda conn: (conn.execute(
-                "INSERT INTO role_state(chat_id,role_key,role_name,user_id,status,bot_managed,legacy_marker,legacy_custom_emoji_id) VALUES(?,?,?,?,?,0,'','') "
-                "ON CONFLICT(chat_id,role_key) DO UPDATE SET user_id=excluded.user_id,status='taken',role_name=excluded.role_name",
-                (int(_primary_chat_id), role_key, role["name"], int(local["user_id"]), "taken"),
-            ), conn.commit()))
-        return True
-
-    # Verify current Telegram member tags when local state is stale. This is
-    # intentionally limited to known active members; it avoids needing a full
-    # chat-member listing API that Telegram does not expose to bots.
-    members = _q(lambda conn: conn.execute(
-        "SELECT user_id FROM group_members WHERE chat_id=? AND active=1 LIMIT 500",
-        (int(_primary_chat_id),),
-    ).fetchall())
-    for item in members:
-        uid = int(item["user_id"])
-        try:
-            cm = await _bot.get_chat_member(int(_primary_chat_id), uid)
-        except Exception:
-            continue
-        status = getattr(cm, "status", None)
-        if status not in {"member", "administrator", "creator"} and not (status == "restricted" and bool(getattr(cm, "is_member", False))):
-            continue
-        tag = (getattr(cm, "tag", None) or getattr(cm, "custom_title", None) or "").strip()
-        if tag and _role_for_tag and _role_for_tag(tag):
-            live_role = _role_for_tag(tag)
-            if live_role and _normalize_role(live_role["name"]) == role_key:
-                with suppress(Exception):
-                    await _q(lambda conn: (conn.execute(
-                        "UPDATE group_members SET role_key=?,role_name=?,tag=? WHERE chat_id=? AND user_id=?",
-                        (role_key, role["name"], tag, int(_primary_chat_id), uid),
-                    ), conn.commit()))
-                return True
-    return False
-
-
-async def _requested_role_reserved_elsewhere(role_key: str, application_id: int) -> bool:
-    row = _q(lambda conn: conn.execute(
-        "SELECT 1 FROM jf_applications WHERE chat_id=? AND requested_role_key=? AND id!=? AND status IN ('awaiting_document','pending_review','approved_waiting_join') LIMIT 1",
-        (int(_primary_chat_id), role_key, int(application_id)),
-    ).fetchone())
-    return bool(row)
-
-
-async def _process_requested_role(message: Message, state: FSMContext):
-    app = _application_open_for_user(message.from_user.id)
-    if not app or app["status"] != "awaiting_data":
-        return False
-    role = find_requested_role(message.text or "")
-    if not role:
-        await message.reply(_fmt("Роль не распознана") + "\n\n✦ Напишите имя персонажа ещё раз. Можно обычной фразой, например: «хочу Кадзуху».")
-        return True
-    role_key = _normalize_role(role["name"])
-    if await _live_role_occupied(role) or await _requested_role_reserved_elsewhere(role_key, int(app["id"])):
-        await message.reply(_fmt("Роль недоступна") + "\n\n✦ Выбранная роль сейчас недоступна. Укажите другую желаемую роль.")
-        return True
-    _set_application_field(int(app["id"]), requested_role=role["name"], requested_role_key=role_key, status="awaiting_document")
-    await state.set_state(JoinApplicationState.waiting_document)
-    await message.reply(
-        _fmt("Подтверждение возраста") + "\n\n"
-        f"✦ Желаемая роль: {role['name']}\n\n"
-        "✦ Теперь отправьте фотографию документа, подтверждающего, что вам есть 16.\n"
-        "✦ Дата рождения должна быть видна.\n"
-        "✦ Остальные данные можно скрыть.\n\n"
-        "♡ Документ увидит только владелец Justice Faite."
-    )
-    return True
-
-
-async def join_application_text_router(message: Message, state: FSMContext):
-    if message.chat.type != "private" or not message.from_user or not (message.text or "").strip():
-        return
-    app = _application_open_for_user(message.from_user.id)
-    if not app:
-        return
-    status = str(app["status"] or "")
-    if status == "awaiting_data":
-        await _process_requested_role(message, state)
-    elif status == "awaiting_document":
-        await state.set_state(JoinApplicationState.waiting_document)
-        await message.reply(_fmt("Нужна фотография") + "\n\n✦ Отправьте фото документа с видимой датой рождения.")
-    elif status == "pending_review":
-        await message.reply(_fmt("Заявка на проверке") + "\n\n✦ Документ уже передан владельцу. Дождитесь решения администрации.")
-    elif status == "approved_waiting_join":
-        link = app["approved_invite_link"] or ""
-        if link:
-            await message.reply(_fmt("Заявка одобрена") + f"\n\n✦ Ваша персональная ссылка:\n\n{link}")
-
-
-async def join_role_text(message: Message, state: FSMContext):
-    if message.chat.type != "private":
-        return
-    app = _application_open_for_user(message.from_user.id)
-    if not app or app["status"] != "awaiting_data":
-        return
-    role = find_requested_role(message.text or "")
-    if not role:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Не удалось определить персонажа. Напишите название роли ещё раз.")
-        return
-    role_key = _normalize_role(role["name"])
-    occupied = await _live_role_occupied(role)
-    if occupied or await _requested_role_reserved_elsewhere(role_key, int(app["id"])):
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Эта роль сейчас недоступна. Выберите другую желаемую роль.")
-        return
-    _set_application_field(int(app["id"]), requested_role=role["name"], requested_role_key=role_key, status="awaiting_document")
-    await state.set_state(JoinApplicationState.waiting_document)
-    await message.reply(
-        "༺ 𓆩 ✧ 𓆪 ༻\n\n"
-        "📄 Подтверждение возраста\n\n"
-        "✦ Отправьте фотографию документа, подтверждающего, что вам есть 16.\n"
-        "✦ Дата рождения должна быть видна.\n"
-        "✦ Остальные данные можно скрыть.\n\n"
-        "Документ увидит только владелец Justice Faite."
-    )
-
-
-async def join_application_photo_router(message: Message, state: FSMContext):
-    if message.chat.type != "private" or not message.from_user or not message.photo:
-        return
-    app = _application_open_for_user(message.from_user.id)
-    if not app or str(app["status"] or "") != "awaiting_document":
-        return
-    await join_document_photo(message, state)
-
-
-async def join_document_photo(message: Message, state: FSMContext):
-    if message.chat.type != "private":
-        return
-    app = _application_open_for_user(message.from_user.id)
-    if not app or app["status"] not in {"awaiting_data", "awaiting_document"}:
-        return
-    if not app["requested_role"]:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\nСначала укажите желаемую роль.")
-        return
-    try:
-        user_label = f"@{message.from_user.username}" if message.from_user.username else (message.from_user.first_name or "участник")
-        caption = (
-            "༺ 𓆩 ✧ 𓆪 ༻\n\n📄 Проверка возраста — Justice Faite\n\n"
-            f"Заявка №{int(app['id'])}\n"
-            f"Пользователь: {user_label}\n"
-            f"Желаемая роль: {app['requested_role'] or '—'}\n\n"
-            "✦ Фото документа предназначено только для владельца."
-        )
-        sent = await _bot.send_photo(_admin_id, message.photo[-1].file_id, caption=caption, reply_markup=_join_application_kb(int(app["id"])))
-    except Exception:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Не удалось передать документ владельцу. Отправьте фотографию ещё раз.")
-        return
-    _set_application_field(int(app["id"]), document_file_id=message.photo[-1].file_id, document_message_id=sent.message_id, status="pending_review")
-    await state.clear()
-    await message.reply(
-        "༺ 𓆩 ✧ 𓆪 ༻\n\n✅ Документ передан владельцу.\n\n"
-        "✦ Дождитесь подтверждения. После одобрения бот пришлёт персональную ссылку на вступление во флуд."
-    )
-
-
-async def join_document_nonphoto(message: Message, state: FSMContext):
-    if message.chat.type != "private":
-        return
-    app = _application_open_for_user(message.from_user.id)
-    if app and app["status"] in {"awaiting_data", "awaiting_document"} and app["requested_role"]:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n📄 Нужна именно фотография документа. Отправьте изображение с видимой датой рождения.")
-
-
-async def join_role_fallback(message: Message, state: FSMContext):
-    """Recover an interrupted application after a Render restart."""
-    if message.chat.type != "private" or not message.from_user or not (message.text or "").strip():
-        return
-    app = _application_open_for_user(message.from_user.id)
-    if not app or app["status"] not in {"awaiting_data", "awaiting_document"} or app["document_file_id"]:
-        return
-    # If a role was already saved, the only missing item is the document.
-    if app["requested_role"]:
-        return
-    role = find_requested_role(message.text or "")
-    if not role:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Не удалось определить персонажа. Попробуйте написать имя ещё раз.")
-        return
-    role_key = _normalize_role(role["name"])
-    occupied = await _live_role_occupied(role)
-    if occupied or await _requested_role_reserved_elsewhere(role_key, int(app["id"])):
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Эта роль сейчас недоступна. Укажите другую желаемую роль.")
-        return
-    _set_application_field(int(app["id"]), requested_role=role["name"], requested_role_key=role_key, status="awaiting_document")
-    await state.set_state(JoinApplicationState.waiting_document)
-    await message.reply(
-        "༺ 𓆩 ✧ 𓆪 ༻\n\n🎭 Роль сохранена\n\n"
-        f"✦ Желаемая роль: {role['name']}\n\n"
-        "📄 Теперь отправьте фотографию документа, подтверждающего возраст 16+.\n"
-        "✦ Дата рождения должна быть видна.\n"
-        "✦ Остальные данные можно скрыть."
-    )
-
-
-async def join_document_photo_fallback(message: Message, state: FSMContext):
-    """Recover the document step after an FSM restart."""
-    if message.chat.type != "private" or not message.from_user or not message.photo:
-        return
-    app = _application_open_for_user(message.from_user.id)
-    if not app or app["status"] not in {"awaiting_data", "awaiting_document"} or not app["requested_role"] or app["document_file_id"]:
-        return
-    await join_document_photo(message, state)
-
-
-async def applications_list(message: Message):
-    if not _admin_only(message) or message.chat.type != "private":
-        return
-    rows = _q(lambda conn: conn.execute("SELECT * FROM jf_applications WHERE status IN ('awaiting_data','ready','pending_review','approved_waiting_join','approved') ORDER BY id DESC LIMIT 25").fetchall())
-    if not rows:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n📭 Активных заявок нет.")
-        return
-    lines=["༺ 𓆩 ✧ 𓆪 ༻","","📋 Заявки Justice Faite",""]
-    for row in rows:
-        lines.append(f"#{row['id']} · {row['status']} · {row['requested_role'] or '—'} · {'📄' if row['document_file_id'] else '—'}")
-    await message.reply("\n".join(lines))
-
-
-async def admin_application_message_text(message: Message, state: FSMContext):
-    if message.chat.type != "private" or not _admin_only(message):
-        return
-    app_id = int(_PENDING_ADMIN_MESSAGE.get(int(message.from_user.id), 0))
-    if not app_id:
-        data = await state.get_data()
-        app_id = int(data.get("application_id") or 0)
-    if not app_id:
-        await state.clear()
-        return
-    app = _q(lambda conn: conn.execute("SELECT * FROM jf_applications WHERE id=?", (app_id,)).fetchone())
-    if not app:
-        await state.clear()
-        await message.reply(_fmt("Заявка не найдена"))
-        return
-    text = (message.text or "").strip()
-    if not text:
-        await message.reply(_fmt("Пустое сообщение") + "\n\n✦ Напишите текст для кандидата.")
-        return
-    with suppress(Exception):
-        await _bot.send_message(int(app["user_id"]), _fmt("Сообщение администрации") + f"\n\n✦ {text}")
-    _PENDING_ADMIN_MESSAGE.pop(int(message.from_user.id), None)
-    await state.clear()
-    await message.reply(_fmt("Сообщение отправлено") + "\n\n✦ Кандидат получит его в личных сообщениях.")
-
-
-async def application_callback(callback: CallbackQuery):
-    if callback.from_user.id != int(_admin_id):
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-    try:
-        action, raw_id = (callback.data or "").split(":")[-2:]
-        app_id = int(raw_id)
-    except (ValueError, IndexError):
-        await callback.answer("Некорректная заявка.", show_alert=True)
-        return
-    app = _q(lambda conn: conn.execute("SELECT * FROM jf_applications WHERE id=?", (app_id,)).fetchone())
-    if not app:
-        await callback.answer("Заявка не найдена.", show_alert=True)
-        return
-    if action == "app_role":
-        if app["status"] in {"declined", "joined"}:
-            await callback.answer("Заявка уже завершена.", show_alert=True)
-            return
-        _set_application_field(app_id, status="awaiting_data", requested_role="", requested_role_key="", review_reason="")
-        with suppress(Exception):
-            await _bot.send_message(int(app["user_id"]), _fmt("Выбор роли") + "\n\n✦ Администрация попросила выбрать другую роль.\n✦ Напишите желаемого персонажа ещё раз.")
-        with suppress(Exception):
-            await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.answer("Кандидату отправлен запрос на выбор другой роли.")
-        return
-    if action == "app_msg":
-        if app["status"] in {"declined", "joined"}:
-            await callback.answer("Для этой заявки сообщение уже не требуется.", show_alert=True)
-            return
-        # Store state without relying on callback-local data after a restart.
-        try:
-            from aiogram.fsm.context import FSMContext as _FSMContext
-        except Exception:
-            _FSMContext = None
-        # This callback is always handled in the owner's private chat.
-        # The handler receives FSMContext only if registered as a callback with it,
-        # so we use a compact transient marker in-memory through the dispatcher.
-        await callback.answer("Напишите сообщение следующим сообщением.")
-        # Best-effort: attach application id to the callback message via a command prompt.
-        await callback.message.reply("💬 Введите текст для кандидата следующим сообщением.")
-        _PENDING_ADMIN_MESSAGE[int(callback.from_user.id)] = app_id
-        return
-    if action == "app_no":
-        if app["status"] in {"declined", "joined"}:
-            await callback.answer("Заявка уже обработана.", show_alert=True)
-            return
-        _set_application_field(app_id, status="declined", reviewed_by=int(_admin_id), reviewed_at=_utc_iso(), review_reason="Отклонено администрацией")
-        with suppress(Exception):
-            await _bot.send_message(int(app["user_id"]), "༺ 𓆩 ✧ 𓆪 ༻\n\n❌ Заявка на вступление отклонена администрацией.")
-        with suppress(Exception):
-            await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.answer("Заявка отклонена.")
-        return
-    if action == "app_ok":
-        if app["status"] == "approved_waiting_join":
-            await callback.answer("Для этой заявки ссылка уже создана и ожидает входа.", show_alert=True)
-            return
-        if app["status"] == "approved" or app["status"] == "joined":
-            await callback.answer("Заявка уже обработана.", show_alert=True)
-            return
-        if not _application_ready(app):
-            await callback.answer("Нужны роль и документ.", show_alert=True)
-            return
-        role = _role_for(app["requested_role"])
-        if not role or await _live_role_occupied(role):
-            await callback.answer("Эта роль уже недоступна. Заявка сохранена, но сначала выберите другую роль.", show_alert=True)
-            with suppress(Exception):
-                await _bot.send_message(int(app["user_id"]), _fmt("Роль недоступна") + "\n\n✦ Выбранная ранее роль больше не свободна. Обратитесь к администрации.")
-            return
-        if await _member_is_active_in_primary(int(app["user_id"])):
-            _set_application_field(app_id, status="joined", reviewed_by=int(_admin_id), reviewed_at=_utc_iso(), review_reason="Участник уже находится во флуде")
-            await callback.answer("Участник уже находится во флуде.", show_alert=True)
-            return
-        try:
-            expire = datetime.now(timezone.utc) + timedelta(hours=INVITE_TTL_HOURS)
-            link = await _bot.create_chat_invite_link(
-                int(_primary_chat_id),
-                name=f"Justice Faite #{app_id}",
-                creates_join_request=True,
-                expire_date=expire,
-            )
-        except Exception:
-            await callback.answer("Не удалось создать персональную ссылку. Проверьте права бота в чате.", show_alert=True)
-            return
-        _set_application_field(app_id, status="approved_waiting_join", reviewed_by=int(_admin_id), reviewed_at=_utc_iso(), approved_invite_link=link.invite_link, approved_invite_expires_at=expire.isoformat())
-        _q(lambda conn: (conn.execute(
-            "INSERT OR REPLACE INTO jf_invites(invite_link,chat_id,created_by,created_at,expires_at,status) VALUES(?,?,?,?,?,?)",
-            (link.invite_link, int(_primary_chat_id), int(_admin_id), _utc_iso(), expire.isoformat(), "active"),
-        ), conn.commit()))
-        try:
-            await _bot.send_message(
-                int(app["user_id"]),
-                "༺ 𓆩 ✧ 𓆪 ༻\n\n✅ Заявка одобрена\n\n"
-                "✦ Ваша персональная ссылка на Justice Faite:\n\n"
-                f"{link.invite_link}\n\n"
-                "✦ Ссылка персональная: бот пропустит по ней только вас. Она ограничена по времени."
-            )
-        except Exception:
-            # Keep the application approved; the admin can inspect the generated link in the application list.
-            pass
-        with suppress(Exception):
-            await callback.message.edit_reply_markup(reply_markup=None)
-        await callback.answer("Заявка одобрена, ссылка создана.")
-        return
-
-
-async def join_request_admin_callback(callback: CallbackQuery):
-    """Final admission decision for a valid Telegram join request."""
-    if not callback.message or callback.message.chat.type != "private" or callback.from_user.id != int(_admin_id):
-        await callback.answer("Нет доступа.", show_alert=True)
-        return
-    try:
-        action, raw_id = (callback.data or "").split(":")[-2:]
-        app_id = int(raw_id)
-    except (ValueError, IndexError):
-        await callback.answer("Некорректная заявка.", show_alert=True)
-        return
-    app = _q(lambda conn: conn.execute("SELECT * FROM jf_applications WHERE id=?", (app_id,)).fetchone())
-    if not app:
-        await callback.answer("Заявка не найдена.", show_alert=True)
-        return
-    if str(app["status"]) != "approved_waiting_join":
-        await callback.answer("Эта заявка уже не ожидает вступления.", show_alert=True)
-        return
-    user_id = int(app["user_id"])
-    if not app["join_request_chat_id"] or int(app["join_request_chat_id"]) != int(_primary_chat_id):
-        await callback.answer("Актуальной заявки Telegram ещё нет.", show_alert=True)
-        return
-    try:
-        if action == "join_approve":
-            await _bot.approve_chat_join_request(int(_primary_chat_id), user_id)
-            _set_application_field(app_id, status="approved", updated_at=_utc_iso())
-            with suppress(Exception):
-                if app["approved_invite_link"]:
-                    await _bot.revoke_chat_invite_link(int(_primary_chat_id), app["approved_invite_link"])
-            with suppress(Exception):
-                _q(lambda conn: (conn.execute("UPDATE jf_invites SET status='used',used_by=?,used_at=? WHERE invite_link=?", (user_id,_utc_iso(),app["approved_invite_link"])), conn.commit()))
-            await callback.answer("Вступление одобрено.")
-            with suppress(Exception):
-                await callback.message.edit_reply_markup(reply_markup=None)
-            with suppress(Exception):
-                await _bot.send_message(user_id, _fmt("Добро пожаловать") + "\n\n✦ Администрация одобрила вступление во флуд.\n✦ Роль после входа назначается вручную через Call ID.")
-            return
-        if action == "join_decline":
-            await _bot.decline_chat_join_request(int(_primary_chat_id), user_id)
-            _set_application_field(app_id, status="declined", updated_at=_utc_iso(), review_reason="Вступление отклонено администрацией")
-            with suppress(Exception):
-                await _bot.send_message(user_id, _fmt("Вступление отклонено") + "\n\n✦ Администрация не одобрила вход во флуд.")
-            await callback.answer("Вступление отклонено.")
-            with suppress(Exception):
-                await callback.message.edit_reply_markup(reply_markup=None)
-            return
-        await callback.answer("Неизвестное действие.", show_alert=True)
-    except Exception:
-        import logging
-        logging.getLogger("justice_features").exception("Join request decision failed | app=%s", app_id)
-        await callback.answer("Не удалось обработать заявку. Попробуйте ещё раз.", show_alert=True)
-
-
-async def handle_join_request(event: ChatJoinRequest):
-    """Register a Telegram join request but never approve it automatically.
-
-    Approval is always an explicit administrator action. The application
-    workflow may create a single-user-equivalent join-request invite, but the
-    final admission decision remains with the owner/administrator.
-    """
-    if int(event.chat.id) != int(_primary_chat_id):
-        return
-    user = event.from_user
-    invite_text = getattr(event.invite_link, "invite_link", "") if getattr(event, "invite_link", None) else ""
-    app = _q(lambda conn: conn.execute(
-        "SELECT * FROM jf_applications WHERE user_id=? AND chat_id=? AND status='approved_waiting_join' ORDER BY id DESC LIMIT 1",
-        (int(user.id), int(event.chat.id)),
-    ).fetchone())
-    if not app or not invite_text or invite_text != (app["approved_invite_link"] or ""):
-        # Unknown/expired/unrelated requests are safe to reject. This is not
-        # the admission path; valid requests always wait for admin approval.
-        with suppress(Exception):
-            await _bot.decline_chat_join_request(int(event.chat.id), int(user.id))
-        return
-
-    _set_application_field(
-        int(app["id"]),
-        join_request_chat_id=int(event.chat.id),
-        join_request_user_chat_id=int(getattr(event, "user_chat_id", user.id) or user.id),
-        join_request_at=_utc_iso(),
-    )
-    with suppress(Exception):
-        await _bot.send_message(
-            int(_admin_id),
-            _fmt("Заявка на вступление") + "\n\n"
-            f"№ {int(app['id'])}\n"
-            f"👤 {_display_username(user)}\n"
-            f"🎭 Желаемая роль: {app['requested_role'] or '—'}\n\n"
-            "✦ Кандидат отправил запрос на вступление.\n"
-            "✦ Автоматически он не будет принят. Решение остаётся за администрацией.",
-            reply_markup=InlineKeyboardMarkup(inline_keyboard=[
-                [
-                    InlineKeyboardButton(text="✅ Принять во флуд", callback_data=f"{FEATURE_PREFIX}join_approve:{int(app['id'])}"),
-                    InlineKeyboardButton(text="❌ Отклонить", callback_data=f"{FEATURE_PREFIX}join_decline:{int(app['id'])}"),
-                ]
-            ]),
-        )
-
-
-async def auto_bind_requested_role(chat_id: int, user):
-    """Compatibility stub: role binding is intentionally manual via Call ID."""
-    return False
-
-
-def warning_eligible_at(level: int, issued_at: str) -> Optional[str]:
-    try:
-        dt = datetime.fromisoformat(issued_at)
-        days = 14 if level == 1 else 30 if level == 2 else None
-        return (dt + timedelta(days=days)).isoformat() if days else None
-    except Exception:
         return None
+    status = getattr(member, "status", None)
+    active = status in {"member", "administrator", "creator"} or (
+        status == "restricted" and bool(getattr(member, "is_member", False)))
+    user = getattr(member, "user", None)
+    if not active or user is None or getattr(user, "is_bot", False):
+        return None
+    with suppress(Exception):
+        _upsert_group_member(int(_primary_chat_id), user, active=True)
+    return member_by_id(int(user_id))
 
 
-def active_warning_count(chat_id: int, user_id: int) -> int:
-    row = _q(lambda conn: conn.execute(
-        "SELECT COUNT(*) AS c FROM jf_warnings WHERE chat_id=? AND user_id=? AND removed_at IS NULL",
-        (int(chat_id), int(user_id)),
-    ).fetchone())
-    return int(row["c"])
+async def resolve_target(message: Message, args: str, *, active_only: bool = True) -> tuple[Optional[dict], str]:
+    """Цель команды: ответ на сообщение → @username → числовой ID. Возвращает (участник, остаток текста)."""
+    args = (args or "").strip()
+    reply = getattr(message, "reply_to_message", None)
+    if reply is not None and getattr(reply, "from_user", None) and not reply.from_user.is_bot:
+        user = reply.from_user
+        row = member_by_id(int(user.id))
+        if row is None and message.chat.type in GROUP_TYPES:
+            with suppress(Exception):
+                _upsert_group_member(int(message.chat.id), user, active=True)
+            row = member_by_id(int(user.id))
+        return row, args
+    if not args:
+        return None, ""
+    first, _, rest = args.partition(" ")
+    if first.startswith("@") or ui.clean_username(first):
+        row = member_by_username(first, active_only=active_only)
+        if row:
+            return row, rest.strip()
+    if first.lstrip("-").isdigit():
+        row = member_by_id(int(first), active_only=active_only)
+        if row:
+            return row, rest.strip()
+    return None, args
 
 
-def issue_warning(chat_id: int, user_id: int, reason: str, issued_by: int):
-    now = _utc_iso()
+def _command_args(message: Message) -> str:
+    text = (message.text or "").strip()
+    m = re.match(r"^/\w+(?:@\w+)?\s*(.*)$", text, re.DOTALL)
+    return m.group(1).strip() if m else ""
+
+
+def _mention_html(row: dict) -> str:
+    username = (row.get("username") or "").strip()
+    if username:
+        return "@" + html.escape(username, quote=False)
+    name = html.escape((row.get("first_name") or "участник").strip() or "участник", quote=False)
+    return f'<a href="tg://user?id={int(row["user_id"])}">{name}</a>'
+
+
+def _render_html(template: str, **named: str) -> str:
+    """Экранирует шаблон владельца и подставляет уже безопасный HTML в {name}."""
+    text = html.escape(template or "", quote=False)
+    for key, value in named.items():
+        text = text.replace("{" + key + "}", value)
+    return text
+
+
+async def _is_active_member(user_id: int) -> bool:
+    return (await cmdcfg.level_of(int(user_id))) != "all"
+
+
+def _is_owner(message: Message) -> bool:
+    return bool(message.from_user and int(message.from_user.id) == int(_admin_id))
+
+
+async def _reply(message: Message, key: str, text: str, **kwargs):
+    return await cmdcfg.respond(message, key, text, **kwargs)
+
+
+# --------------------------------------------------------------------------
+# Награды (локальная запись; команды Ирис — в awards.py)
+# --------------------------------------------------------------------------
+
+def issue_local_award(chat_id: int, user_id: int, code: str, title: str, description: str,
+                      issued_by: Optional[int], source: str) -> bool:
     def op(conn):
-        level = int(conn.execute(
-            "SELECT COALESCE(MAX(level),0)+1 AS n FROM jf_warnings WHERE chat_id=? AND user_id=?",
-            (int(chat_id), int(user_id)),
-        ).fetchone()["n"])
-        eligible = warning_eligible_at(level, now)
         cur = conn.execute(
-            "INSERT INTO jf_warnings(chat_id,user_id,level,reason,issued_by,issued_at,eligible_at) VALUES(?,?,?,?,?,?,?)",
-            (int(chat_id), int(user_id), level, reason[:2000], int(issued_by), now, eligible),
-        )
-        # A new violation restarts the waiting period for all active warnings.
-        for old in conn.execute("SELECT id,level FROM jf_warnings WHERE chat_id=? AND user_id=? AND removed_at IS NULL", (int(chat_id), int(user_id))).fetchall():
-            conn.execute("UPDATE jf_warnings SET eligible_at=? WHERE id=?", (warning_eligible_at(int(old["level"]), now), int(old["id"])))
-        conn.commit()
-        return cur.lastrowid, level, eligible
-    return _q(op)
-
-
-def award_exists(chat_id: int, user_id: int, code: str) -> bool:
-    return bool(_q(lambda conn: conn.execute(
-        "SELECT 1 FROM jf_achievements WHERE chat_id=? AND user_id=? AND code=? LIMIT 1",
-        (int(chat_id), int(user_id), code),
-    ).fetchone()))
-
-
-def issue_local_award(chat_id: int, user_id: int, code: str, title: str, description: str, issued_by: int | None, source: str):
-    def op(conn):
-        cur = conn.execute(
-            "INSERT OR IGNORE INTO jf_achievements(chat_id,user_id,code,title,description,issued_at,issued_by,source) VALUES(?,?,?,?,?,?,?,?)",
-            (int(chat_id), int(user_id), code, title, description[:1000], _utc_iso(), issued_by, source),
-        )
+            "INSERT OR IGNORE INTO jf_achievements(chat_id,user_id,code,title,description,issued_at,issued_by,source) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (int(chat_id), int(user_id), code, title, (description or "")[:1000], _utc_iso(), issued_by, source))
         conn.commit()
         return cur.rowcount > 0
     return bool(_q(op))
 
 
+# --------------------------------------------------------------------------
+# Предупреждения
+# --------------------------------------------------------------------------
 
-
-def iris_already_sent(chat_id: int, user_id: int, kind: str) -> bool:
-    row = _q(lambda conn: conn.execute(
-        "SELECT 1 FROM jf_award_audit WHERE chat_id=? AND user_id=? AND kind=? AND status IN ('sent','manual','prepared') LIMIT 1",
-        (int(chat_id), int(user_id), kind),
-    ).fetchone())
-    return bool(row)
-
-def record_iris_audit(chat_id: int, user_id: int, kind: str, status: str, reason: str, external_ref: str = "") -> None:
-    _q(lambda conn: (conn.execute(
-        "INSERT INTO jf_award_audit(chat_id,user_id,kind,status,reason,created_at,external_ref) VALUES(?,?,?,?,?,?,?)",
-        (int(chat_id), int(user_id), kind, status, reason[:1000], _utc_iso(), external_ref[:200]),
-    ), conn.commit()))
-
-def _duration_to_days(value: str) -> int:
-    """Parse Iris-style duration text into whole days.
-
-    Examples: ``1 месяц 12 дн``, ``27 дней 8 ч``, ``12 ч``, ``37 мин``.
-    Month is treated as 30 days for the thresholding purpose because the
-    configured milestones are expressed as 30/60/120 days.
-    """
-    raw = (value or "").casefold().replace("ё", "е")
-    total = 0.0
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*(?:год|года|лет)", raw)
-    if m:
-        total += float(m.group(1).replace(',', '.')) * 365
-    m = re.search(r"(\d+(?:[.,]\d+)?)\s*месяц(?:а|ев)?", raw)
-    if m:
-        total += float(m.group(1).replace(',', '.')) * 30
-    m = re.search(r"(\d+)\s*д(?:ень|ня|ней|н)?\b", raw)
-    if m:
-        total += int(m.group(1))
-    m = re.search(r"(\d+)\s*ч(?:\.|ас(?:а|ов)?)?\b", raw)
-    if m:
-        total += int(m.group(1)) / 24
-    m = re.search(r"(\d+)\s*мин(?:ут(?:а|ы|)?)?\b", raw)
-    if m:
-        total += int(m.group(1)) / 1440
-    return int(total)
-
-
-def _best_award_threshold(days: int):
-    eligible = [x for x in IRIS_OLD_THRESHOLDS if days >= x[0]]
-    return max(eligible, key=lambda x: x[0]) if eligible else None
-
-
-def compute_old_and_active_candidates(chat_id: int):
-    rows = _q(lambda conn: conn.execute(
-        "SELECT gm.user_id,gm.first_name,gm.last_name,gm.username,gm.joined_at,u.messages_count,u.last_seen FROM group_members gm LEFT JOIN users u ON u.user_id=gm.user_id WHERE gm.chat_id=? AND gm.active=1 AND gm.user_id!=? ORDER BY gm.joined_at ASC",
-        (int(chat_id), int(_admin_id)),
-    ).fetchall())
-    # Local fallback only; /jf_awards itself uses Iris' ``олды`` response as its
-    # authoritative source when Iris integration is available.
-    now_dt = datetime.now(timezone.utc)
-    old = []
-    active = sorted(rows, key=lambda r: int(r["messages_count"] or 0), reverse=True)[:10]
-    for row in rows:
-        try:
-            joined = datetime.fromisoformat(row["joined_at"])
-            if joined.tzinfo is None:
-                joined = joined.replace(tzinfo=timezone.utc)
-            days = (now_dt - joined).days
-        except Exception:
-            days = 0
-        if days >= 30:
-            old.append(row)
-    return old, active
-
-
-def _display_key(value: str) -> str:
-    """Normalize a display name while retaining Unicode and stylized letters.
-
-    Iris lists often contain mathematical/stylized Unicode alphabets. NFKC
-    converts compatible glyphs where possible; keeping all Unicode letters and
-    numbers prevents Cyrillic/Latin stylized names from collapsing to empty keys.
-    """
-    normalized = unicodedata.normalize("NFKC", (value or "")).casefold().replace("ё", "е")
-    return "".join(ch for ch in normalized if unicodedata.category(ch)[:1] in {"L", "N"})
-
-
-def _utf16_prefix(text: str) -> list[int]:
-    values = [0]
-    total = 0
-    for ch in text:
-        total += len(ch.encode("utf-16-le")) // 2
-        values.append(total)
-    return values
-
-
-def _utf16_slice(text: str, start: int, length: int) -> str:
-    raw = text.encode("utf-16-le")
-    return raw[start * 2:(start + length) * 2].decode("utf-16-le", errors="ignore")
-
-
-def _line_entity_identity(message: Message, line_start_py: int, line_end_py: int):
-    """Return concrete Telegram user identities referenced by clickable entities in a line."""
-    text = message.text or message.caption or ""
-    prefix = _utf16_prefix(text)
-    start_u16 = prefix[line_start_py]
-    end_u16 = prefix[line_end_py]
-    identities: list[tuple[str, Any]] = []
-    entities = message.entities or message.caption_entities or []
-    for entity in entities:
-        ent_start = int(entity.offset)
-        ent_end = ent_start + int(entity.length)
-        if ent_start < start_u16 or ent_start >= end_u16:
-            continue
-        etype = str(getattr(entity, "type", ""))
-        if etype == "text_mention" and getattr(entity, "user", None):
-            identities.append(("id", entity.user))
-        elif etype == "text_link":
-            url = str(getattr(entity, "url", "") or "")
-            id_match = re.search(r"tg://user\?id=(\d+)", url)
-            if id_match:
-                identities.append(("id", int(id_match.group(1))))
-            else:
-                username_match = re.search(r"(?:https?://)?(?:www\.)?t\.me/([A-Za-z0-9_]{3,32})(?:[/?#]|$)", url, re.I)
-                if username_match:
-                    identities.append(("username", username_match.group(1).casefold()))
-        elif etype == "mention":
-            mention_text = _utf16_slice(text, ent_start, int(entity.length)).lstrip("@")
-            identities.append(("username", mention_text.casefold()))
-    return identities
-
-
-def _match_member_by_identity(identity, active_rows: list[Any]):
-    kind, value = identity
-    if kind == "id":
-        uid = int(value.id) if hasattr(value, "id") else int(value)
-        for row in active_rows:
-            if int(row["user_id"]) == uid:
-                if hasattr(value, "username") and value.username and not row.get("username"):
-                    row["username"] = value.username
-                return row
+def warning_eligible_at(level: int, issued_at: str) -> Optional[str]:
+    days = {1: cmdcfg.get_int("warn", "l1_days"), 2: cmdcfg.get_int("warn", "l2_days")}.get(level)
+    dt = ui.parse_iso(issued_at)
+    if not dt or not days:
         return None
-    username = str(value).casefold().lstrip("@")
-    hits = [r for r in active_rows if (r["username"] or "").casefold() == username]
-    return hits[0] if len(hits) == 1 else None
+    return (dt + timedelta(days=days)).isoformat()
 
 
-async def _resolve_member_by_identity(identity, active_rows: list[Any]):
-    hit = _match_member_by_identity(identity, active_rows)
-    if hit:
-        return hit
-    kind, value = identity
-    if kind != "id":
-        return None
-    uid = int(value.id) if hasattr(value, "id") else int(value)
-    try:
-        member = await _bot.get_chat_member(int(_primary_chat_id), uid)
-    except Exception:
-        return None
-    status = getattr(member, "status", None)
-    active = status in {"member", "administrator", "creator"} or (status == "restricted" and bool(getattr(member, "is_member", False)))
-    if not active or not getattr(member, "user", None) or getattr(member.user, "is_bot", False):
-        return None
-    user = member.user
-    with suppress(Exception):
-        _upsert_group_member(int(_primary_chat_id), user, active=True)
-    row = _get_member(int(_primary_chat_id), uid)
-    if row:
-        # sqlite3.Row is indexable but has no .get(); normalize it before the
-        # reward packager accesses username/first_name fields.
-        return dict(row)
-    return {
-        "user_id": uid,
-        "first_name": getattr(user, "first_name", "") or "",
-        "last_name": getattr(user, "last_name", "") or "",
-        "username": getattr(user, "username", "") or "",
-    }
+def active_warnings(chat_id: int, user_id: int) -> list:
+    return _q(lambda conn: conn.execute(
+        "SELECT * FROM jf_warnings WHERE chat_id=? AND user_id=? AND removed_at IS NULL ORDER BY id",
+        (int(chat_id), int(user_id))).fetchall())
 
 
-async def _match_iris_old_line(line: str, active_rows: list[Any], message: Message | None = None, line_start_py: int = 0, line_end_py: int = 0):
-    """Resolve an Iris old-list line only with strong, deterministic identity evidence.
+def issue_warning(chat_id: int, user_id: int, reason: str, issued_by: int):
+    """Новый уровень = число активных предупреждений + 1. Срок ожидания всех активных обновляется."""
+    now = _utc_iso()
 
-    Never use fuzzy similarity here: a false positive can award the wrong member.
-    Preferred order: Telegram user entity/id, exact @username, exact normalized
-    display name extracted from the list row. Ambiguous or unknown rows are skipped.
-    """
-    if message is not None:
-        for identity in _line_entity_identity(message, line_start_py, line_end_py):
-            hit = await _resolve_member_by_identity(identity, active_rows)
-            if hit:
-                return hit
-
-    # Exact username match, if Iris included one in the line.
-    username_hit = re.search(r"(?<![A-Za-z0-9_])@([A-Za-z0-9_]{3,32})", line)
-    if username_hit:
-        uname = username_hit.group(1).casefold()
-        hits = [r for r in active_rows if str(r["username"] or "").casefold().lstrip("@") == uname]
-        return hits[0] if len(hits) == 1 else None
-
-    # Iris usually formats rows as: "1. 🔥 Display Name (1,2k) — 3 месяца 2 дн".
-    # Extract only the display-name field and compare it exactly after normalization.
-    row_match = re.match(r"^\s*\d+\.\s*(.*?)\s*\([^()]*\)\s*[—–-]\s*.+$", line)
-    if not row_match:
-        return None
-    display_text = row_match.group(1).strip()
-    # _display_key removes decorative emoji/punctuation while preserving Unicode letters.
-    target_key = _display_key(display_text)
-    if not target_key:
-        return None
-
-    exact = []
-    for row in active_rows:
-        display = " ".join(
-            part for part in (str(row["first_name"] or ""), str(row["last_name"] or "")) if part
-        ).strip()
-        username = str(row["username"] or "").lstrip("@")
-        keys = {_display_key(display), _display_key(username)}
-        if target_key in keys:
-            exact.append(row)
-    return exact[0] if len(exact) == 1 else None
-
-
-def _iter_text_lines_with_offsets(text: str):
-    cursor = 0
-    for raw in text.splitlines(True):
-        line = raw.rstrip("\r\n")
-        line_start = cursor
-        line_end = cursor + len(line)
-        yield line, line_start, line_end
-        cursor += len(raw)
-
-
-async def _extract_iris_old_candidates(message: Message, active_rows: list[Any]):
-    """Parse an Iris ``олды`` response using clickable entities whenever available."""
-    text = message.text or message.caption or ""
-    results = []
-    for line, line_start, line_end in _iter_text_lines_with_offsets(text):
-        stripped = line.strip()
-        if not stripped:
-            continue
-        duration = re.search(r"[—–-]\s*(.+?)\s*$", stripped)
-        if not duration:
-            continue
-        age_text = duration.group(1).strip()
-        if not re.search(r"(?:дн|день|дня|дней|месяц|год|лет|ч\b|мин)", age_text.casefold()):
-            continue
-        days = _duration_to_days(age_text)
-        if days < 30:
-            continue
-        member = await _match_iris_old_line(stripped, active_rows, message, line_start, line_end)
-        if member:
-            row_match = re.match(r"^\s*\d+\.\s*(.*?)\s*\([^()]*\)\s*[—–-]\s*.+$", stripped)
-            display_label = row_match.group(1).strip() if row_match else stripped
-            results.append((member, days, age_text, display_label))
-    return results
-
-
-async def _start_manual_olds_scan() -> bool:
-    """Create a pending scan; the owner manually forwards Iris' response in DM."""
-    try:
-        _q(lambda conn: (
-            conn.execute("UPDATE jf_iris_scan SET status='superseded',finished_at=? WHERE chat_id=? AND status='waiting'", (_utc_iso(), int(_primary_chat_id))),
-            conn.execute("INSERT INTO jf_iris_scan(chat_id,requested_at,status) VALUES(?,?,?)", (int(_primary_chat_id), _utc_iso(), "waiting")),
-            conn.commit(),
-        ))
-        return True
-    except Exception:
-        import logging
-        logging.getLogger("justice_features").exception("Could not start manual Iris scan")
-        return False
-
-
-async def handle_iris_olds_response(message: Message):
-    """Parse a forwarded/pasted Iris 'олды' response in the owner's private chat.
-
-    It never sends commands to Iris or the group. Each reward command is sent to
-    the owner as a separate DM so it can be forwarded manually into the flood.
-    """
-    if not _admin_only(message) or message.chat.type != "private":
-        return
-    waiting = _q(lambda conn: conn.execute(
-        "SELECT * FROM jf_iris_scan WHERE chat_id=? AND status='waiting' ORDER BY id DESC LIMIT 1",
-        (int(_primary_chat_id),),
-    ).fetchone())
-    if not waiting:
-        return
-    source_text = message.text or message.caption or ""
-    if not source_text.strip():
-        await message.reply("Не вижу текста в пересланном сообщении. Перешли ответ Ирис с текстом списка «олды» или вставь его текстом.")
-        return
-    # Do not consume the scan if the owner accidentally sends another message
-    # while the scan is waiting. Require at least one correctly shaped numbered
-    # Iris row; a valid old-list containing no eligible people is still accepted.
-    looks_like_olds_list = False
-    for candidate_line, _, _ in _iter_text_lines_with_offsets(source_text):
-        candidate_line = candidate_line.strip()
-        if (re.match(r"^\s*\d+\.\s*.*?\([^()]*\)\s*[—–-]\s*.+$", candidate_line)
-                and re.search(r"[—–-]\s*(.+?)\s*$", candidate_line)):
-            looks_like_olds_list = True
-            break
-    if not looks_like_olds_list:
-        await message.reply("Пока не вижу списка «олды» Ирис. Перешли сюда её исходное сообщение целиком — ожидание сохранено, можешь отправить список ещё раз.")
-        return
-    # Forwarded messages preserve entities. Pasted text still supports exact name matching.
-    _q(lambda conn: (conn.execute("UPDATE jf_iris_scan SET status='processing' WHERE id=?", (int(waiting["id"]),)), conn.commit()))
-    try:
-        active_rows = _active_member_rows()
-        parsed = await _extract_iris_old_candidates(message, active_rows)
-        # Some Telegram clients strip entities from copied text; parser still falls
-        # back to usernames and unique display-name matching.
-        if not parsed and source_text != (message.text or ""):
-            shadow = message.model_copy(update={"text": source_text, "caption": None})
-            parsed = await _extract_iris_old_candidates(shadow, active_rows)
-        package: list[tuple[int, str, str, str, str]] = []
-        skipped = 0
-        seen_pairs: set[tuple[int, int]] = set()
-        matched_labels = {_display_key(label) for _, _, _, label in parsed}
-        unmatched_lines: list[str] = []
-        for line, _, _ in _iter_text_lines_with_offsets(source_text):
-            stripped = line.strip()
-            duration_match = re.search(r"[—–-]\s*(.+?)\s*$", stripped)
-            if not duration_match or not re.search(r"(?:дн|день|дня|дней|месяц|год|лет|ч\b|мин)", duration_match.group(1).casefold()):
-                continue
-            if _duration_to_days(duration_match.group(1).strip()) >= 30:
-                row_match = re.match(r"^\s*\d+\.\s*(.*?)\s*\([^()]*\)\s*[—–-]\s*.+$", stripped)
-                label = row_match.group(1).strip() if row_match else stripped
-                # We'll list unmatched eligible lines after all resolvable rows are known.
-                label_key = _display_key(label)
-                name_hits = []
-                for r in active_rows:
-                    display_key = _display_key(" ".join(part for part in (str(r["first_name"] or ""), str(r["last_name"] or "")) if part).strip())
-                    username_key = _display_key(str(r["username"] or "").lstrip("@"))
-                    if label_key and label_key in {display_key, username_key}:
-                        name_hits.append(int(r["user_id"]))
-                # An entity-resolved line may have a custom display label, so the
-                # label in the parsed results is also concrete evidence. A name
-                # that maps to multiple users is still considered ambiguous.
-                identity_ok = label_key in matched_labels or len(set(name_hits)) == 1
-                if not identity_ok:
-                    unmatched_lines.append(label)
-        for row, days, age_text, display_label in parsed:
-            uid = int(row["user_id"])
-            username = str(row.get("username") or "").strip()
-            if not username:
-                skipped += 1
-                unmatched_lines.append(f"{display_label} — участник найден, но у него нет @username; команда Iris не подготовлена")
-                continue
-            for threshold_days, level, title in IRIS_OLD_THRESHOLDS:
-                if days < threshold_days:
-                    continue
-                pair = (uid, threshold_days)
-                if pair in seen_pairs or iris_already_sent(_primary_chat_id, uid, f"iris_old_{threshold_days}d"):
-                    skipped += 1
-                    continue
-                seen_pairs.add(pair)
-                command = f"{IRIS_AWARD_PREFIX}{IRIS_COMMAND} {level} @{username}"
-                package.append((uid, command, f"{title}. Стаж: {age_text}.", f"iris_old_{threshold_days}d", title))
-        _q(lambda conn: (conn.execute("UPDATE jf_iris_scan SET status='prepared',finished_at=? WHERE id=?", (_utc_iso(), int(waiting["id"]))), conn.commit()))
-        if not package:
-            response = [
-                "Список обработан, но команды наград не подготовлены.",
-                f"Строк с олдами распознано: {len(parsed)}.",
-                f"Пропущено: {skipped}.",
-                "Награды выдаются только при точном сопоставлении — бот не будет угадывать получателя.",
-            ]
-            if unmatched_lines:
-                response.append("\nНе удалось подготовить команду для строк:")
-                response.extend(f"• {name}" for name in list(dict.fromkeys(unmatched_lines))[:30])
-            await message.answer("\n".join(response))
-            return
-        # Send an at-a-glance roster so the owner can see all recipients and levels,
-        # followed by individual command messages that can be forwarded to the flood.
-        roster_lines = ["🏆 ПАКЕТ НАГРАД: КОМУ И ЧТО ВЫДАТЬ", ""]
-        for index, (uid, command, reason, code, title) in enumerate(package, start=1):
-            roster_lines.append(f"{index}. {command} — {reason}")
-        roster_text = (
-            "🏆 Пакет наград подготовлен\n\n"
-            f"Распознано олдов: {len(parsed)}\n"
-            f"Команд к ручной пересылке: {len(package)}\n"
-            f"Пропущено команд: {skipped}\n\n"
-            "Ни одна команда не отправлена в флуд автоматически. Ниже — полный список, затем каждая команда придёт отдельным сообщением для пересылки Ирису в флуд."
-        )
-        await message.answer(roster_text)
-        # Telegram caps a message at 4096 chars; chunk the full roster safely.
-        current_chunk = ""
-        for roster_line in roster_lines:
-            candidate = current_chunk + roster_line + "\n"
-            if len(candidate) > 3500 and current_chunk:
-                await message.answer(current_chunk.rstrip())
-                current_chunk = roster_line + "\n"
-            else:
-                current_chunk = candidate
-        if current_chunk.strip():
-            await message.answer(current_chunk.rstrip())
-        if unmatched_lines:
-            unique_unmatched = list(dict.fromkeys(unmatched_lines))
-            warning = "⚠️ Не удалось однозначно сопоставить строки (награды не подготовлены для них):\n" + "\n".join(f"• {name}" for name in unique_unmatched[:40])
-            if len(unique_unmatched) > 40:
-                warning += f"\n…и ещё {len(unique_unmatched) - 40}."
-            await message.answer(warning)
-        # Persist the pending audit before exposing buttons, so an immediate tap
-        # cannot race ahead of the database insert.
-        for uid, command, reason, code, title in package:
-            record_iris_audit(_primary_chat_id, uid, code, "prepared", reason, command)
-        for uid, command, reason, code, title in package:
-            threshold = re.search(r"(30|60|120)d$", code)
-            threshold_days = threshold.group(1) if threshold else "0"
-            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
-                InlineKeyboardButton(text="✅ Отметить выданной", callback_data=f"rewardmark:{uid}:{threshold_days}"),
-                InlineKeyboardButton(text="↩️ Не выдана", callback_data=f"rewardcancel:{uid}:{threshold_days}"),
-            ]])
-            await _bot.send_message(int(_admin_id), command, reply_markup=keyboard)
-            await asyncio.sleep(0.15)
-        await _bot.send_message(int(_admin_id), "ℹ️ Команды отправлены выше отдельными сообщениями. Перешли их в флуд вручную; бот не может подтвердить, что Ирис их выполнила.")
-    except Exception:
-        _q(lambda conn: (conn.execute("UPDATE jf_iris_scan SET status='failed',finished_at=? WHERE id=?", (_utc_iso(), int(waiting["id"]))), conn.commit()))
-        import logging
-        logging.getLogger("justice_features").exception("Manual Iris award preparation failed")
-        await message.reply("Не удалось обработать список. Ошибка записана в журнал; проверь формат ответа и повтори /jf_awards.")
-
-
-async def handle_reward_cancel(callback: CallbackQuery):
-    if not callback.from_user or callback.from_user.id != _admin_id or not callback.message or callback.message.chat.type != "private":
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    parts = (callback.data or "").split(":")
-    if len(parts) != 3 or not parts[1].isdigit() or parts[2] not in {"30", "60", "120"}:
-        await callback.answer("Некорректные данные", show_alert=True)
-        return
-    uid, days = int(parts[1]), parts[2]
-    code = f"iris_old_{days}d"
-    _q(lambda conn: (conn.execute(
-        "DELETE FROM jf_award_audit WHERE id=(SELECT id FROM jf_award_audit WHERE chat_id=? AND user_id=? AND kind=? AND status='prepared' ORDER BY id DESC LIMIT 1)",
-        (int(_primary_chat_id), uid, code),
-    ), conn.commit()))
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer("Подготовка отменена. Награду можно подготовить повторно.")
-
-async def handle_reward_mark(callback: CallbackQuery):
-    if not callback.from_user or callback.from_user.id != _admin_id or not callback.message or callback.message.chat.type != "private":
-        await callback.answer("Нет доступа", show_alert=True)
-        return
-    parts = (callback.data or "").split(":")
-    if len(parts) != 3 or not parts[1].isdigit() or parts[2] not in {"30", "60", "120"}:
-        await callback.answer("Некорректные данные", show_alert=True)
-        return
-    uid, days = int(parts[1]), parts[2]
-    code = f"iris_old_{days}d"
-    row = _q(lambda conn: conn.execute(
-        "SELECT id FROM jf_award_audit WHERE chat_id=? AND user_id=? AND kind=? AND status='prepared' ORDER BY id DESC LIMIT 1",
-        (int(_primary_chat_id), uid, code),
-    ).fetchone())
-    if not row:
-        await callback.answer("Подготовленная награда не найдена или уже отмечена", show_alert=True)
-        return
-    _q(lambda conn: (conn.execute("UPDATE jf_award_audit SET status='manual' WHERE id=?", (int(row["id"]),)), conn.commit()))
-    await callback.message.edit_reply_markup(reply_markup=None)
-    await callback.answer("Отмечено. Бот не может проверить выполнение команды Ирис.")
-
-def _pretty_dashboard(chat_id: int) -> str:
-    rows = _q(lambda conn: conn.execute(
-        "SELECT COUNT(*) AS c FROM group_members WHERE chat_id=? AND active=1", (int(chat_id),)
-    ).fetchone())
-    active = int(rows["c"])
-    rest = _q(lambda conn: conn.execute(
-        "SELECT COUNT(*) AS c FROM jf_rest WHERE chat_id=? AND active=1 AND end_at> ?", (int(chat_id), _utc_iso())
-    ).fetchone())["c"]
-    return (
-        "༺ 𓆩 ✧ 𓆪 ༻\n\n"
-        "🌸 LIFE OF JUSTICE FAITE\n\n"
-        f"👥 Активных участников: {active}\n"
-        f"🥹 В ресте: {rest}\n\n"
-        "✦ Единый центр управления флудом"
-    )
-
-
-async def cmd_dashboard(message: Message):
-    if not _admin_only(message) and message.chat.type not in {"group", "supergroup"}:
-        return
-    if message.chat.type in {"group", "supergroup"} and not _is_primary_chat(message.chat.id):
-        return
-    await message.reply(_pretty_dashboard(message.chat.id if message.chat.type in {"group", "supergroup"} else int(_primary_chat_id)))
-
-
-async def cmd_awards_check(message: Message):
-    if not _admin_only(message) or message.chat.type != "private":
-        return
-    if not await _start_manual_olds_scan():
-        await message.reply("Не удалось создать сессию проверки. Попробуй ещё раз.")
-        return
-    await message.answer(
-        "🏆 **Подготовка наград за стаж**\n\n"
-        "1. Открой основной флуд и отправь Ирис команду `!олды`.\n"
-        "2. Дождись ответа Ирис.\n"
-        "3. Перешли ответ сюда в личные сообщения бота.\n\n"
-        f"Пороги: 30 / 60 / 120 дней. Степени: {IRIS_30D_LEVEL} / {IRIS_60D_LEVEL} / {IRIS_120D_LEVEL}.\n"
-        "Бот подготовит отдельное сообщение-команду для каждого участника. Сам в флуд ничего отправлять не будет.",
-        parse_mode="Markdown",
-    )
-
-
-async def cmd_iris_sync(message: Message):
-    await cmd_awards_check(message)
-
-
-async def cmd_award(message: Message):
-    if not _admin_only(message):
-        return
-    parts = (message.text or "").split(maxsplit=3)
-    if len(parts) < 4:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\nФормат:\n/jf_award @username code название | описание")
-        return
-    target_raw, code, rest = parts[1], parts[2], parts[3]
-    if "|" in rest:
-        award_title, desc = [x.strip() for x in rest.split("|", 1)]
-    else:
-        award_title, desc = rest.strip(), ""
-    row = _q(lambda conn: conn.execute(
-        "SELECT * FROM group_members WHERE chat_id=? AND username=? AND active=1 LIMIT 1",
-        (int(_primary_chat_id), target_raw.lstrip("@").casefold()),
-    ).fetchone())
-    if not row:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\nУчастник не найден в базе флуда.")
-        return
-    created = issue_local_award(_primary_chat_id, row["user_id"], code, award_title, desc, _admin_id, "manual")
-    await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n" + ("✅ Награда выдана в системе Justice Faite." if created else "ℹ️ Такая награда уже есть у участника."))
+    def op(conn):
+        active = conn.execute(
+            "SELECT id,level FROM jf_warnings WHERE chat_id=? AND user_id=? AND removed_at IS NULL ORDER BY id",
+            (int(chat_id), int(user_id))).fetchall()
+        level = len(active) + 1
+        eligible = warning_eligible_at(level, now)
+        cur = conn.execute(
+            "INSERT INTO jf_warnings(chat_id,user_id,level,reason,issued_by,issued_at,eligible_at) VALUES(?,?,?,?,?,?,?)",
+            (int(chat_id), int(user_id), level, reason[:2000], int(issued_by), now, eligible))
+        for old in active:
+            conn.execute("UPDATE jf_warnings SET eligible_at=? WHERE id=?",
+                         (warning_eligible_at(int(old["level"]), now), int(old["id"])))
+        conn.commit()
+        return cur.lastrowid, level, eligible, len(active) + 1
+    return _q(op)
 
 
 async def cmd_warn(message: Message):
-    if not _admin_only(message):
+    if not await cmdcfg.gate(message, "warn"):
         return
-    raw = (message.text or "").split(maxsplit=2)
-    if len(raw) < 3:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\nФормат:\n/jf_warn @username причина")
+    target, reason = await resolve_target(message, _command_args(message))
+    if not target or len(reason) < 3:
+        await _reply(message, "warn", ui.card(
+            "Предупреждение",
+            ui.lines(ui.bullet("/jf_warn @username причина"),
+                     ui.bullet("Или ответом на сообщение: /jf_warn причина"),
+                     ui.bullet("Причина — минимум 3 символа."))))
         return
-    username, reason = raw[1].lstrip("@"), raw[2].strip()
-    row = _q(lambda conn: conn.execute(
-        "SELECT * FROM group_members WHERE chat_id=? AND username=? AND active=1 LIMIT 1",
-        (int(_primary_chat_id), username.casefold()),
-    ).fetchone())
-    if not row:
-        await message.reply("Участник не найден.")
-        return
-    warn_id, level, eligible = issue_warning(_primary_chat_id, row["user_id"], reason, _admin_id)
-    text = f"⚠️ Предупреждение #{level} выдано."
+    warn_id, level, eligible, total = issue_warning(_primary_chat_id, target["user_id"], reason, message.from_user.id)
+    who = ui.person(target)
+    lines = [ui.kv("Участник", who), ui.kv("Уровень", level), ui.kv("Активных предупреждений", total), ui.kv("Причина", ui.short(reason, 200))]
     if eligible:
-        text += "\nСрок возможного снятия: " + eligible[:10] + "."
-    await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n" + text)
+        lines.append(ui.kv("Снять можно после", ui.fmt_date(eligible)))
+    else:
+        lines.append(ui.kv("Снятие", "по решению владельца"))
+    await _reply(message, "warn", ui.card(f"Предупреждение №{warn_id}", ui.lines(*lines)))
+
+    if cmdcfg.get_bool("warn", "announce") and message.chat.type == "private":
+        with suppress(Exception):
+            await _bot.send_message(
+                int(_primary_chat_id),
+                f"⚠️ {_mention_html(target)}: предупреждение ({level}).\n{html.escape(reason, quote=False)}",
+                parse_mode="HTML")
+    if cmdcfg.get_bool("warn", "notify_user"):
+        with suppress(Exception):
+            await _bot.send_message(int(target["user_id"]), ui.card("Предупреждение", ui.kv("Причина", ui.short(reason, 300))))
 
 
 async def cmd_warnings(message: Message):
-    if not _admin_only(message):
+    if not await cmdcfg.gate(message, "warnings"):
         return
-    raw = (message.text or "").split(maxsplit=1)
-    if len(raw) < 2:
-        await message.reply("Формат: /jf_warnings @username")
+    uid = int(message.from_user.id)
+    level = await cmdcfg.level_of(uid)
+    args = _command_args(message)
+    target, _ = await resolve_target(message, args, active_only=False)
+    if args or getattr(message, "reply_to_message", None):
+        if cmdcfg.ACCESS_ORDER.get(level, 0) < cmdcfg.ACCESS_ORDER["admins"]:
+            await _reply(message, "warnings", ui.fail("Чужие предупреждения может смотреть только администрация."))
+            return
+        if not target:
+            await _reply(message, "warnings", ui.fail("Участник не найден."))
+            return
+    else:
+        target = member_by_id(uid) or {"user_id": uid, "first_name": getattr(message.from_user, "first_name", ""),
+                                       "username": getattr(message.from_user, "username", "")}
+    limit = cmdcfg.get_int("warnings", "limit")
+    rows = _q(lambda conn: conn.execute(
+        "SELECT * FROM jf_warnings WHERE chat_id=? AND user_id=? ORDER BY id DESC LIMIT ?",
+        (int(_primary_chat_id), int(target["user_id"]), limit)).fetchall())
+    if not rows:
+        await _reply(message, "warnings", ui.card("Предупреждения", ui.ok(f"У {ui.person(target)} нет предупреждений.")))
         return
-    row = _q(lambda conn: conn.execute(
-        "SELECT * FROM group_members WHERE chat_id=? AND username=? LIMIT 1",
-        (int(_primary_chat_id), raw[1].lstrip("@").casefold()),
-    ).fetchone())
-    if not row:
-        await message.reply("Участник не найден.")
-        return
-    warns = _q(lambda conn: conn.execute(
-        "SELECT * FROM jf_warnings WHERE chat_id=? AND user_id=? ORDER BY id DESC",
-        (int(_primary_chat_id), int(row["user_id"])),
-    ).fetchall())
-    if not warns:
-        await message.reply("༺ 𓆩 ✧ 𓆪 ༻\n\n✅ Активных и снятых предупреждений нет.")
-        return
-    lines = ["༺ 𓆩 ✧ 𓆪 ༻", "", "⚠️ История предупреждений", ""]
-    for w in warns[:20]:
-        status = "снято" if w["removed_at"] else "активно"
-        lines.append(f"#{w['id']} · {w['level']} уровень · {status}\n{w['reason']}\n{w['issued_at'][:10]}")
-    await message.reply("\n\n".join(lines))
+    active = sum(1 for r in rows if not r["removed_at"])
+    items = []
+    for r in rows:
+        status = "снято" if r["removed_at"] else "активно"
+        extra = ""
+        if not r["removed_at"] and r["eligible_at"]:
+            extra = f" · снять можно с {ui.fmt_date(r['eligible_at'])}"
+        items.append(f"#{r['id']} · уровень {r['level']} · {status}{extra}\n   {ui.short(r['reason'], 160)} ({ui.fmt_date(r['issued_at'])})")
+    await _reply(message, "warnings", ui.card(
+        f"Предупреждения · {ui.person(target)}", ui.kv("Активных", active), "\n".join(items)))
 
 
 async def cmd_remove_warning(message: Message):
-    if not _admin_only(message):
+    if not await cmdcfg.gate(message, "warn_remove"):
         return
-    raw = (message.text or "").split(maxsplit=1)
-    if len(raw) < 2 or not raw[1].isdigit():
-        await message.reply("Формат: /jf_warn_remove ID")
+    parts = _command_args(message).split()
+    if not parts or not parts[0].lstrip("#").isdigit():
+        await _reply(message, "warn_remove", ui.card("Снять предупреждение", ui.bullet("/jf_warn_remove ID"),
+                                                    ui.bullet("ID виден в /jf_warnings. «force» в конце снимает досрочно.")))
         return
-    wid = int(raw[1])
+    wid = int(parts[0].lstrip("#"))
+    force = len(parts) > 1 and parts[1].lower() in {"force", "досрочно", "!"}
+    enforce = cmdcfg.get_bool("warn_remove", "enforce_wait") and not force
+
     def op(conn):
         row = conn.execute("SELECT * FROM jf_warnings WHERE id=?", (wid,)).fetchone()
         if not row:
-            return None
+            return "missing", None
         if row["removed_at"]:
-            return False
-        if row["eligible_at"]:
-            try:
-                eligible = datetime.fromisoformat(str(row["eligible_at"]))
-                if eligible.tzinfo is None:
-                    eligible = eligible.replace(tzinfo=timezone.utc)
-                if eligible > datetime.now(timezone.utc):
-                    return "early"
-            except Exception:
-                pass
-        conn.execute("UPDATE jf_warnings SET removed_at=?,removed_by=? WHERE id=?", (_utc_iso(), int(_admin_id), wid))
+            return "removed", row
+        eligible = ui.parse_iso(row["eligible_at"]) if row["eligible_at"] else None
+        if enforce and eligible and eligible > datetime.now(timezone.utc):
+            return "early", row
+        conn.execute("UPDATE jf_warnings SET removed_at=?,removed_by=? WHERE id=?", (_utc_iso(), int(message.from_user.id), wid))
         conn.commit()
-        return True
-    result = _q(op)
-    if result is None:
-        await message.reply("Предупреждение не найдено.")
-    elif result is False:
-        await message.reply("Оно уже снято.")
-    elif result == "early":
-        await message.reply("⏳ Срок снятия ещё не наступил по правилам флуда.")
-    else:
-        await message.reply("✅ Предупреждение снято.")
+        return "ok", row
 
+    status, row = _q(op)
+    text = {
+        "missing": ui.fail("Предупреждение не найдено."),
+        "removed": ui.note("Оно уже снято."),
+        "early": ui.warning(f"Срок снятия ещё не наступил (с {ui.fmt_date(row['eligible_at']) if row else '—'}). Добавьте «force», чтобы снять досрочно.") if row else "",
+        "ok": ui.ok(f"Предупреждение #{wid} снято."),
+    }[status]
+    await _reply(message, "warn_remove", text)
+
+
+# --------------------------------------------------------------------------
+# Рест
+# --------------------------------------------------------------------------
 
 MONTH_ALIASES = {
-    "января": 1, "январь": 1, "янв": 1,
-    "февраля": 2, "февраль": 2, "фев": 2,
-    "марта": 3, "март": 3, "мар": 3,
-    "апреля": 4, "апрель": 4, "апр": 4,
-    "мая": 5, "май": 5,
-    "июня": 6, "июнь": 6, "июн": 6,
-    "июля": 7, "июль": 7, "июл": 7,
-    "августа": 8, "август": 8, "авг": 8,
-    "сентября": 9, "сентябрь": 9, "сен": 9,
-    "октября": 10, "октябрь": 10, "окт": 10,
-    "ноября": 11, "ноябрь": 11, "ноя": 11,
+    "января": 1, "январь": 1, "янв": 1, "февраля": 2, "февраль": 2, "фев": 2,
+    "марта": 3, "март": 3, "мар": 3, "апреля": 4, "апрель": 4, "апр": 4,
+    "мая": 5, "май": 5, "июня": 6, "июнь": 6, "июн": 6, "июля": 7, "июль": 7, "июл": 7,
+    "августа": 8, "август": 8, "авг": 8, "сентября": 9, "сентябрь": 9, "сен": 9,
+    "октября": 10, "октябрь": 10, "окт": 10, "ноября": 11, "ноябрь": 11, "ноя": 11,
     "декабря": 12, "декабрь": 12, "дек": 12,
 }
+_MONTH_WORDS = "|".join(sorted(MONTH_ALIASES, key=len, reverse=True))
+_DUR_RE = re.compile(r"(?iu)(?:\bна\s+)?(?<!\d)(\d{1,3})\s*(недел\w*|нед\b\.?|мес\w*|дней|дня|день|дн\b\.?|д\b\.?)")
+_DATE_WORD_RE = re.compile(rf"(?iu)(?:\bдо\s+)?(?<!\d)(\d{{1,2}})\s+({_MONTH_WORDS})\b")
+_DATE_NUM_RE = re.compile(r"(?iu)(?:\bдо\s+)?(?<!\d)(\d{1,2})\s*[.\-/\s]\s*(\d{1,2})(?!\d)")
 
 
-def _parse_rest_day_month(value: str):
-    parts = [p for p in re.split(r"[.\-/\s]+", (value or "").strip().casefold()) if p]
-    if len(parts) != 2:
-        return None
-    try:
-        day = int(parts[0])
-    except ValueError:
-        return None
-    month = MONTH_ALIASES.get(parts[1])
-    if month is None:
-        try:
-            month = int(parts[1])
-        except ValueError:
-            return None
-    if not 1 <= month <= 12 or not 1 <= day <= 31:
-        return None
+def _valid_day_month(day: int, month: int) -> bool:
+    if not (1 <= month <= 12 and 1 <= day <= 31):
+        return False
     try:
         datetime(2024, month, day)
+        return True
     except ValueError:
-        return None
-    return day, month
+        return False
 
 
-def _next_rest_end(day: int, month: int) -> datetime:
-    offset_hours = int(os.getenv("DEFAULT_TIMEZONE_OFFSET_HOURS", "3"))
-    tz = timezone(timedelta(hours=offset_hours))
-    now_local = datetime.now(tz)
-    year = now_local.year
-    candidate = datetime(year, month, day, 23, 59, 59, tzinfo=tz)
-    if candidate <= now_local:
-        candidate = datetime(year + 1, month, day, 23, 59, 59, tzinfo=tz)
-    return candidate.astimezone(timezone.utc)
+def _end_of_local_day(base: datetime) -> datetime:
+    return base.replace(hour=23, minute=59, second=59, microsecond=0)
 
 
-async def _resolve_member_target(raw: str):
-    value = (raw or "").strip()
-    if not value:
-        return None
-    username = value.lstrip("@").casefold()
-    row = _q(lambda conn: conn.execute(
-        "SELECT * FROM group_members WHERE chat_id=? AND lower(username)=? AND active=1 LIMIT 1",
-        (int(_primary_chat_id), username),
-    ).fetchone())
-    if row:
-        return row
-    if username.isdigit():
-        return _q(lambda conn: conn.execute(
-            "SELECT * FROM group_members WHERE chat_id=? AND user_id=? AND active=1 LIMIT 1",
-            (int(_primary_chat_id), int(username)),
-        ).fetchone())
-    return None
+def parse_rest_period(text: str, *, now_local: Optional[datetime] = None) -> tuple[Optional[datetime], Optional[int], str]:
+    """Срок реста из текста. Возвращает (конец в UTC | None, дней | None, остаток-заметка)."""
+    now_local = now_local or ui.local_now()
+    raw = (text or "").strip()
+    m = _DUR_RE.search(raw)
+    if m:
+        number, unit = int(m.group(1)), m.group(2).casefold()
+        days = number * (7 if unit.startswith("нед") else 30 if unit.startswith("мес") else 1)
+        end_local = _end_of_local_day(now_local + timedelta(days=days))
+        note = (raw[:m.start()] + " " + raw[m.end():]).strip()
+        return end_local.astimezone(timezone.utc), days, " ".join(note.split())
+    for rx in (_DATE_WORD_RE, _DATE_NUM_RE):
+        m = rx.search(raw)
+        if not m:
+            continue
+        day = int(m.group(1))
+        month = MONTH_ALIASES.get(m.group(2).casefold()) if rx is _DATE_WORD_RE else int(m.group(2))
+        if not month or not _valid_day_month(day, month):
+            continue
+        candidate = _end_of_local_day(datetime(now_local.year, month, day, tzinfo=now_local.tzinfo))
+        if candidate <= now_local:
+            candidate = _end_of_local_day(datetime(now_local.year + 1, month, day, tzinfo=now_local.tzinfo))
+        days = max(1, (candidate.date() - now_local.date()).days)
+        note = (raw[:m.start()] + " " + raw[m.end():]).strip()
+        return candidate.astimezone(timezone.utc), days, " ".join(note.split())
+    return None, None, raw
 
 
-async def _set_rest_from_text(message: Message):
-    raw = (message.text or "").strip()
-    pattern = r"(?iu)^\s*(?:(?:выдать\s+)?рест|/(?:jf_)?rest)\s+(@[A-Za-z0-9_]{3,32}|\d+)\s+(.+?)\s*$"
-    match = re.match(pattern, raw)
-    if not match:
-        await message.reply(_fmt("Рест") + "\n\n✦ Формат: `выдать рест @username 15 09`\n✦ Или: `/rest @username 15 09`")
-        return
-    target_raw, date_raw = match.group(1), match.group(2).strip()
-    # The date can be "15 09", "15.09" or "15 сентября".
-    if re.fullmatch(r"\d{1,2}\s+\d{1,2}", date_raw):
-        a, b = date_raw.split()
-        parsed = _parse_rest_day_month(f"{a}.{b}")
-    else:
-        parsed = _parse_rest_day_month(date_raw)
-    if not parsed:
-        await message.reply(_fmt("Рест") + "\n\n✦ Укажи дату как `15 09`, `15.09` или `15 сентября`.")
-        return
-    row = await _resolve_member_target(target_raw)
-    if not row:
-        await message.reply(_fmt("Рест") + "\n\n✦ Участник не найден во флуде.")
-        return
-    end_at = _next_rest_end(*parsed)
-    now = _utc_iso()
-    _q(lambda conn: (conn.execute(
-        "INSERT INTO jf_rest(chat_id,user_id,start_at,end_at,note,created_by,created_at,active) VALUES(?,?,?,?,?,?,?,1) "
-        "ON CONFLICT(chat_id,user_id) DO UPDATE SET end_at=excluded.end_at,note=excluded.note,created_by=excluded.created_by,created_at=excluded.created_at,active=1,ended_notified_at=NULL",
-        (int(_primary_chat_id), int(row["user_id"]), now, end_at.isoformat(), "", int(_admin_id), now),
-    ), conn.commit()))
-    display = _mention_user(int(row["user_id"]), row["first_name"] or "участник", row["username"])
-    local_tz = timezone(timedelta(hours=int(os.getenv("DEFAULT_TIMEZONE_OFFSET_HOURS", "3"))))
-    await message.reply(_fmt("Рест оформлен") + f"\n\n🥹 {display}\n✦ До: {end_at.astimezone(local_tz).strftime('%d.%m.%Y')}")
+async def _rest_args(message: Message) -> str:
+    text = (message.text or "").strip()
+    m = re.match(r"(?iu)^(?:/\w+(?:@\w+)?|выдать\s+рест|снять\s+рест)\s*(.*)$", text, re.DOTALL)
+    return m.group(1).strip() if m else ""
 
 
-async def natural_rest_command(message: Message):
-    if message.chat.type not in {"group", "supergroup"} or not _is_primary_chat(message.chat.id):
-        return
-    if not _admin_only(message):
-        return
-    await _set_rest_from_text(message)
+RESTFORMAT = ui.card(
+    "Рест",
+    ui.lines(
+        ui.section("Форматы"),
+        ui.bullet("выдать рест @user 15.09"),
+        ui.bullet("выдать рест @user 15 сентября"),
+        ui.bullet("выдать рест @user на 7 дней"),
+        ui.bullet("ответом на сообщение: выдать рест на 2 недели"),
+        ui.bullet("в конце можно добавить заметку"),
+    ),
+)
 
 
 async def cmd_rest(message: Message):
-    if not _admin_only(message):
+    if not await cmdcfg.gate(message, "rest"):
         return
-    await _set_rest_from_text(message)
+    target, rest_text = await resolve_target(message, await _rest_args(message))
+    end_utc, days, note = parse_rest_period(rest_text)
+    if not target and rest_text:
+        await _reply(message, "rest", ui.fail("Участник не найден среди участников флуда."))
+        return
+    if not target or end_utc is None:
+        await _reply(message, "rest", RESTFORMAT)
+        return
+    limit = cmdcfg.get_int("rest", "max_days")
+    if days and days > limit:
+        await _reply(message, "rest", ui.fail(f"Слишком долго: максимум {ui.days_word(limit)}."))
+        return
+    now = _utc_iso()
+    note = note[:300]
+
+    def op(conn):
+        previous = conn.execute("SELECT end_at,active FROM jf_rest WHERE chat_id=? AND user_id=?",
+                                (int(_primary_chat_id), int(target["user_id"]))).fetchone()
+        conn.execute(
+            "INSERT INTO jf_rest(chat_id,user_id,start_at,end_at,note,created_by,created_at,active,ended_notified_at) "
+            "VALUES(?,?,?,?,?,?,?,1,NULL) ON CONFLICT(chat_id,user_id) DO UPDATE SET "
+            "end_at=excluded.end_at,note=excluded.note,created_by=excluded.created_by,created_at=excluded.created_at,"
+            "active=1,ended_notified_at=NULL",
+            (int(_primary_chat_id), int(target["user_id"]), now, end_utc.isoformat(), note, int(message.from_user.id), now))
+        conn.commit()
+        return bool(previous and previous["active"])
+
+    extended = _q(op)
+    lines = [ui.kv("Участник", ui.person(target)), ui.kv("До", ui.fmt_date(end_utc)),
+             ui.kv("Осталось", ui.left_text(end_utc))]
+    if note:
+        lines.append(ui.kv("Заметка", ui.short(note, 120)))
+    head = "Рест продлён" if extended else "Рест оформлен"
+    await _reply(message, "rest", ui.card(head, ui.lines(*lines)))
+    if message.chat.type == "private" and cmdcfg.get_bool("rest", "announce"):
+        with suppress(Exception):
+            await _bot.send_message(
+                int(_primary_chat_id),
+                f"🥹 {_mention_html(target)} на ресте до {ui.fmt_date(end_utc)}.", parse_mode="HTML")
 
 
-def _parse_birthday(value: str):
-    raw = (value or "").strip()
-    m = re.fullmatch(r"(\d{1,2})[.\-/](\d{1,2})", raw)
-    if not m:
-        return None
-    day, month = int(m.group(1)), int(m.group(2))
-    try:
-        datetime(2024, month, day)
-    except ValueError:
-        return None
-    return day, month
+async def cmd_unrest(message: Message):
+    if not await cmdcfg.gate(message, "unrest"):
+        return
+    target, _ = await resolve_target(message, await _rest_args(message), active_only=False)
+    if not target:
+        await _reply(message, "unrest", ui.card("Снять рест", ui.bullet("снять рест @user"), ui.bullet("или ответом на сообщение")))
+        return
+
+    def op(conn):
+        cur = conn.execute("UPDATE jf_rest SET active=0,ended_notified_at=? WHERE chat_id=? AND user_id=? AND active=1",
+                           (_utc_iso(), int(_primary_chat_id), int(target["user_id"])))
+        conn.commit()
+        return cur.rowcount > 0
+
+    done = _q(op)
+    await _reply(message, "unrest", ui.ok(f"Рест снят: {ui.person(target)}.") if done else ui.note(f"У {ui.person(target)} нет активного реста."))
 
 
-# Community-provided birthday list. The labels are matched at runtime against
-# the current participant's role/name/username, so people who leave the chat
-# disappear automatically. The supplied 16 July entry is Митя.
+def active_rest_rows():
+    return _q(lambda conn: conn.execute(
+        "SELECT r.*,gm.username,gm.first_name FROM jf_rest r LEFT JOIN group_members gm "
+        "ON gm.chat_id=r.chat_id AND gm.user_id=r.user_id WHERE r.chat_id=? AND r.active=1 AND r.end_at>? ORDER BY r.end_at",
+        (int(_primary_chat_id), _utc_iso())).fetchall())
+
+
+async def cmd_restlist(message: Message):
+    if not await cmdcfg.gate(message, "restlist"):
+        return
+    rows = active_rest_rows()
+    if not rows:
+        await _reply(message, "restlist", ui.card("Рестники", ui.note("Сейчас никто не находится на ресте.")))
+        return
+    show_note = cmdcfg.get_bool("restlist", "show_reason")
+    items = []
+    for r in rows:
+        line = f"🥹 {ui.person(dict(r))} — до {ui.fmt_date(r['end_at'])} ({ui.left_text(r['end_at'])})"
+        if show_note and r["note"]:
+            line += f"\n   ⌁ {ui.short(r['note'], 100)}"
+        items.append(line)
+    await _reply(message, "restlist", ui.card(f"Рестники · {len(rows)}", "\n".join(items)))
+
+
+# --------------------------------------------------------------------------
+# Дни рождения
+# --------------------------------------------------------------------------
+
 BIRTHDAY_SEEDS = [
     (2, 7, "Кэйя"), (2, 7, "Лини"), (2, 12, "Хайтам"), (2, 27, "Ноэлль"), (2, 29, "Бай Чжу"),
     (3, 4, "Водяница"), (3, 18, "Кли"),
@@ -1905,6 +594,19 @@ BIRTHDAY_SEEDS = [
 ]
 
 
+def parse_birthday(value: str) -> Optional[tuple[int, int]]:
+    raw = (value or "").strip().casefold()
+    m = re.fullmatch(r"(\d{1,2})\s*[.\-/\s]\s*(\d{1,2})(?:[.\-/]\d{2,4})?", raw)
+    if m:
+        day, month = int(m.group(1)), int(m.group(2))
+    else:
+        m = re.fullmatch(rf"(\d{{1,2}})\s+({_MONTH_WORDS})", raw)
+        if not m:
+            return None
+        day, month = int(m.group(1)), MONTH_ALIASES[m.group(2)]
+    return (day, month) if _valid_day_month(day, month) else None
+
+
 def _person_key(value: str) -> str:
     return re.sub(r"[^a-zа-я0-9]+", "", (value or "").casefold().replace("ё", "е"))
 
@@ -1912,286 +614,323 @@ def _person_key(value: str) -> str:
 def seed_birthday_directory() -> None:
     if not _primary_chat_id:
         return
+
     def op(conn):
         conn.executemany(
             "INSERT OR IGNORE INTO jf_birthday_directory(chat_id,person_label,person_key,month,day,source) VALUES(?,?,?,?,?,?)",
-            [(int(_primary_chat_id), label, _person_key(label), month, day, "community_seed") for month, day, label in BIRTHDAY_SEEDS],
-        )
+            [(int(_primary_chat_id), label, _person_key(label), month, day, "community_seed") for month, day, label in BIRTHDAY_SEEDS])
         conn.commit()
+
     _q(op)
 
 
-def _active_member_rows() -> list[dict[str, Any]]:
-    rows = _q(lambda conn: conn.execute(
-        "SELECT * FROM group_members WHERE chat_id=? AND active=1",
-        (int(_primary_chat_id),),
-    ).fetchall())
-    return [dict(r) for r in rows]
-
-
-def _resolve_seed_birthday(seed_row, members: list[dict[str, Any]]):
-    label_key = _person_key(seed_row["person_label"])
+def _resolve_seed(seed_row, members: list[dict]) -> Optional[dict]:
+    label = _person_key(seed_row["person_label"])
     hits = []
     for m in members:
-        candidates = {
-            _person_key(m.get("first_name", "")),
-            _person_key(m.get("last_name", "")),
-            _person_key(m.get("username", "")),
-            _person_key(m.get("role_name", "")),
-            _person_key(m.get("role_key", "")),
-        }
-        full = _person_key((m.get("first_name", "") + " " + m.get("last_name", "")).strip())
-        candidates.add(full)
-        if label_key and label_key in candidates:
+        keys = {_person_key(m.get(k, "")) for k in ("first_name", "last_name", "username", "role_name", "role_key")}
+        keys.add(_person_key(f"{m.get('first_name', '')} {m.get('last_name', '')}"))
+        if label and label in keys:
             hits.append(m)
     return hits[0] if len(hits) == 1 else None
 
 
-async def _get_live_birthdays() -> list[dict[str, Any]]:
-    seed_birthday_directory()
+def live_birthdays() -> list[dict]:
+    """Дни рождения тех, кто сейчас в флуде: личные даты + справочник сообщества."""
     members = _active_member_rows()
-    # The cache can lag behind Telegram after a restart. Verify only seed matches
-    # that are actually present in the chat before exposing or announcing them.
-    seeds = _q(lambda conn: conn.execute(
-        "SELECT * FROM jf_birthday_directory WHERE chat_id=? ORDER BY month,day",
-        (int(_primary_chat_id),),
-    ).fetchall())
-    live = []
-    seen_ids = set()
-    for seed in seeds:
-        member = _resolve_seed_birthday(seed, members)
+    by_id = {int(m["user_id"]): m for m in members}
+    result, seen = [], set()
+    manual = _q(lambda conn: conn.execute("SELECT * FROM jf_birthdays WHERE chat_id=?", (int(_primary_chat_id),)).fetchall())
+    for row in manual:
+        member = by_id.get(int(row["user_id"]))
         if not member:
             continue
-        uid = int(member["user_id"])
-        seen_ids.add(uid)
-        live.append({
-            "user_id": uid,
-            "month": int(seed["month"]),
-            "day": int(seed["day"]),
-            "name": member.get("first_name") or seed["person_label"],
-            "username": member.get("username") or "",
-            "label": seed["person_label"],
-            "source": "seed",
-        })
-    manual = _q(lambda conn: conn.execute(
-        "SELECT b.*,gm.username,gm.first_name,gm.last_name,gm.active FROM jf_birthdays b LEFT JOIN group_members gm ON gm.chat_id=b.chat_id AND gm.user_id=b.user_id WHERE b.chat_id=?",
-        (int(_primary_chat_id),),
-    ).fetchall())
-    for row in manual:
-        if not row["active"]:
-            continue
-        uid = int(row["user_id"])
-        if uid in seen_ids:
-            continue
+        seen.add(int(row["user_id"]))
+        result.append({"user_id": int(row["user_id"]), "month": int(row["month"]), "day": int(row["day"]), "row": member})
+    seeds = _q(lambda conn: conn.execute("SELECT * FROM jf_birthday_directory WHERE chat_id=? ORDER BY month,day",
+                                         (int(_primary_chat_id),)).fetchall())
+    for seed in seeds:
+        member = _resolve_seed(seed, members)
+        if member and int(member["user_id"]) not in seen:
+            seen.add(int(member["user_id"]))
+            result.append({"user_id": int(member["user_id"]), "month": int(seed["month"]), "day": int(seed["day"]), "row": member})
+    return result
+
+
+def days_until(month: int, day: int, today: Optional[datetime] = None) -> int:
+    today = today or ui.local_now()
+    for year in (today.year, today.year + 1, today.year + 2, today.year + 4):
         try:
-            member = await _bot.get_chat_member(int(_primary_chat_id), uid)
-            if not (getattr(member, "status", None) in {"member","administrator","creator"} or (getattr(member, "status", None)=="restricted" and bool(getattr(member,"is_member",False)))):
-                continue
-        except Exception:
+            target = datetime(year, month, day, tzinfo=today.tzinfo)
+        except ValueError:      # 29 февраля
             continue
-        live.append({
-            "user_id": uid,
-            "month": int(row["month"]),
-            "day": int(row["day"]),
-            "name": row["first_name"] or "участник",
-            "username": row["username"] or "",
-            "label": row["first_name"] or "участник",
-            "source": "manual",
-        })
-    return live
+        if target.date() >= today.date():
+            return (target.date() - today.date()).days
+    return 366
 
 
-async def _save_birthday_for_user(user_id: int, value: str, state: FSMContext | None = None):
-    parsed = _parse_birthday(value)
-    if not parsed:
-        return False
-    day, month = parsed
+def _save_birthday(user_id: int, day: int, month: int) -> None:
     _q(lambda conn: (conn.execute(
         "INSERT INTO jf_birthdays(chat_id,user_id,month,day,year,created_at) VALUES(?,?,?,?,NULL,?) "
         "ON CONFLICT(chat_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,year=NULL,created_at=excluded.created_at",
-        (int(_primary_chat_id), int(user_id), month, day, _utc_iso()),
-    ), conn.commit()))
-    if state:
-        await state.clear()
-    return True
+        (int(_primary_chat_id), int(user_id), month, day, _utc_iso())), conn.commit()))
+
+
+def _delete_birthday(user_id: int) -> bool:
+    def op(conn):
+        cur = conn.execute("DELETE FROM jf_birthdays WHERE chat_id=? AND user_id=?", (int(_primary_chat_id), int(user_id)))
+        conn.commit()
+        return cur.rowcount > 0
+    return bool(_q(op))
+
+
+def _saved_birthday(user_id: int) -> Optional[tuple[int, int]]:
+    row = _q(lambda conn: conn.execute("SELECT day,month FROM jf_birthdays WHERE chat_id=? AND user_id=?",
+                                       (int(_primary_chat_id), int(user_id))).fetchone())
+    return (int(row["day"]), int(row["month"])) if row else None
+
+
+_BDAY_HELP = ui.card("День рождения", ui.lines(
+    ui.bullet("Отправьте дату: 24.03 или «24 марта». Год не нужен."),
+    ui.bullet("«удалить» — убрать сохранённую дату.")))
 
 
 async def cmd_birthday(message: Message, state: FSMContext):
-    if message.chat.type != "private" or not message.from_user:
+    if not await cmdcfg.gate(message, "birthday"):
         return
-    if not await _member_is_active_in_primary(message.from_user.id):
-        await message.reply(f"{_fmt('Дни рождения')}\n\n✦ Эта функция доступна после вступления во флуд.")
+    uid = int(message.from_user.id)
+    args = _command_args(message)
+    if _is_owner(message) and args:                    # владелец задаёт дату другому
+        target, rest = await resolve_target(message, args)
+        if target and rest:
+            parsed = parse_birthday(rest)
+            if not parsed:
+                await message.answer(ui.fail("Дата: ДД.ММ, например 24.03."))
+                return
+            _save_birthday(int(target["user_id"]), *parsed)
+            await message.answer(ui.ok(f"{ui.person(target)}: {parsed[0]:02d}.{parsed[1]:02d}"))
+            return
+    if not await _is_active_member(uid) and not _is_owner(message):
+        await message.answer(ui.card("Дни рождения", ui.note("Доступно участникам флуда.")))
         return
-    parts = (message.text or "").split(maxsplit=1)
-    if len(parts) == 2:
-        if await _save_birthday_for_user(message.from_user.id, parts[1], state):
-            parsed = _parse_birthday(parts[1])
-            await message.reply(f"{_fmt('День рождения')}\n\n✅ Сохранено: {parsed[0]:02d}.{parsed[1]:02d}")
-        else:
-            await message.reply(f"{_fmt('День рождения')}\n\n✦ Формат: DD.MM, например 24.03")
+    if args:
+        await _store_birthday_text(message, state, args)
         return
+    current = _saved_birthday(uid)
     await state.set_state(BirthdayState.waiting_date)
-    await message.reply(f"{_fmt('День рождения')}\n\n✦ Укажите свою дату в формате DD.MM\n✦ Год указывать не нужно.")
+    head = ui.bullet(f"Сохранено сейчас: {current[0]:02d}.{current[1]:02d}") if current else None
+    await message.answer(ui.card("День рождения", head, _BDAY_HELP))
+
+
+async def _store_birthday_text(message: Message, state: FSMContext, text: str):
+    uid = int(message.from_user.id)
+    if text.strip().casefold() in {"удалить", "убрать", "delete", "-"}:
+        await state.clear()
+        await message.answer(ui.ok("Дата удалена.") if _delete_birthday(uid) else ui.note("Сохранённой даты не было."))
+        return
+    parsed = parse_birthday(text)
+    if not parsed:
+        await message.answer(ui.fail("Не понял дату. Пример: 24.03 или 24 марта."))
+        return
+    _save_birthday(uid, *parsed)
+    await state.clear()
+    await message.answer(ui.ok(f"Сохранено: {parsed[0]:02d}.{parsed[1]:02d}"))
 
 
 async def birthday_state_text(message: Message, state: FSMContext):
-    if message.chat.type != "private" or not message.from_user:
+    if not message.from_user:
         return
-    if not await _member_is_active_in_primary(message.from_user.id):
+    if not await _is_active_member(message.from_user.id) and not _is_owner(message):
         await state.clear()
         return
-    if await _save_birthday_for_user(message.from_user.id, message.text or "", state):
-        parsed = _parse_birthday(message.text or "")
-        await message.reply(f"{_fmt('День рождения')}\n\n✅ Сохранено: {parsed[0]:02d}.{parsed[1]:02d}")
-    else:
-        await message.reply(f"{_fmt('День рождения')}\n\n✦ Неверный формат. Укажите дату как DD.MM.")
+    await _store_birthday_text(message, state, message.text or "")
 
 
 async def cmd_birthdays(message: Message):
-    if message.chat.type != "private" or not message.from_user:
+    if not await cmdcfg.gate(message, "birthdays"):
         return
-    if not await _member_is_active_in_primary(message.from_user.id):
-        await message.reply(f"{_fmt('Дни рождения')}\n\n✦ Список доступен после вступления во флуд.")
+    uid = int(message.from_user.id)
+    if not await _is_active_member(uid) and not _is_owner(message):
+        await message.answer(ui.card("Дни рождения", ui.note("Список доступен участникам флуда.")))
         return
-    live = await _get_live_birthdays()
-    if not live:
-        await message.reply(f"{_fmt('Дни рождения')}\n\n🎂 Пока нет сохранённых дней рождения участников, находящихся во флуде.")
+    live = live_birthdays()
+    window = cmdcfg.get_int("birthdays", "window_days")
+    today = ui.local_now()
+    ordered = sorted(live, key=lambda r: days_until(r["month"], r["day"], today))
+    if window:
+        ordered = [r for r in ordered if days_until(r["month"], r["day"], today) <= window]
+    ordered = ordered[:cmdcfg.get_int("birthdays", "limit")]
+    if not ordered:
+        await message.answer(ui.card("Дни рождения", ui.note("Пока нет сохранённых дат участников, находящихся во флуде.")))
         return
-    now_dt = datetime.now(timezone.utc)
-    def dist(r):
-        current = r['month'] * 32 + r['day']
-        today = now_dt.month * 32 + now_dt.day
-        if current < today:
-            current += 12 * 32
-        return current - today
-    ordered = sorted(live, key=dist)
-    lines = [_fmt("Дни рождения"), ""]
-    for r in ordered[:50]:
-        name = f"@{r['username']}" if r['username'] else r['name']
-        lines.append(f"✦ {r['day']:02d}.{r['month']:02d} — {name}")
-    await message.reply("\n".join(lines))
+    items = []
+    for r in ordered:
+        left = days_until(r["month"], r["day"], today)
+        tail = "сегодня 🎉" if left == 0 else "завтра" if left == 1 else f"через {ui.days_word(left)}"
+        items.append(f"🎂 {r['day']:02d}.{r['month']:02d} — {ui.person(r['row'])} · {tail}")
+    await message.answer(ui.card("Дни рождения", "\n".join(items)))
 
 
-async def cmd_restlist(message: Message):
-    if message.chat.type not in {"private", "group", "supergroup"}:
+# --------------------------------------------------------------------------
+# Сводка
+# --------------------------------------------------------------------------
+
+def dashboard_text() -> str:
+    cid = int(_primary_chat_id)
+    now = _utc_iso()
+    active = _q(lambda conn: conn.execute("SELECT COUNT(*) AS c FROM group_members WHERE chat_id=? AND active=1", (cid,)).fetchone())["c"]
+    with_role = _q(lambda conn: conn.execute(
+        "SELECT COUNT(*) AS c FROM group_members WHERE chat_id=? AND active=1 AND role_key IS NOT NULL", (cid,)).fetchone())["c"]
+    rest = _q(lambda conn: conn.execute("SELECT COUNT(*) AS c FROM jf_rest WHERE chat_id=? AND active=1 AND end_at>?", (cid, now)).fetchone())["c"]
+    blocks = [ui.lines(ui.section("Флуд"), ui.kv("Активных участников", active), ui.kv("С назначенной ролью", with_role),
+                       ui.kv("Без роли", max(0, active - with_role)), ui.kv("На ресте", rest))]
+    if cmdcfg.get_bool("dashboard", "show_warnings"):
+        w = _q(lambda conn: conn.execute(
+            "SELECT COUNT(*) AS c, COUNT(DISTINCT user_id) AS u FROM jf_warnings WHERE chat_id=? AND removed_at IS NULL", (cid,)).fetchone())
+        blocks.append(ui.lines(ui.section("Предупреждения"), ui.kv("Активных", w["c"]), ui.kv("Участников с ними", w["u"])))
+    if cmdcfg.get_bool("dashboard", "show_awards"):
+        try:
+            counts = awards.CTX.queue.counts(cid)
+        except Exception:
+            counts = {}
+        blocks.append(ui.lines(ui.section("Награды"), ui.kv("Ждут выдачи", counts.get("ready", 0)), ui.kv("Выдано через очередь", counts.get("issued", 0))))
+    if cmdcfg.get_bool("dashboard", "show_birthdays"):
+        today = ui.local_now()
+        soon = [r for r in live_birthdays() if days_until(r["month"], r["day"], today) <= 7]
+        soon.sort(key=lambda r: days_until(r["month"], r["day"], today))
+        lines = [ui.section("Дни рождения (7 дней)")]
+        lines += [ui.bullet(f"{r['day']:02d}.{r['month']:02d} — {ui.person(r['row'])}") for r in soon[:6]] or [ui.bullet("никого")]
+        blocks.append(ui.lines(*lines))
+    return ui.card("Justice Faite · сводка", *blocks)
+
+
+async def cmd_dashboard(message: Message):
+    if not await cmdcfg.gate(message, "dashboard"):
         return
-    if message.chat.type == "private" and not _admin_only(message):
-        return
-    if message.chat.type in {"group", "supergroup"} and not _is_primary_chat(message.chat.id):
-        return
-    rows = _q(lambda conn: conn.execute(
-        "SELECT r.*,gm.username,gm.first_name FROM jf_rest r LEFT JOIN group_members gm ON gm.chat_id=r.chat_id AND gm.user_id=r.user_id WHERE r.chat_id=? AND r.active=1 AND r.end_at>? ORDER BY r.end_at",
-        (int(_primary_chat_id), _utc_iso()),
-    ).fetchall())
-    if not rows:
-        await message.reply(_fmt("Рестники") + "\n\n✦ Сейчас никто не находится на ресте.")
-        return
-    lines=[_fmt("Рестники"), ""]
-    for r in rows:
-        lines.append(f"🥹 {_mention_user(int(r['user_id']), r['first_name'] or 'участник', r['username'])} — до {str(r['end_at'])[:10]}")
-    await message.reply("\n".join(lines))
+    await _reply(message, "dashboard", dashboard_text())
+
+
+# --------------------------------------------------------------------------
+# Естественные команды во флуде
+# --------------------------------------------------------------------------
+
+async def natural_rest_command(message: Message):
+    await cmd_rest(message)
+
+
+async def natural_unrest_command(message: Message):
+    await cmd_unrest(message)
 
 
 async def natural_restlist_command(message: Message):
-    if message.chat.type not in {"group", "supergroup"} or not _is_primary_chat(message.chat.id):
-        return
     await cmd_restlist(message)
 
 
+# --------------------------------------------------------------------------
+# Фоновый обработчик: окончание реста, поздравления
+# --------------------------------------------------------------------------
+
+async def _announce_rest_end(row) -> None:
+    if not cmdcfg.get_bool("rest", "notify_end"):
+        return
+    template = cmdcfg.get_str("rest", "end_text")
+    member = dict(row)
+    member.setdefault("user_id", row["user_id"])
+    text = _render_html(template, name=_mention_html(member))
+    await _bot.send_message(int(_primary_chat_id), text, parse_mode="HTML")
+
+
+def _claim_birthday_notice(user_id: int, year: int) -> bool:
+    """True, если поздравление за этот год ещё не отправлялось (и теперь помечено отправленным)."""
+    def op(conn):
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO jf_birthday_notices(chat_id,user_id,year,sent_at) VALUES(?,?,?,?)",
+            (int(_primary_chat_id), int(user_id), int(year), _utc_iso()))
+        conn.commit()
+        return cur.rowcount == 1
+    return bool(_q(op))
+
+
+async def maintenance_tick() -> None:
+    now_dt = datetime.now(timezone.utc)
+    ended = _q(lambda conn: conn.execute(
+        "SELECT r.*,gm.username,gm.first_name FROM jf_rest r LEFT JOIN group_members gm "
+        "ON gm.chat_id=r.chat_id AND gm.user_id=r.user_id WHERE r.chat_id=? AND r.active=1 AND r.end_at<=?",
+        (int(_primary_chat_id), now_dt.isoformat())).fetchall())
+    for row in ended:
+        _q(lambda conn, r=row: (conn.execute(
+            "UPDATE jf_rest SET active=0,ended_notified_at=? WHERE chat_id=? AND user_id=? AND active=1",
+            (_utc_iso(), int(r["chat_id"]), int(r["user_id"]))), conn.commit()))
+        with suppress(Exception):
+            await _announce_rest_end(row)
+
+    if not cmdcfg.is_enabled("birthday_greet"):
+        return
+    local = ui.local_now()
+    if local.hour < cmdcfg.get_int("birthday_greet", "hour"):
+        return
+    template = cmdcfg.get_str("birthday_greet", "text")
+    for item in live_birthdays():
+        if int(item["month"]) != local.month or int(item["day"]) != local.day:
+            continue
+        claimed = _claim_birthday_notice(int(item["user_id"]), local.year)
+        if not claimed:
+            continue
+        with suppress(Exception):
+            await _bot.send_message(int(_primary_chat_id), _render_html(template, name=_mention_html(item["row"])), parse_mode="HTML")
+
+
 async def feature_maintenance_worker():
-    last_bday_date = None
     while True:
         try:
-            now_dt=datetime.now(timezone.utc)
-            ended = _q(lambda conn: conn.execute(
-                "SELECT r.*,gm.username,gm.first_name FROM jf_rest r LEFT JOIN group_members gm ON gm.chat_id=r.chat_id AND gm.user_id=r.user_id WHERE r.chat_id=? AND r.active=1 AND r.end_at<=?",
-                (int(_primary_chat_id), now_dt.isoformat()),
-            ).fetchall())
-            if ended:
-                _q(lambda conn: (conn.executemany(
-                    "UPDATE jf_rest SET active=0,ended_notified_at=? WHERE chat_id=? AND user_id=? AND active=1",
-                    [(_utc_iso(), int(r["chat_id"]), int(r["user_id"])) for r in ended],
-                ), conn.commit()))
-                for r in ended:
-                    with suppress(Exception):
-                        await _bot.send_message(int(_primary_chat_id), f"{_fmt('Рест окончен')}\n\n🥹 {_mention_user(int(r['user_id']), r['first_name'] or 'участник', r['username'])} снова свободен от реста.")
-            day_key=now_dt.date().isoformat()
-            if last_bday_date != day_key:
-                live = await _get_live_birthdays()
-                for row in live:
-                    if int(row["month"]) != now_dt.month or int(row["day"]) != now_dt.day:
-                        continue
-                    already=_q(lambda conn: conn.execute("SELECT 1 FROM jf_birthday_notices WHERE chat_id=? AND user_id=? AND year=?", (int(_primary_chat_id),int(row["user_id"]),now_dt.year)).fetchone())
-                    if already:
-                        continue
-                    _q(lambda conn,r=row: (conn.execute("INSERT OR IGNORE INTO jf_birthday_notices(chat_id,user_id,year,sent_at) VALUES(?,?,?,?)", (int(_primary_chat_id),int(r["user_id"]),now_dt.year,_utc_iso())),conn.commit()))
-                    with suppress(Exception):
-                        name = f"@{row['username']}" if row.get('username') else row.get('name') or 'участника'
-                        await _bot.send_message(int(_primary_chat_id), f"༺ 𓆩 ✧ 𓆪 ༻\n\n🎂 Сегодня день рождения у {name}!\n\n✦ Поздравляем от Justice Faite ♡")
-                last_bday_date=day_key
+            await maintenance_tick()
         except asyncio.CancelledError:
             raise
         except Exception:
-            pass
-        await asyncio.sleep(300)
+            logger.exception("maintenance tick failed")
+        await asyncio.sleep(60)
+
+
+# --------------------------------------------------------------------------
+# Регистрация
+# --------------------------------------------------------------------------
 
 def register_justice_features(ns: dict[str, Any]):
-    global _bot, _dp, _db, _db_op, _now, _role_for, _role_for_tag, _normalize_role
-    global _group_member_is_active, _upsert_group_member, _get_member, _assign_role_db_atomic
-    global _apply_member_tag, _finalize_role_assignment, _confirm_member, _lift_member_restriction
-    global _send_or_edit_welcome, _display_username, _primary_chat_id, _is_primary_chat, _admin_id, _register_user
+    global _bot, _dp, _db_op, _now, _upsert_group_member, _get_member
+    global _primary_chat_id, _admin_id, _is_primary_chat
     _bot = ns["bot"]
     _dp = ns["dp"]
-    _db = ns["db"]
     _db_op = ns["group_db_op"]
     _now = ns["now"]
-    _role_for = ns["role_for"]
-    _role_for_tag = ns.get("role_for_tag")
-    _normalize_role = ns["normalize_role"]
-    _group_member_is_active = ns["_chat_member_is_active"]
     _upsert_group_member = ns["upsert_group_member"]
     _get_member = ns["get_member"]
-    _assign_role_db_atomic = ns["assign_role_db_atomic"]
-    _apply_member_tag = ns["apply_member_tag"]
-    _finalize_role_assignment = ns["finalize_role_assignment"]
-    _confirm_member = ns["confirm_member"]
-    _lift_member_restriction = ns["lift_member_restriction"]
-    _send_or_edit_welcome = ns["send_or_edit_welcome"]
-    _display_username = ns["display_username_for_group"]
-    _primary_chat_id = ns["PRIMARY_CHAT_ID"]
+    _primary_chat_id = int(ns["PRIMARY_CHAT_ID"])
+    _admin_id = int(ns["ADMIN_ID"])
     _is_primary_chat = ns["is_primary_chat"]
-    _admin_id = ns["ADMIN_ID"]
-    _register_user = ns["register_user"]
 
-    # Schema exists before handlers can execute, but call again is idempotent and
-    # makes importing the module in simulations convenient.
     init_justice_features_db()
     seed_birthday_directory()
 
+    awards.register(
+        _dp, bot=_bot, owner_id=_admin_id, chat_id=_primary_chat_id, db_op=_db_op, now=_now,
+        active_members=_active_member_rows, lookup_member=lookup_member, issue_local_award=issue_local_award,
+    )
+
     private = F.chat.type == "private"
-    private_admin = private & (F.from_user.id == _admin_id)
+    group = F.chat.type.in_(GROUP_TYPES)
 
     _dp.message.register(cmd_birthday, Command("jf_birthday"), private)
     _dp.message.register(cmd_birthdays, Command("jf_birthdays"), private)
-    _dp.message.register(birthday_state_text, BirthdayState.waiting_date, private, F.text)
+    _dp.message.register(birthday_state_text, BirthdayState.waiting_date, private, F.text, ~F.text.startswith("/"))
 
-    _dp.message.register(handle_iris_olds_response, lambda m: m.chat.type == "private" and bool(m.from_user and m.from_user.id == _admin_id) and bool(m.text or m.caption) and bool(_q(lambda conn: conn.execute("SELECT 1 FROM jf_iris_scan WHERE chat_id=? AND status='waiting' LIMIT 1", (int(_primary_chat_id),)).fetchone())))
-    _dp.message.register(cmd_dashboard, Command("jf_dashboard"), private_admin)
-    _dp.message.register(cmd_awards_check, Command("jf_awards"), private_admin)
-    _dp.callback_query.register(handle_reward_mark, F.data.startswith("rewardmark:"))
-    _dp.callback_query.register(handle_reward_cancel, F.data.startswith("rewardcancel:"))
-    _dp.message.register(cmd_award, Command("jf_award"), private_admin)
-    _dp.message.register(cmd_iris_sync, Command("jf_iris_sync"), private_admin)
-    _dp.message.register(cmd_warn, Command("jf_warn"), private_admin)
-    _dp.message.register(cmd_warnings, Command("jf_warnings"), private_admin)
-    _dp.message.register(cmd_remove_warning, Command("jf_warn_remove"), private_admin)
-    _dp.message.register(cmd_rest, Command("jf_rest"), private_admin)
-    _dp.message.register(cmd_rest, Command("rest"), private_admin)
-    _dp.message.register(cmd_restlist, Command("jf_restlist"), private_admin)
+    _dp.message.register(cmd_dashboard, Command("jf_dashboard"))
+    _dp.message.register(cmd_warn, Command("jf_warn"))
+    _dp.message.register(cmd_warnings, Command("jf_warnings"))
+    _dp.message.register(cmd_remove_warning, Command("jf_warn_remove"))
+    _dp.message.register(cmd_rest, Command("rest", "jf_rest"))
+    _dp.message.register(cmd_unrest, Command("unrest"))
+    _dp.message.register(cmd_restlist, Command("jf_restlist", "restlist"))
 
     _dp.message.register(natural_restlist_command, F.text.regexp(r"(?iu)^\s*рестники\s*$"))
-    _dp.message.register(natural_rest_command, F.text.regexp(r"(?iu)^\s*выдать\s+рест\s+.+$"))
-
-    # Persistent DB-driven routers come before FSM-specific handlers. This makes
-    # the application flow recover even if MemoryStorage is cleared/restarted.
-
+    _dp.message.register(natural_rest_command, F.text.regexp(r"(?iu)^\s*выдать\s+рест(?:\s+.+)?$"))
+    _dp.message.register(natural_unrest_command, F.text.regexp(r"(?iu)^\s*снять\s+рест(?:\s+.+)?$"))
