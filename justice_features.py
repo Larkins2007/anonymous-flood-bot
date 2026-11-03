@@ -54,6 +54,22 @@ def _q(fn, *args):
     return _db_op(fn, *args)
 
 
+def _effective_primary_chat_id() -> int:
+    """Resolve a stale/missing configured ID from a sole persisted binding."""
+    configured = int(_primary_chat_id or 0)
+    if _db_op is None:
+        return configured
+    try:
+        ids = _q(lambda conn: [int(row[0]) for row in conn.execute(
+            "SELECT group_chat_id FROM managed_group ORDER BY group_chat_id"
+        ).fetchall()])
+    except Exception:
+        return configured
+    if configured in ids:
+        return configured
+    return ids[0] if len(ids) == 1 else configured
+
+
 def _utc_iso() -> str:
     return _now() if _now else datetime.now(timezone.utc).isoformat()
 
@@ -163,6 +179,8 @@ def init_justice_features_db() -> None:
             );
             """
         )
+        # Migrate away from the old, incorrect character-birthday inference.
+        conn.execute("DELETE FROM jf_birthday_directory WHERE source='community_seed'")
         rest_cols = {row[1] for row in conn.execute("PRAGMA table_info(jf_rest)").fetchall()}
         if "ended_notified_at" not in rest_cols:
             conn.execute("ALTER TABLE jf_rest ADD COLUMN ended_notified_at TEXT")
@@ -199,7 +217,7 @@ def init_justice_features_db() -> None:
 
 def _active_member_rows() -> list[dict[str, Any]]:
     rows = _q(lambda conn: conn.execute(
-        "SELECT * FROM group_members WHERE chat_id=? AND active=1", (int(_primary_chat_id),)).fetchall())
+        "SELECT * FROM group_members WHERE chat_id=? AND active=1", (_effective_primary_chat_id(),)).fetchall())
     return [dict(r) for r in rows]
 
 
@@ -699,19 +717,9 @@ async def cmd_restlist(message: Message):
 # Дни рождения
 # --------------------------------------------------------------------------
 
-BIRTHDAY_SEEDS = [
-    (2, 7, "Кэйя"), (2, 7, "Лини"), (2, 12, "Хайтам"), (2, 27, "Ноэлль"), (2, 29, "Бай Чжу"),
-    (3, 4, "Водяница"), (3, 18, "Кли"),
-    (4, 3, "Ризли"), (4, 10, "Тиори"), (4, 22, "Альбедо"), (4, 30, "Ной"),
-    (5, 13, "Странник"),
-    (6, 12, "Иллуги"), (6, 24, "Тарталья"), (6, 30, "Дурин"),
-    (7, 16, "Митя"),
-    (8, 2, "Диона"), (8, 18, "Навия"),
-    (9, 2, "Сяо"), (9, 26, "Рэйндоттир"),
-    (10, 21, "Чжун Ли"), (10, 25, "Цици"),
-    (11, 4, "Люмин"), (11, 12, "Аяка"), (11, 13, "Лаума"), (11, 15, "Венти"), (11, 28, "Капитано"),
-    (12, 27, "Кавех"), (12, 30, "Ху Тао"),
-]
+# Birthday dates are personal data: never infer them from Genshin roles,
+# display names, tags, or a built-in character calendar. Only explicit entries
+# in jf_birthdays are shown.
 
 
 def parse_birthday(value: str) -> Optional[tuple[int, int]]:
@@ -727,53 +735,42 @@ def parse_birthday(value: str) -> Optional[tuple[int, int]]:
     return (day, month) if _valid_day_month(day, month) else None
 
 
-def _person_key(value: str) -> str:
-    return re.sub(r"[^a-zа-я0-9]+", "", (value or "").casefold().replace("ё", "е"))
-
-
 def seed_birthday_directory() -> None:
-    if not _primary_chat_id:
+    """Legacy migration hook: remove the old character-to-member birthday seeds.
+
+    The previous implementation matched a user's selected Genshin role to a
+    character birthday and displayed it as the member's personal birthday.
+    That inference was incorrect and is intentionally disabled.
+    """
+    if not _db_op:
         return
-
-    def op(conn):
-        conn.executemany(
-            "INSERT OR IGNORE INTO jf_birthday_directory(chat_id,person_label,person_key,month,day,source) VALUES(?,?,?,?,?,?)",
-            [(int(_primary_chat_id), label, _person_key(label), month, day, "community_seed") for month, day, label in BIRTHDAY_SEEDS])
-        conn.commit()
-
-    _q(op)
-
-
-def _resolve_seed(seed_row, members: list[dict]) -> Optional[dict]:
-    label = _person_key(seed_row["person_label"])
-    hits = []
-    for m in members:
-        keys = {_person_key(m.get(k, "")) for k in ("first_name", "last_name", "username", "role_name", "role_key")}
-        keys.add(_person_key(f"{m.get('first_name', '')} {m.get('last_name', '')}"))
-        if label and label in keys:
-            hits.append(m)
-    return hits[0] if len(hits) == 1 else None
+    try:
+        _q(lambda conn: (conn.execute(
+            "DELETE FROM jf_birthday_directory WHERE source='community_seed'"
+        ), conn.commit()))
+    except Exception:
+        logger.exception("Could not remove legacy inferred birthday entries")
 
 
 def live_birthdays() -> list[dict]:
-    """Дни рождения тех, кто сейчас в флуде: личные даты + справочник сообщества."""
+    """Only dates explicitly saved by the participant or entered by the owner."""
     members = _active_member_rows()
     by_id = {int(m["user_id"]): m for m in members}
-    result, seen = [], set()
-    manual = _q(lambda conn: conn.execute("SELECT * FROM jf_birthdays WHERE chat_id=?", (int(_primary_chat_id),)).fetchall())
+    manual = _q(lambda conn: conn.execute(
+        "SELECT * FROM jf_birthdays WHERE chat_id=? ORDER BY month,day",
+        (int(_effective_primary_chat_id()),),
+    ).fetchall())
+    result = []
     for row in manual:
         member = by_id.get(int(row["user_id"]))
         if not member:
             continue
-        seen.add(int(row["user_id"]))
-        result.append({"user_id": int(row["user_id"]), "month": int(row["month"]), "day": int(row["day"]), "row": member})
-    seeds = _q(lambda conn: conn.execute("SELECT * FROM jf_birthday_directory WHERE chat_id=? ORDER BY month,day",
-                                         (int(_primary_chat_id),)).fetchall())
-    for seed in seeds:
-        member = _resolve_seed(seed, members)
-        if member and int(member["user_id"]) not in seen:
-            seen.add(int(member["user_id"]))
-            result.append({"user_id": int(member["user_id"]), "month": int(seed["month"]), "day": int(seed["day"]), "row": member})
+        result.append({
+            "user_id": int(row["user_id"]),
+            "month": int(row["month"]),
+            "day": int(row["day"]),
+            "row": member,
+        })
     return result
 
 
@@ -793,12 +790,12 @@ def _save_birthday(user_id: int, day: int, month: int) -> None:
     _q(lambda conn: (conn.execute(
         "INSERT INTO jf_birthdays(chat_id,user_id,month,day,year,created_at) VALUES(?,?,?,?,NULL,?) "
         "ON CONFLICT(chat_id,user_id) DO UPDATE SET month=excluded.month,day=excluded.day,year=NULL,created_at=excluded.created_at",
-        (int(_primary_chat_id), int(user_id), month, day, _utc_iso())), conn.commit()))
+        (int(_effective_primary_chat_id()), int(user_id), month, day, _utc_iso())), conn.commit()))
 
 
 def _delete_birthday(user_id: int) -> bool:
     def op(conn):
-        cur = conn.execute("DELETE FROM jf_birthdays WHERE chat_id=? AND user_id=?", (int(_primary_chat_id), int(user_id)))
+        cur = conn.execute("DELETE FROM jf_birthdays WHERE chat_id=? AND user_id=?", (int(_effective_primary_chat_id()), int(user_id)))
         conn.commit()
         return cur.rowcount > 0
     return bool(_q(op))
@@ -806,7 +803,7 @@ def _delete_birthday(user_id: int) -> bool:
 
 def _saved_birthday(user_id: int) -> Optional[tuple[int, int]]:
     row = _q(lambda conn: conn.execute("SELECT day,month FROM jf_birthdays WHERE chat_id=? AND user_id=?",
-                                       (int(_primary_chat_id), int(user_id))).fetchone())
+                                       (int(_effective_primary_chat_id()), int(user_id))).fetchone())
     return (int(row["day"]), int(row["month"])) if row else None
 
 
@@ -935,7 +932,7 @@ async def cmd_birthdays(message: Message):
 # --------------------------------------------------------------------------
 
 def dashboard_text() -> str:
-    cid = int(_primary_chat_id)
+    cid = _effective_primary_chat_id()
     now = _utc_iso()
     active = _q(lambda conn: conn.execute("SELECT COUNT(*) AS c FROM group_members WHERE chat_id=? AND active=1", (cid,)).fetchone())["c"]
     with_role = _q(lambda conn: conn.execute(
@@ -1063,6 +1060,22 @@ async def feature_maintenance_worker():
 # --------------------------------------------------------------------------
 # Регистрация
 # --------------------------------------------------------------------------
+
+def set_primary_chat_id(chat_id: int) -> None:
+    """Apply the database-resolved primary group after backup restoration.
+
+    The module is imported before `main()` restores a missing SQLite file, so
+    its first registration can see an empty/default environment value. The
+    authoritative persisted group ID is applied again during startup.
+    """
+    global _primary_chat_id
+    _primary_chat_id = int(chat_id)
+    # The awards module captures its chat ID at registration time; keep its
+    # queue and duplicate checks aligned with the resolved group as well.
+    if awards.CTX.queue is not None:
+        awards.CTX.chat_id = _primary_chat_id
+    if _db_op is not None:
+        seed_birthday_directory()
 
 def register_justice_features(ns: dict[str, Any]):
     global _bot, _dp, _db_op, _now, _upsert_group_member, _get_member

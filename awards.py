@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import difflib
+import html
 import logging
 import re
 import unicodedata
@@ -148,8 +149,11 @@ def identities_in_range(text: str, entities, start: int, end: int, u16: Optional
         if kind == "text_mention" and getattr(ent, "user", None) is not None:
             u = ent.user
             result.append(Identity("id", int(u.id), (getattr(u, "username", "") or "").lower()))
-        elif kind == "text_link":
-            url = str(getattr(ent, "url", "") or "")
+        elif kind in {"text_link", "url"}:
+            # Iris may attach a hidden profile link (text_link) or print a
+            # literal t.me URL (url). Both can carry a stable Telegram ID or
+            # username. For `url`, the URL itself is the selected text.
+            url = str(getattr(ent, "url", "") or "") if kind == "text_link" else text[e_start:e_end]
             m = _TG_ID.search(url)
             if m:
                 result.append(Identity("id", int(m.group(1))))
@@ -193,7 +197,13 @@ def clean_name(fragment: str) -> str:
 
 
 def key_of(value: str) -> str:
-    return re.sub(r"[^a-zа-я0-9]+", "", (value or "").casefold().replace("ё", "е"))
+    # NFKD collapses mathematical/script Unicode alphabets into their base
+    # letters (e.g. 𝐃𝐞𝐛𝐨𝐫𝐚 -> debora). Remove combining marks and punctuation,
+    # but keep both Cyrillic and Latin letters so decorated names can match
+    # the ordinary Telegram profile stored in the database.
+    value = unicodedata.normalize("NFKD", str(value or "")).casefold().replace("ё", "е")
+    value = "".join(ch for ch in value if not unicodedata.category(ch).startswith("M"))
+    return re.sub(r"[^a-zа-я0-9]+", "", value)
 
 
 def parse_olds(text: str, entities=None) -> list[OldEntry]:
@@ -241,7 +251,12 @@ def _member_keys(m: dict) -> set[str]:
     keys = {
         key_of(f"{first} {last}"), key_of(first), key_of(last),
         key_of(m.get("username") or ""), key_of(m.get("role_name") or ""),
+        key_of(m.get("display_name") or ""), key_of(m.get("full_name") or ""),
     }
+    aliases = m.get("aliases") or ()
+    if isinstance(aliases, str):
+        aliases = [aliases]
+    keys.update(key_of(alias) for alias in aliases)
     tag = m.get("tag") or ""
     keys.add(key_of(tag))
     return {k for k in keys if len(k) >= 3}
@@ -288,26 +303,42 @@ def match_entry(entry: OldEntry, members: list[dict]) -> Match:
 
     line_key = key_of(entry.name or entry.raw)
     if line_key:
+        # Exact normalized aliases take precedence over fuzzy matching.
+        exact = []
+        for m in members:
+            if line_key in _member_keys(m):
+                exact.append(m)
+        exact_ids = {int(m["user_id"]) for m in exact}
+        if len(exact_ids) == 1:
+            return _finish(entry, exact[0])
+        if len(exact_ids) > 1:
+            return Match(entry, None, "ambiguous")
+
         scored = []
         for m in members:
             keys = _member_keys(m)
-            best = max((len(k) for k in keys if k and k in line_key), default=0)
-            if best:
+            # Substring matches are useful when Iris decorates a Telegram
+            # name with symbols or a counter, but short fragments are unsafe.
+            best = max((len(k) for k in keys if len(k) >= 5 and (k in line_key or line_key in k)), default=0)
+            if best >= 5:
                 scored.append((best, m))
         if scored:
             scored.sort(key=lambda x: -x[0])
-            top = [m for score, m in scored if score == scored[0][0]]
-            if len(top) == 1:
-                return _finish(entry, top[0])
+            top_ids = {int(m["user_id"]) for score, m in scored if score == scored[0][0]}
+            if len(top_ids) == 1:
+                chosen = next(m for score, m in scored if score == scored[0][0])
+                return _finish(entry, chosen)
             return Match(entry, None, "ambiguous")
 
         fuzzy = []
         for m in members:
-            for k in _member_keys(m):
-                fuzzy.append((difflib.SequenceMatcher(None, k, line_key).ratio(), m))
+            score = max((difflib.SequenceMatcher(None, k, line_key).ratio()
+                         for k in _member_keys(m) if len(k) >= 4 and len(line_key) >= 4), default=0.0)
+            if score:
+                fuzzy.append((score, m))
         fuzzy.sort(key=lambda x: -x[0])
         if fuzzy and fuzzy[0][0] >= 0.82:
-            runner = next((r for r, m in fuzzy[1:] if m["user_id"] != fuzzy[0][1]["user_id"]), 0.0)
+            runner = next((r for r, m in fuzzy[1:] if int(m["user_id"]) != int(fuzzy[0][1]["user_id"])), 0.0)
             if fuzzy[0][0] - runner >= 0.08:
                 return _finish(entry, fuzzy[0][1])
             return Match(entry, None, "ambiguous")
@@ -357,7 +388,10 @@ def eligible_tiers(days: float, tiers: list[Tier], mode: str) -> list[Tier]:
 
 
 def build_command(prefix: str, word: str, level: int, username: str, description: str) -> str:
-    head = f"{prefix}{word} {int(level)} @{username.lstrip('@')}"
+    target = str(username or "").strip()
+    if not target.startswith("<a "):
+        target = "@" + target.lstrip("@")
+    head = f"{prefix}{word} {int(level)} {target}"
     description = (description or "").strip()
     return f"{head}\n{description}" if description else head
 
@@ -528,9 +562,11 @@ def make_plan(matches: list[Match], *, chat_id: int, tiers: list[Tier], mode: st
     for match in matches:
         entry = match.entry
         if match.status == "no_username":
+            # A known Telegram ID is enough to create a text_mention entity.
+            # The command message is sent as HTML so forwarding it to Iris
+            # retains the clickable profile mention even without @username.
             if eligible_tiers(entry.days, tiers, mode):
                 plan.no_username.append(ui.person(match.member) + f" — {entry.age_text}")
-            continue
         if match.status == "ambiguous":
             plan.ambiguous.append(entry.name or entry.raw)
             continue
@@ -555,8 +591,18 @@ def make_plan(matches: list[Match], *, chat_id: int, tiers: list[Tier], mode: st
             if state:
                 plan.already += 1
                 continue
-            description = describe(template, title=tier.title, age=entry.age_text, days=int(entry.days), name=ui.person(member))
-            command = build_command(prefix, word, tier.level, member["username"], description)
+            # The automatic oldies command is deliberately minimal and
+            # deterministic: exactly the configured tier label on line two.
+            # Ignore legacy desc_template values that appended extra prose.
+            description = (str(tier.title or f"{tier.days} дней в Justice Faite").strip().rstrip(".")) + "."
+            username = str(member.get("username") or "").strip().lstrip("@")
+            if username:
+                target = "@" + username
+            else:
+                uid = int(member["user_id"])
+                label = html.escape(ui.person(member) or f"ID {uid}", quote=True)
+                target = f'<a href="tg://user?id={uid}">{label}</a>'
+            command = build_command(prefix, word, tier.level, target, description)
             plan.items.append(PlanItem(member, tier, entry, command, description))
     return plan
 
@@ -626,7 +672,12 @@ def _queue_markup(item_id: int):
 async def _send_plain(chat_id: int, text: str, markup=None):
     for attempt in (1, 2):
         try:
-            return await CTX.bot.send_message(chat_id, text, reply_markup=markup)
+            kwargs = {"reply_markup": markup}
+            if "tg://user?id=" in (text or ""):
+                # Preserve a user without @username as a Telegram text_mention
+                # when the owner forwards the generated command to Iris.
+                kwargs["parse_mode"] = "HTML"
+            return await CTX.bot.send_message(chat_id, text, **kwargs)
         except TelegramRetryAfter as exc:
             await asyncio.sleep(float(getattr(exc, "retry_after", 1) or 1) + 0.5)
         except Exception:
@@ -743,7 +794,9 @@ async def process_olds(message: Message, state: FSMContext):
         summary.append(ui.kv("Ещё не дошли до порога", plan.young))
     extra = []
     if plan.no_username:
-        extra.append(ui.lines(ui.section("Нет @username — выдайте вручную"), *[ui.bullet(x) for x in plan.no_username[:10]]))
+        extra.append(ui.note(
+            f"Без @username: {len(plan.no_username)}. В командах использовано упоминание Telegram-профиля по ID."
+        ))
     if plan.unknown or plan.ambiguous:
         names = [x for x in (plan.unknown + plan.ambiguous)[:10]]
         extra.append(ui.lines(ui.section("Не удалось определить участника"), *[ui.bullet(ui.short(x, 50)) for x in names]))

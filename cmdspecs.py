@@ -15,7 +15,7 @@ DEFAULT_WELCOME = (
 )
 DEFAULT_BIRTHDAY_TEXT = "🎂 Сегодня день рождения у {name}!\n\n✦ Поздравляем от Justice Faite ♡"
 DEFAULT_REST_END_TEXT = "🥹 {name} снова свободен от реста."
-DEFAULT_AWARD_DESC = "{title}. Участник находится во флуде {age}."
+DEFAULT_AWARD_DESC = "{title}."
 
 
 def _tier(n: int, days: int, level: int, title: str) -> tuple:

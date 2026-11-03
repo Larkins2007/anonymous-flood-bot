@@ -236,6 +236,7 @@ EXTRA = [
     ("memory_view", "Память проекта", "🗂️", "system", ("/jf_memory",), "owner", "private", "Просмотреть структурированную память проекта."),
     ("memory_save", "Сохранить память", "📝", "system", ("/jf_memory_save",), "owner", "private", "Добавить новую запись в память проекта."),
     ("memory_search", "Поиск по памяти", "🔎", "system", ("/jf_memory_search",), "owner", "private", "Найти сохранённые сообщения и требования."),
+    ("chatlog_status", "Архив переписки флуда", "📚", "system", ("/jf_chatlog",), "owner", "private", "Показать статистику архива сообщений флуда и технических логов."),
 
     # Free community raffles and bounded cleanup.
     ("raffles_help", "Справка по розыгрышам", "🎉", "events", ("/jf_raffles",), "members", "Справка по бесплатным розыгрышам."),

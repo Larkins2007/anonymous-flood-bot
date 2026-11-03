@@ -4443,6 +4443,48 @@ def group_db_op(callback, *args):
     return db_transaction(callback, *args)
 
 
+def resolve_primary_chat_id(configured: Optional[int] = None) -> int:
+    """Resolve the primary flood from its persisted managed-group binding.
+
+    A restored SQLite backup may contain the authoritative group binding while
+    an old/empty environment variable still points at 0 or another chat. When
+    exactly one group is bound, that row is the single source of truth; this
+    prevents dashboards, role capture and awards from querying an empty chat ID.
+    Multiple bindings still require an explicit matching PRIMARY_CHAT_ID.
+    """
+    configured = int(PRIMARY_CHAT_ID if configured is None else configured)
+    try:
+        rows = group_db_op(lambda conn: conn.execute(
+            "SELECT group_chat_id FROM managed_group ORDER BY group_chat_id"
+        ).fetchall())
+        bound = [int(row["group_chat_id"]) for row in rows]
+    except Exception:
+        logger.exception("Could not read the managed-group binding")
+        bound = []
+
+    if configured < 0 and configured in bound:
+        return configured
+    if len(bound) == 1:
+        resolved = bound[0]
+        if configured != resolved:
+            logger.warning(
+                "PRIMARY_CHAT_ID mismatch: configured=%s, database binding=%s. "
+                "Using the single persisted managed group.", configured, resolved,
+            )
+        return resolved
+    if configured < 0:
+        return configured
+    if len(bound) > 1:
+        raise RuntimeError(
+            "Several managed groups are stored in the database. Set PRIMARY_CHAT_ID "
+            "to one of their exact negative Telegram chat IDs."
+        )
+    raise RuntimeError(
+        "PRIMARY_CHAT_ID is missing/invalid and the database has no single managed-group binding. "
+        "Set PRIMARY_CHAT_ID to the negative Telegram supergroup ID or bind one group first."
+    )
+
+
 def upsert_group_member(chat_id, user, *, active=True, role_key=None, role_name=None, tag=None, confirmed=False, welcome_message_id=None, tag_set_by_bot=None):
     def op(conn):
         existing = conn.execute("SELECT * FROM group_members WHERE chat_id=? AND user_id=?", (chat_id, user.id)).fetchone()
@@ -4712,7 +4754,19 @@ async def sync_member_tag(chat_id, user_id, *, user=None, refresh_roster=False, 
     previous=get_member(chat_id,target.id)
     prev_role=role_for(previous["role_name"]) if previous and previous["role_name"] else None
     if tag_from_message and previous and bool(previous["active"]) and (previous["tag"] or "") == actual:
-        return prev_role or (role_for_tag(actual) if actual else None)
+        observed_role = role_for_tag(actual) if actual else None
+        saved_key = normalize_role(previous["role_key"] or "")
+        observed_key = normalize_role(observed_role["name"]) if observed_role else ""
+        # Do not short-circuit when the tag was stored earlier but role_key /
+        # role_name was not. Re-process it so the role table is backfilled.
+        if observed_role and prev_role and saved_key == observed_key:
+            return prev_role
+        if actual and not observed_role and prev_role:
+            # Unknown non-empty tags are not enough to erase a previously
+            # recognized role; keep the last trusted assignment.
+            return prev_role
+        if not actual and not previous["role_key"] and not previous["role_name"]:
+            return None
     upsert_group_member(chat_id,target,active=active,tag=actual,confirmed=bool(previous["confirmed"]) if previous else False,tag_set_by_bot=None)
     note_roster_user(chat_id,target)
     if not active: return None
@@ -6865,7 +6919,8 @@ async def setup_commands():
     console_command = BotCommand(command="jf_console", description="🧠 Личная консоль владельца")
     memory_command = BotCommand(command="jf_memory", description="🗂️ Память и требования проекта")
     memory_save_command = BotCommand(command="jf_memory_save", description="📝 Сохранить блок памяти проекта")
-    memory_search_command = BotCommand(command="jf_memory_search", description="🔎 Найти запись в архиве ЛС")
+    memory_search_command = BotCommand(command="jf_memory_search", description="🔎 Поиск по памяти, флуду и логам")
+    chatlog_command = BotCommand(command="jf_chatlog", description="📚 Состояние архива переписки и логов")
     console_refresh_command = BotCommand(command="jf_console_refresh", description="🔄 Обновить личную консоль")
     group_extras = (profile_command, reputation_command, reports_command, timers_command,
                     automod_command, fun_command, network_command, raffles_command,
@@ -6890,7 +6945,7 @@ async def setup_commands():
         with suppress(Exception):
             await bot.set_my_commands([], scope=scope)
 
-    for item in (console_command, console_refresh_command, memory_command, memory_save_command, memory_search_command):
+    for item in (console_command, console_refresh_command, memory_command, memory_save_command, memory_search_command, chatlog_command):
         if all(c.command != item.command for c in owner_private):
             owner_private.insert(0, item)
 
@@ -9605,16 +9660,13 @@ def validate_database_bootstrap_policy(database_was_present: bool, database_vali
 
 
 async def main():
-    global DELIVERY_QUEUE, BROADCAST_QUEUE, FATAL_EVENT
+    global DELIVERY_QUEUE, BROADCAST_QUEUE, FATAL_EVENT, PRIMARY_CHAT_ID
 
     logger.info("Starting Justice Faite Manager...")
 
     # One authoritative configuration for the primary flood and owner console.
     if ADMIN_ID <= 0:
         raise RuntimeError("ADMIN_ID is missing or invalid. Set it to the numeric owner Telegram ID.")
-    if PRIMARY_CHAT_ID >= 0:
-        raise RuntimeError("PRIMARY_CHAT_ID is missing or invalid. Set the negative Telegram supergroup ID.")
-
     # A missing/invalid DB must never silently become a new empty DB. A fresh
     # installation is allowed only when the operator explicitly opts in once.
     os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
@@ -9643,6 +9695,20 @@ async def main():
     init_db()
     migrate_db()
     init_group_db()
+    # Restore/bind resolution must happen after SQLite recovery and group-table
+    # initialization, but before any feature seeds, role middleware or workers
+    # begin reading PRIMARY_CHAT_ID.
+    PRIMARY_CHAT_ID = resolve_primary_chat_id(PRIMARY_CHAT_ID)
+    if PRIMARY_CHAT_ID >= 0:
+        raise RuntimeError("PRIMARY_CHAT_ID is invalid. The primary group ID must be negative.")
+    JF_CONSOLE.primary_chat_id = PRIMARY_CHAT_ID
+    cmdcfg.configure(bot=bot, owner_id=ADMIN_ID, primary_chat_id=PRIMARY_CHAT_ID, manager=JF_MANAGER)
+    try:
+        import justice_features as _justice_features
+        _justice_features.set_primary_chat_id(PRIMARY_CHAT_ID)
+    except Exception:
+        logger.exception("Could not apply the resolved primary chat ID to community features")
+        raise
     # Load the known username roster once per database; unresolved names remain
     # visibly pending until Telegram supplies a real user ID from an update.
     seed_participant_roster()

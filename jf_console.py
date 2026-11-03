@@ -17,16 +17,20 @@ import sqlite3
 import tempfile
 import threading
 from contextlib import suppress
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger("justice-faite-console")
-PROJECT_VERSION = "0.7.3"
+PROJECT_VERSION = "0.7.6"
 BACKUP_MARKER = "JF_DB_BACKUP_V1"
 BACKUP_INTERVAL_SECONDS = 300
+CHAT_LOG_RETENTION_DAYS = max(1, min(int(os.getenv("JF_CHAT_LOG_RETENTION_DAYS", "30")), 365))
+CHAT_LOG_MAX_ROWS = max(1000, min(int(os.getenv("JF_CHAT_LOG_MAX_ROWS", "25000")), 200000))
+RUNTIME_LOG_MAX_ROWS = max(500, min(int(os.getenv("JF_RUNTIME_LOG_MAX_ROWS", "10000")), 100000))
+CHAT_ARCHIVE_ENABLED = os.getenv("JF_CHAT_ARCHIVE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
 
 
 def utcnow() -> str:
@@ -56,11 +60,15 @@ def _pack_html_blocks(blocks, max_chars: int = 3500):
 
 
 def _is_sensitive_message(value: str) -> bool:
-    """Avoid archiving obvious credentials accidentally pasted into the owner DM."""
+    """Detect common credentials before any chat text is stored in the archive."""
     patterns = (
         r"\b\d{5,12}:[A-Za-z0-9_-]{25,}\b",  # Telegram bot token
-        r"(?i)\b(?:password|passwd|пароль|bot[_ -]?token|api[_ -]?key|secret)\s*[:=]",
+        r"(?i)\b(?:password|passwd|пароль|bot[_ -]?token|api[_ -]?key|secret|access[_ -]?token|refresh[_ -]?token)\s*[:=]",
         r"(?i)\b(?:ключ доступа|секретный ключ)\s*[:=]",
+        r"(?i)\bauthorization\s*[:=]\s*bearer\s+\S+",
+        r"(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{16,}",
+        r"(?i)\b(?:x-api-key|client_secret|private_key)\s*[:=]",
+        r"(?i)[?&](?:token|access_token|api_key|secret)=([^&\s]+)",
     )
     return any(re.search(pattern, value or "") for pattern in patterns)
 
@@ -133,7 +141,38 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_jf_owner_message_log_created
                     ON jf_owner_message_log(created_at DESC);
+                CREATE TABLE IF NOT EXISTS jf_chat_message_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    direction TEXT NOT NULL DEFAULT 'in',
+                    sender_user_id INTEGER NOT NULL DEFAULT 0,
+                    sender_chat_id INTEGER,
+                    sender_username TEXT NOT NULL DEFAULT '',
+                    sender_name TEXT NOT NULL DEFAULT '',
+                    message_type TEXT NOT NULL DEFAULT 'text',
+                    body TEXT NOT NULL DEFAULT '',
+                    reply_to_message_id INTEGER,
+                    message_at TEXT NOT NULL,
+                    edited_at TEXT,
+                    stored_at TEXT NOT NULL,
+                    UNIQUE(chat_id, message_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_jf_chat_message_log_date
+                    ON jf_chat_message_log(chat_id, message_at DESC);
+                CREATE INDEX IF NOT EXISTS idx_jf_chat_message_log_sender
+                    ON jf_chat_message_log(chat_id, sender_user_id, message_at DESC);
+                CREATE TABLE IF NOT EXISTS jf_runtime_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    created_at TEXT NOT NULL,
+                    level TEXT NOT NULL,
+                    logger_name TEXT NOT NULL,
+                    message TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_jf_runtime_log_date
+                    ON jf_runtime_log(created_at DESC);
             """)
+            self._prune_archive_conn(conn)
             for category, title, body, source in SEED_MEMORY:
                 conn.execute(
                     "INSERT OR IGNORE INTO jf_project_memory(key,category,title,body,source,updated_at) VALUES(?,?,?,?,?,?)",
@@ -196,6 +235,126 @@ class Store:
         except sqlite3.Error:
             return 0
 
+    @staticmethod
+    def _prune_archive_conn(conn):
+        cutoff = (datetime.now(timezone.utc) - timedelta(days=CHAT_LOG_RETENTION_DAYS)).isoformat(timespec="seconds")
+        # Retention follows the original message timestamp; editing an old
+        # message must not extend the archive lifetime for that content.
+        conn.execute("DELETE FROM jf_chat_message_log WHERE message_at < ?", (cutoff,))
+        conn.execute("DELETE FROM jf_runtime_log WHERE created_at < ?", (cutoff,))
+        conn.execute(
+            "DELETE FROM jf_chat_message_log WHERE id NOT IN "
+            "(SELECT id FROM jf_chat_message_log ORDER BY id DESC LIMIT ?)",
+            (CHAT_LOG_MAX_ROWS,),
+        )
+        conn.execute(
+            "DELETE FROM jf_runtime_log WHERE id NOT IN "
+            "(SELECT id FROM jf_runtime_log ORDER BY id DESC LIMIT ?)",
+            (RUNTIME_LOG_MAX_ROWS,),
+        )
+
+    def archive_chat_message(self, *, chat_id: int, message_id: int, direction: str,
+                             sender_user_id: int = 0, sender_chat_id: int | None = None,
+                             sender_username: str = "", sender_name: str = "",
+                             message_type: str = "text", body: str = "",
+                             reply_to_message_id: int | None = None,
+                             message_at: str | None = None, edited_at: str | None = None) -> bool:
+        if not CHAT_ARCHIVE_ENABLED or int(message_id or 0) <= 0:
+            return False
+        text = str(body or "").strip()
+        if _is_sensitive_message(text):
+            text = "[сообщение скрыто: похоже на секрет или учётные данные]"
+        if len(text) > 4000:
+            text = text[:3980] + "… [обрезано]"
+        try:
+            def op(conn):
+                cur = conn.execute(
+                    "INSERT INTO jf_chat_message_log "
+                    "(chat_id,message_id,direction,sender_user_id,sender_chat_id,sender_username,sender_name,"
+                    "message_type,body,reply_to_message_id,message_at,edited_at,stored_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "ON CONFLICT(chat_id,message_id) DO UPDATE SET "
+                    "direction=excluded.direction,sender_user_id=excluded.sender_user_id,"
+                    "sender_chat_id=excluded.sender_chat_id,sender_username=excluded.sender_username,"
+                    "sender_name=excluded.sender_name,message_type=excluded.message_type,body=excluded.body,"
+                    "reply_to_message_id=excluded.reply_to_message_id,"
+                    "edited_at=COALESCE(excluded.edited_at,jf_chat_message_log.edited_at),stored_at=excluded.stored_at",
+                    (int(chat_id), int(message_id), direction if direction in {"in", "out"} else "in",
+                     int(sender_user_id or 0), int(sender_chat_id) if sender_chat_id is not None else None,
+                     str(sender_username or "")[:128], str(sender_name or "")[:256],
+                     str(message_type or "unknown")[:40], text, int(reply_to_message_id) if reply_to_message_id else None,
+                     message_at or utcnow(), edited_at, utcnow()),
+                )
+                self._prune_archive_conn(conn)
+                return cur.rowcount > 0
+            return bool(self.run(op))
+        except sqlite3.Error:
+            return False
+
+    def archive_runtime_log(self, created_at: str, level: str, logger_name: str, message: str) -> bool:
+        text = str(message or "").strip()
+        if not text or _is_sensitive_message(text):
+            return False
+        text = text[:6000]
+        try:
+            def op(conn):
+                cur = conn.execute(
+                    "INSERT INTO jf_runtime_log(created_at,level,logger_name,message) VALUES(?,?,?,?)",
+                    (created_at or utcnow(), str(level or "INFO")[:20], str(logger_name or "")[:160], text),
+                )
+                self._prune_archive_conn(conn)
+                return cur.rowcount == 1
+            return bool(self.run(op))
+        except sqlite3.Error:
+            return False
+
+    def chat_message_count(self, chat_id: int | None = None) -> int:
+        try:
+            if chat_id is None:
+                return int(self.run(lambda c: c.execute("SELECT COUNT(*) FROM jf_chat_message_log").fetchone()[0]))
+            return int(self.run(lambda c: c.execute("SELECT COUNT(*) FROM jf_chat_message_log WHERE chat_id=?", (int(chat_id),)).fetchone()[0]))
+        except sqlite3.Error:
+            return 0
+
+    def runtime_log_count(self) -> int:
+        try:
+            return int(self.run(lambda c: c.execute("SELECT COUNT(*) FROM jf_runtime_log").fetchone()[0]))
+        except sqlite3.Error:
+            return 0
+
+    def recent_chat_messages(self, chat_id: int, limit: int = 12):
+        return self.run(lambda c: c.execute(
+            "SELECT direction,sender_username,sender_name,message_type,body,message_at,edited_at "
+            "FROM jf_chat_message_log WHERE chat_id=? ORDER BY message_at DESC,id DESC LIMIT ?",
+            (int(chat_id), max(1, min(int(limit), 100))),
+        ).fetchall())
+
+    def search_chat_messages(self, chat_id: int, query: str, limit: int = 20):
+        needle = query.strip().casefold()
+        if not needle:
+            return []
+        rows = self.run(lambda c: c.execute(
+            "SELECT direction,sender_username,sender_name,message_type,body,message_at "
+            "FROM jf_chat_message_log WHERE chat_id=? ORDER BY message_at DESC LIMIT 10000",
+            (int(chat_id),),
+        ).fetchall())
+        found = [row for row in rows if needle in str(row["body"]).casefold() or needle in str(row["sender_name"]).casefold() or needle in str(row["sender_username"]).casefold()]
+        return found[:max(1, min(int(limit), 50))]
+
+    def recent_runtime_logs(self, limit: int = 20):
+        return self.run(lambda c: c.execute(
+            "SELECT created_at,level,logger_name,message FROM jf_runtime_log ORDER BY id DESC LIMIT ?",
+            (max(1, min(int(limit), 100)),),
+        ).fetchall())
+
+    def search_runtime_logs(self, query: str, limit: int = 20):
+        needle = query.strip().casefold()
+        if not needle:
+            return []
+        rows = self.recent_runtime_logs(500)
+        found = [row for row in rows if needle in (str(row["logger_name"]) + " " + str(row["message"])).casefold()]
+        return found[:max(1, min(int(limit), 50))]
+
     def set_message(self, section: str, chat_id: int, message_id: int):
         self.run(lambda c: c.execute(
             "INSERT INTO jf_console_messages(section,chat_id,message_id,updated_at) VALUES(?,?,?,?) "
@@ -210,6 +369,39 @@ class Store:
             ).fetchone())
         except sqlite3.Error:
             return None
+
+
+class SQLiteRuntimeLogHandler(logging.Handler):
+    """Copy application diagnostics into SQLite so the pinned DB backup contains them."""
+    def __init__(self, store: Store):
+        super().__init__(level=logging.INFO)
+        self.store = store
+
+    def emit(self, record):
+        try:
+            message = record.getMessage()
+            if record.exc_info:
+                import traceback
+                message += "\n" + "".join(traceback.format_exception(*record.exc_info))
+            created_at = datetime.fromtimestamp(record.created, timezone.utc).isoformat(timespec="seconds")
+            self.store.archive_runtime_log(created_at, record.levelname, record.name, message)
+        except Exception:
+            # Logging must never break a bot handler or recursively log its own failure.
+            return
+
+
+class FloodOutgoingArchiveMiddleware:
+    """Capture the bot's successful outgoing group messages at the aiogram API layer."""
+    def __init__(self, console):
+        self.console = console
+
+    async def __call__(self, make_request, bot, method):
+        result = await make_request(bot, method)
+        try:
+            self.console._archive_outgoing_api_result(method, result)
+        except Exception:
+            logger.exception("Could not archive an outgoing Telegram message")
+        return result
 
 
 class Console:
@@ -228,6 +420,13 @@ class Console:
 
     def init(self):
         self.store.init()
+        if self.bot is not None:
+            root = logging.getLogger()
+            marker = f"_jf_sqlite_runtime_log_{os.path.abspath(self.store.path)}"
+            if not any(getattr(handler, marker, False) for handler in root.handlers):
+                handler = SQLiteRuntimeLogHandler(self.store)
+                setattr(handler, marker, True)
+                root.addHandler(handler)
 
     def register(self):
         if self.registered:
@@ -238,8 +437,16 @@ class Console:
         self.dp.message.register(self.handle_memory, private, Command("jf_memory"))
         self.dp.message.register(self.handle_memory_save, private, Command("jf_memory_save"))
         self.dp.message.register(self.handle_memory_search, private, Command("jf_memory_search"))
-        # Outer middleware archives owner notes without blocking any command handler.
+        self.dp.message.register(self.handle_chatlog, private, Command("jf_chatlog"))
+        # Outer middlewares archive context without consuming or changing messages.
         self.dp.message.outer_middleware(self.owner_message_middleware)
+        self.dp.message.outer_middleware(self.group_message_middleware)
+        # Edited messages are a separate Telegram update type; a passive handler
+        # keeps that update enabled and stores revisions of flood messages.
+        edited_observer = getattr(self.dp, "edited_message", None)
+        if edited_observer is not None:
+            edited_observer.register(self.archive_edited_message_event)
+        self._install_outgoing_message_archive()
         self.dp.callback_query.register(self.handle_callback, self.F.data.startswith("jfcon:"))
         self.registered = True
 
@@ -270,6 +477,208 @@ class Console:
             logger.exception("Could not archive owner DM message")
         return await handler(event, data)
 
+    @staticmethod
+    def _date_iso(value) -> str | None:
+        if isinstance(value, datetime):
+            aware = value if value.tzinfo else value.replace(tzinfo=timezone.utc)
+            return aware.astimezone(timezone.utc).isoformat(timespec="seconds")
+        if isinstance(value, (int, float)):
+            return datetime.fromtimestamp(value, timezone.utc).isoformat(timespec="seconds")
+        return None
+
+    def _archive_flood_event(self, event, *, direction: str = "in", edited: bool = False):
+        if not CHAT_ARCHIVE_ENABLED:
+            return False
+        chat = getattr(event, "chat", None)
+        if not chat or getattr(chat, "type", None) not in {"group", "supergroup"}:
+            return False
+        chat_id = int(getattr(chat, "id", 0) or 0)
+        if not chat_id or chat_id != self._effective_primary_chat_id():
+            return False
+        user = getattr(event, "from_user", None)
+        sender_chat = getattr(event, "sender_chat", None)
+        body = getattr(event, "text", None) or getattr(event, "caption", None) or ""
+        content_type = getattr(event, "content_type", None)
+        message_type = str(getattr(content_type, "value", content_type) or "text")
+        if not body:
+            body = f"[{message_type}]"
+        reply = getattr(event, "reply_to_message", None)
+        message_date = self._date_iso(getattr(event, "date", None)) or utcnow()
+        edited_date = self._date_iso(getattr(event, "edit_date", None)) if edited else None
+        return self.store.archive_chat_message(
+            chat_id=chat_id,
+            message_id=int(getattr(event, "message_id", 0) or 0),
+            direction=direction,
+            sender_user_id=int(getattr(user, "id", 0) or 0),
+            sender_chat_id=int(getattr(sender_chat, "id", 0) or 0) or None,
+            sender_username=str(getattr(user, "username", "") or ""),
+            sender_name=" ".join(filter(None, [str(getattr(user, "first_name", "") or ""), str(getattr(user, "last_name", "") or "")])) or str(getattr(sender_chat, "title", "") or ""),
+            message_type=message_type,
+            body=str(body),
+            reply_to_message_id=int(getattr(reply, "message_id", 0) or 0) or None,
+            message_at=message_date,
+            edited_at=edited_date,
+        )
+
+    async def group_message_middleware(self, handler, event, data):
+        try:
+            self._archive_flood_event(event, direction="in")
+        except Exception:
+            logger.exception("Could not archive a flood message")
+        return await handler(event, data)
+
+    async def archive_edited_message_event(self, message):
+        try:
+            self._archive_flood_event(message, direction="in", edited=True)
+        except Exception:
+            logger.exception("Could not archive an edited flood message")
+
+    def _archive_outgoing_api_result(self, method, result):
+        """Archive text/captions produced by any aiogram API send/edit request."""
+        if not CHAT_ARCHIVE_ENABLED:
+            return
+        method_name = type(method).__name__
+        chat_id_value = getattr(method, "chat_id", None)
+        try:
+            chat_id = int(chat_id_value or 0)
+        except (TypeError, ValueError):
+            return
+        if not chat_id or chat_id != self._effective_primary_chat_id():
+            return
+
+        edit_methods = {"EditMessageText", "EditMessageCaption", "EditMessageMedia"}
+        send_methods = {
+            "SendMessage", "SendPhoto", "SendVideo", "SendAnimation", "SendDocument",
+            "SendAudio", "SendVoice", "SendLivePhoto", "SendPaidMedia", "SendVideoNote",
+            "CopyMessage", "ForwardMessage", "SendRichMessage",
+        }
+        if method_name not in edit_methods | send_methods and method_name != "SendMediaGroup":
+            return
+
+        method_text = getattr(method, "text", None)
+        method_caption = getattr(method, "caption", None)
+        input_media = getattr(method, "media", None)
+
+        def archive_one(message_obj=None, *, message_id=None, body=None, message_type=None, edited=False):
+            message_obj = message_obj if message_obj is not None else None
+            actual_chat = getattr(getattr(message_obj, "chat", None), "id", None)
+            actual_id = getattr(message_obj, "message_id", None) or message_id
+            actual_text = body
+            if actual_text is None and message_obj is not None:
+                actual_text = getattr(message_obj, "text", None) or getattr(message_obj, "caption", None)
+            if message_type is None:
+                message_type = "text" if method_name in {"SendMessage", "EditMessageText", "SendRichMessage"} else method_name.removeprefix("Send").removeprefix("Edit").lower()
+            if not actual_text:
+                actual_text = f"[{message_type or 'message'}]"
+            sender = getattr(message_obj, "from_user", None)
+            self.store.archive_chat_message(
+                chat_id=int(actual_chat or chat_id),
+                message_id=int(actual_id or 0),
+                direction="out",
+                sender_user_id=int(getattr(sender, "id", 0) or 0),
+                sender_username=str(getattr(sender, "username", "") or ""),
+                sender_name=str(getattr(sender, "first_name", "Justice Faite bot") or "Justice Faite bot"),
+                message_type=str(message_type or "text"),
+                body=str(actual_text),
+                reply_to_message_id=int(getattr(method, "reply_to_message_id", 0) or 0) or None,
+                message_at=self._date_iso(getattr(message_obj, "date", None)) or utcnow(),
+                edited_at=utcnow() if edited else None,
+            )
+
+        # SendMediaGroup returns several Message objects; each gets its own row.
+        if method_name == "SendMediaGroup":
+            returned = result if isinstance(result, (list, tuple)) else []
+            media_items = input_media if isinstance(input_media, (list, tuple)) else []
+            for index, sent in enumerate(returned):
+                item = media_items[index] if index < len(media_items) else None
+                caption = getattr(item, "caption", None) or getattr(sent, "caption", None)
+                media_type = getattr(item, "type", None) or (type(item).__name__.removeprefix("InputMedia").lower() if item else "media")
+                archive_one(sent, body=caption or f"[{media_type}]", message_type=str(media_type))
+            return
+
+        if method_name in edit_methods:
+            msg_id = getattr(method, "message_id", None)
+            body = method_text or method_caption or getattr(getattr(method, "media", None), "caption", None)
+            media_type = "text" if method_name == "EditMessageText" else "caption"
+            archive_one(result if hasattr(result, "message_id") else None,
+                        message_id=msg_id, body=body, message_type=media_type, edited=True)
+            return
+
+        archive_one(result if hasattr(result, "message_id") else None,
+                    body=method_text or method_caption,
+                    message_type="text" if method_name in {"SendMessage", "SendRichMessage"} else method_name.removeprefix("Send").lower())
+
+    def _install_outgoing_message_archive(self):
+        if self.bot is None or getattr(self, "_outgoing_archive_installed", False):
+            return
+        session = getattr(self.bot, "session", None)
+        register_middleware = getattr(session, "middleware", None)
+        if callable(register_middleware):
+            middleware = FloodOutgoingArchiveMiddleware(self)
+            register_middleware(middleware)
+            self._outgoing_archive_installed = True
+            return
+
+        # Compatibility fallback for tiny test doubles or non-aiogram adapters.
+        original_send = getattr(self.bot, "send_message", None)
+        if callable(original_send):
+            async def tracked_send(*args, **kwargs):
+                sent = await original_send(*args, **kwargs)
+                try:
+                    chat_id = kwargs.get("chat_id", args[0] if args else 0)
+                    body = kwargs.get("text", args[1] if len(args) > 1 else "")
+                    if int(chat_id or 0) == self._effective_primary_chat_id() and body:
+                        self.store.archive_chat_message(
+                            chat_id=int(chat_id), message_id=int(getattr(sent, "message_id", 0) or 0),
+                            direction="out", sender_user_id=int(getattr(getattr(sent, "from_user", None), "id", 0) or 0),
+                            sender_username=str(getattr(getattr(sent, "from_user", None), "username", "") or ""),
+                            sender_name=str(getattr(getattr(sent, "from_user", None), "first_name", "Justice Faite bot") or "Justice Faite bot"),
+                            message_type="text", body=str(body),
+                            reply_to_message_id=int(kwargs.get("reply_to_message_id", 0) or 0) or None,
+                            message_at=self._date_iso(getattr(sent, "date", None)) or utcnow(),
+                        )
+                except Exception:
+                    logger.exception("Could not archive a bot reply in the flood")
+                return sent
+            self.bot.send_message = tracked_send
+        original_edit = getattr(self.bot, "edit_message_text", None)
+        if callable(original_edit):
+            async def tracked_edit(*args, **kwargs):
+                edited = await original_edit(*args, **kwargs)
+                try:
+                    body = kwargs.get("text", args[0] if args else "")
+                    chat_id = kwargs.get("chat_id", args[1] if len(args) > 1 else 0)
+                    message_id = kwargs.get("message_id", args[2] if len(args) > 2 else 0)
+                    if int(chat_id or 0) == self._effective_primary_chat_id() and body and message_id:
+                        self.store.archive_chat_message(
+                            chat_id=int(chat_id), message_id=int(message_id), direction="out",
+                            sender_name="Justice Faite bot", message_type="text", body=str(body),
+                            edited_at=utcnow(),
+                        )
+                except Exception:
+                    logger.exception("Could not archive an edited bot message in the flood")
+                return edited
+            self.bot.edit_message_text = tracked_edit
+        self._outgoing_archive_installed = True
+
+    async def handle_chatlog(self, message):
+        if not self.is_owner_private(message):
+            return await self.deny(message)
+        chat_id = self._effective_primary_chat_id()
+        total = self.store.chat_message_count(chat_id)
+        runtime = self.store.runtime_log_count()
+        latest = self.store.recent_chat_messages(chat_id, 1)
+        last = latest[0]["message_at"] if latest else "пока нет записей"
+        await message.answer(
+            "📚 <b>АРХИВ JUSTICE FAITE</b>\n\n"
+            f"Сообщений флуда: <b>{total}</b>\n"
+            f"Технических записей: <b>{runtime}</b>\n"
+            f"Срок хранения переписки: <b>{CHAT_LOG_RETENTION_DAYS} дней</b>\n"
+            f"Последнее сообщение: <code>{esc(last)}</code>\n\n"
+            "Поиск: <code>/jf_memory_search слово</code>. Архив входит в закреплённый JF_DB_BACKUP_V1.",
+            parse_mode="HTML",
+        )
+
     async def deny(self, message):
         await message.answer("⛔ Эта консоль доступна только владельцу в личных сообщениях.")
 
@@ -292,9 +701,24 @@ class Console:
         for row in self.store.memory():
             blocks.append(f"<b>{esc(row['title'])}</b>\n{esc(row['body'])}")
         recent = self.store.recent_owner_messages(8)
-        blocks.append(f"<b>📝 Архив личных сообщений</b>\nСохранено: {self.store.owner_message_count()} записей")
+        blocks.append(f"<b>📝 Архив личных сообщений владельца</b>\nСохранено: {self.store.owner_message_count()} записей")
         for row in recent:
             blocks.append(f"<i>{esc(row['created_at'])}</i>\n{esc(row['body'][:700])}")
+        flood_id = self._effective_primary_chat_id()
+        flood_recent = self.store.recent_chat_messages(flood_id, 8)
+        blocks.append(
+            f"<b>💬 Архив переписки флуда</b>\nСохранено: {self.store.chat_message_count(flood_id)} сообщений "
+            f"(хранение {CHAT_LOG_RETENTION_DAYS} дней). Технических логов: {self.store.runtime_log_count()}."
+        )
+        for row in flood_recent:
+            person = row['sender_username'] and ('@' + row['sender_username']) or row['sender_name'] or 'участник/бот'
+            direction = 'бот' if row['direction'] == 'out' else 'чат'
+            blocks.append(f"<i>{esc(row['message_at'])} · {esc(direction)} · {esc(person)}</i>\n{esc(str(row['body'])[:500])}")
+        runtime_recent = self.store.recent_runtime_logs(5)
+        if runtime_recent:
+            blocks.append("<b>⚙️ Последние технические события</b>")
+            for row in runtime_recent:
+                blocks.append(f"<i>{esc(row['created_at'])} · {esc(row['level'])} · {esc(row['logger_name'])}</i>\n{esc(str(row['message'])[:500])}")
         for chunk in _pack_html_blocks(blocks):
             await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
 
@@ -307,17 +731,28 @@ class Console:
             return await message.answer("🔎 Формат: <code>/jf_memory_search текст</code>", parse_mode="HTML")
         memory_rows = self.store.search_project_memory(payload, 20)
         journal_rows = self.store.search_owner_messages(payload, 20)
-        if not memory_rows and not journal_rows:
-            return await message.answer("🔎 Совпадений в проектной памяти и архиве личных сообщений нет.")
+        flood_rows = self.store.search_chat_messages(self._effective_primary_chat_id(), payload, 20)
+        runtime_rows = self.store.search_runtime_logs(payload, 20)
+        if not memory_rows and not journal_rows and not flood_rows and not runtime_rows:
+            return await message.answer("🔎 Совпадений в проектной памяти, переписке флуда и технических логах нет.")
         blocks = ["🔎 <b>РЕЗУЛЬТАТЫ ПОИСКА В ПАМЯТИ</b>"]
         if memory_rows:
             blocks.append("📌 <b>Структурированные требования</b>")
             for row in memory_rows:
                 blocks.append(f"<b>{esc(row['title'])}</b>\n{esc(row['body'][:900])}")
         if journal_rows:
-            blocks.append("📝 <b>Архив личных сообщений</b>")
+            blocks.append("📝 <b>Архив личных сообщений владельца</b>")
             for row in journal_rows:
                 blocks.append(f"<i>{esc(row['created_at'])}</i>\n{esc(row['body'][:700])}")
+        if flood_rows:
+            blocks.append("💬 <b>Архив переписки флуда</b>")
+            for row in flood_rows:
+                person = row['sender_username'] and ('@' + row['sender_username']) or row['sender_name'] or 'участник/бот'
+                blocks.append(f"<i>{esc(row['message_at'])} · {esc(person)} · {esc(row['direction'])}</i>\n{esc(str(row['body'])[:900])}")
+        if runtime_rows:
+            blocks.append("⚙️ <b>Технические логи</b>")
+            for row in runtime_rows:
+                blocks.append(f"<i>{esc(row['created_at'])} · {esc(row['level'])} · {esc(row['logger_name'])}</i>\n{esc(str(row['message'])[:900])}")
         for chunk in _pack_html_blocks(blocks):
             await message.answer(chunk, parse_mode="HTML", disable_web_page_preview=True)
 
@@ -365,7 +800,8 @@ class Console:
                     await callback.answer("Не удалось синхронизировать роли", show_alert=True)
                 return
         if section == "roles" and action in {"prev", "next"}:
-            total = self._table_count("group_members", f"WHERE chat_id={self.primary_chat_id} AND active=1 AND role_key IS NOT NULL")
+            chat_id = self._effective_primary_chat_id()
+            total = self._table_count("group_members", f"WHERE chat_id={chat_id} AND active=1 AND role_key IS NOT NULL")
             pages = max(1, (total + self._roles_page_size - 1) // self._roles_page_size)
             if action == "prev":
                 self._roles_page = max(0, self._roles_page - 1)
@@ -395,6 +831,8 @@ class Console:
             size_label = "ещё не создана / недоступна"
         memory_count = self._table_count("jf_project_memory")
         journal_count = self.store.owner_message_count()
+        flood_log_count = self.store.chat_message_count(self._effective_primary_chat_id())
+        runtime_log_count = self.store.runtime_log_count()
         backup = self.store.get_message("db_backup")
         backup_status = f"закреплённое сообщение #{backup['message_id']}" if backup else "создаётся при первом цикле"
         backup_warning = f"\n⚠️ <b>Проблема копирования:</b> {esc(self._last_backup_error)}" if self._last_backup_error else ""
@@ -404,7 +842,10 @@ class Console:
                 "<b>Состояние базы:</b> доступна ✅\n"
                 f"<b>Файл базы:</b> {esc(size_label)}\n"
                 f"<b>Блоков памяти:</b> {memory_count}\n"
-                f"<b>Архив личных сообщений:</b> {journal_count}\n"
+                f"<b>Архив личных сообщений владельца:</b> {journal_count}\n"
+                f"<b>Архив переписки флуда:</b> {flood_log_count}\n"
+                f"<b>Технический журнал:</b> {runtime_log_count}\n"
+                f"<b>Срок хранения переписки:</b> {CHAT_LOG_RETENTION_DAYS} дней\n"
                 f"<b>Резервная копия:</b> {esc(backup_status)}\n"
                 f"<b>Обновлено:</b> {esc(utcnow())}{backup_warning}\n\n"
                 "Панель и резервный снимок обновляются примерно каждые 5 минут; записи SQLite фиксируются сразу."
@@ -458,14 +899,14 @@ class Console:
         if not {"group_members", "role_state"} <= tables:
             lines.append("\nТаблицы ролей ещё не созданы.")
             return "\n".join(lines)
-        chat_id = self.primary_chat_id
+        chat_id = self._effective_primary_chat_id()
         stats = self.store.run(lambda c: c.execute(
             "SELECT COUNT(*) AS active, SUM(CASE WHEN role_key IS NOT NULL THEN 1 ELSE 0 END) AS assigned "
             "FROM group_members WHERE chat_id=? AND active=1", (chat_id,)
         ).fetchone())
         active_count = int(stats["active"] or 0)
         assigned_count = int(stats["assigned"] or 0)
-        lines.append(f"\n👥 Участников, записанных по Telegram ID: {active_count}")
+        lines.append(f"\n👥 Активных участников: {active_count}")
         lines.append(f"🎭 С распознанной ролью: {assigned_count}")
         lines.append(f"▫️ Пока без распознанной роли: {max(0, active_count - assigned_count)}")
 
@@ -518,6 +959,28 @@ class Console:
         )
         return "\n".join(lines)
 
+    def _effective_primary_chat_id(self) -> int:
+        """Use the sole persisted managed group if the console ID is stale."""
+        configured = int(self.primary_chat_id or 0)
+        try:
+            ids = self.store.run(lambda conn: [
+                int(row[0]) for row in conn.execute(
+                    "SELECT group_chat_id FROM managed_group ORDER BY group_chat_id"
+                ).fetchall()
+            ])
+        except sqlite3.Error:
+            return configured
+        if configured in ids:
+            return configured
+        if len(ids) == 1:
+            self.primary_chat_id = ids[0]
+            logger.warning(
+                "Owner console PRIMARY_CHAT_ID corrected from %s to persisted group %s",
+                configured, ids[0],
+            )
+            return ids[0]
+        return configured
+
     def _memory_text(self):
         rows = self.store.memory()
         lines = ["🗂️ <b>ПАМЯТЬ И ТЕХНИЧЕСКОЕ ЗАДАНИЕ</b>"]
@@ -528,12 +991,16 @@ class Console:
             lines.append(f"\n🔹 <b>{esc(row['title'])}</b>\n{esc(preview)}")
         if len(rows) > 10:
             lines.append(f"\nЕщё блоков в полной памяти: {len(rows) - 10}. Команда: <code>/jf_memory</code>.")
-        lines.append(f"\n📝 Архив ЛС: {self.store.owner_message_count()} записей. Поиск: <code>/jf_memory_search запрос</code>.")
+        lines.append(f"\n📝 Архив ЛС владельца: {self.store.owner_message_count()} записей.")
+        flood_id = self._effective_primary_chat_id()
+        lines.append(f"💬 Архив флуда: {self.store.chat_message_count(flood_id)} сообщений · ⚙️ техлогов: {self.store.runtime_log_count()}.")
+        lines.append(f"Срок хранения: {CHAT_LOG_RETENTION_DAYS} дней. Проверка: <code>/jf_chatlog</code> · поиск: <code>/jf_memory_search запрос</code>.")
         return "\n".join(lines)
 
     async def _edit_or_send(self, chat_id: int, section: str, text: str):
         if section == "roles":
-            total = self._table_count("group_members", f"WHERE chat_id={self.primary_chat_id} AND active=1 AND role_key IS NOT NULL")
+            chat_id = self._effective_primary_chat_id()
+            total = self._table_count("group_members", f"WHERE chat_id={chat_id} AND active=1 AND role_key IS NOT NULL")
             pages = max(1, (total + self._roles_page_size - 1) // self._roles_page_size)
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [
@@ -646,6 +1113,17 @@ class Console:
                 self._quarantine_invalid_database()
             shutil.rmtree(temp_dir, ignore_errors=True)
 
+    def _backup_caption(self, digest: str) -> str:
+        flood_id = self._effective_primary_chat_id()
+        messages = self.store.chat_message_count(flood_id)
+        runtime = self.store.runtime_log_count()
+        return (
+            f"💾 {BACKUP_MARKER}\n"
+            f"Обновлено: {esc(utcnow())}\n"
+            f"Переписка флуда: {messages} · техлоги: {runtime}\n"
+            f"SHA-256: <code>{digest}</code>"
+        )
+
     def _make_compressed_snapshot(self, directory: str) -> tuple[str, str]:
         snapshot = os.path.join(directory, "justice_faite.sqlite3")
         compressed = os.path.join(directory, "justice_faite.sqlite3.gz")
@@ -682,6 +1160,7 @@ class Console:
             pinned_caption = str(getattr(pinned, "caption", "") or "") if pinned else ""
             old_id = int(old["message_id"]) if old and int(old["chat_id"]) == self.owner_id else 0
             old_is_latest_backup = bool(old_id and pinned_id == old_id and BACKUP_MARKER in pinned_caption)
+            backup_caption = self._backup_caption(digest)
 
             if signature == self._last_backup_signature and old_is_latest_backup:
                 return True
@@ -692,7 +1171,7 @@ class Console:
                 try:
                     media = InputMediaDocument(
                         media=FSInputFile(compressed, filename="justice_faite_memory.sqlite3.gz"),
-                        caption=f"💾 {BACKUP_MARKER}\nОбновлено: {esc(utcnow())}\nSHA-256: <code>{digest}</code>",
+                        caption=backup_caption,
                         parse_mode="HTML",
                     )
                     await self.bot.edit_message_media(
@@ -709,7 +1188,7 @@ class Console:
                 sent = await self.bot.send_document(
                     chat_id=self.owner_id,
                     document=FSInputFile(compressed, filename="justice_faite_memory.sqlite3.gz"),
-                    caption=f"💾 {BACKUP_MARKER}\nОбновлено: {esc(utcnow())}\nSHA-256: <code>{digest}</code>",
+                    caption=backup_caption,
                     parse_mode="HTML",
                     disable_notification=True,
                 )
