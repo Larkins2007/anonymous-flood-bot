@@ -302,8 +302,9 @@ def load() -> None:
         where="group", where_options=("group",), cooldown_default=10,
         menu=(("spy", "🕵️ Запустить «Шпион»"),),
         params=(
-            Param("min_players", "Минимум игроков", "int", 3, min=2, max=10, step=1),
-            Param("max_players", "Максимум игроков", "int", 10, min=3, max=20, step=1, presets=(6, 8, 10, 12)),
+            Param("min_players", "Минимум игроков", "int", 3, min=3, max=15, step=1),
+            Param("max_players", "Максимум игроков", "int", 15, min=3, max=15, step=1, presets=(6, 8, 10, 12, 15)),
+            Param("spy_count", "Количество шпионов", "int", 1, min=1, max=3, step=1, presets=(1, 2, 3)),
             Param("round_minutes", "Длительность раунда", "int", 8, min=1, max=30, step=1, unit="мин", presets=(5, 8, 12)),
             Param("discussion_seconds", "Обсуждение перед голосом", "int", 120, min=30, max=600, step=30, unit="с", presets=(60, 120, 180)),
             Param("final_vote_seconds", "Финальное голосование", "int", 120, min=30, max=600, step=30, unit="с"),

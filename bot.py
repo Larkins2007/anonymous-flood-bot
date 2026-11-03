@@ -215,6 +215,9 @@ JF_RAFFLES = jf_raffles.register(dp, bot=bot, F=F, db_path=DB_PATH, manager=JF_M
 import jf_clean
 JF_CLEAN = jf_clean.register(dp, bot=bot, F=F, db_path=DB_PATH, manager=JF_MANAGER, lock=DB_LOCK)
 
+import jf_console
+JF_CONSOLE = jf_console.register(dp, bot=bot, F=F, db_path=DB_PATH, lock=DB_LOCK, owner_id=ADMIN_ID)
+
 DELIVERY_QUEUE = None
 BROADCAST_QUEUE = None
 DELIVERY_WORKERS = max(1, int(os.getenv("DELIVERY_WORKERS", "2")))
@@ -6680,6 +6683,9 @@ async def setup_commands():
     network_command = BotCommand(command="jf_network", description="🌐 Сетка чатов")
     raffles_command = BotCommand(command="jf_raffles", description="🎉 Бесплатные розыгрыши")
     clean_command = BotCommand(command="jf_clean", description="🧹 Чистка сообщений")
+    console_command = BotCommand(command="jf_console", description="🧠 Личная консоль владельца")
+    memory_command = BotCommand(command="jf_memory", description="🗂️ Память и требования проекта")
+    memory_save_command = BotCommand(command="jf_memory_save", description="📝 Сохранить блок памяти проекта")
     if all(c.command != profile_command.command for c in group_user):
         group_user.insert(0, profile_command)
     for item in (reputation_command, reports_command, timers_command, automod_command, fun_command, network_command, raffles_command, clean_command):
@@ -6720,6 +6726,10 @@ async def setup_commands():
         with suppress(Exception):
             await bot.set_my_commands([], scope=scope)
 
+    for item in (console_command, memory_command, memory_save_command):
+        if all(c.command != item.command for c in owner_private):
+            owner_private.insert(0, item)
+
     await bot.set_my_commands(private_user, scope=BotCommandScopeDefault())
     await bot.set_my_commands(owner_private, scope=BotCommandScopeChat(chat_id=ADMIN_ID))
     if PRIMARY_CHAT_ID:
@@ -6738,6 +6748,7 @@ async def refresh_command_menu():
 _SETTING_GLOBALS = {
     ("spy", "min_players"): ("SPY_MIN_PLAYERS", 1),
     ("spy", "max_players"): ("SPY_MAX_PLAYERS", 1),
+    ("spy", "spy_count"): ("SPY_SPY_COUNT", 1),
     ("spy", "round_minutes"): ("SPY_ROUND_SECONDS", 60),
     ("spy", "discussion_seconds"): ("SPY_DISCUSSION_SECONDS", 1),
     ("spy", "final_vote_seconds"): ("SPY_FINAL_VOTE_SECONDS", 1),
@@ -6757,6 +6768,8 @@ def apply_setting(command: str, key: str, value) -> None:
     globals()[name] = int(cmdcfg.get_int(command, key)) * factor
     if name in ("SPY_MIN_PLAYERS", "SPY_MAX_PLAYERS") and globals()["SPY_MIN_PLAYERS"] > globals()["SPY_MAX_PLAYERS"]:
         globals()["SPY_MIN_PLAYERS"] = globals()["SPY_MAX_PLAYERS"]
+    if name == "SPY_SPY_COUNT":
+        globals()["SPY_SPY_COUNT"] = max(1, min(3, globals()["SPY_SPY_COUNT"]))
 
 
 def apply_all_settings() -> None:
@@ -6913,7 +6926,8 @@ async def polling_loop():
 # role assignment, Mafia, polls, schedule state, or anonymous feedback.
 
 SPY_MIN_PLAYERS = 3
-SPY_MAX_PLAYERS = 10
+SPY_MAX_PLAYERS = 15
+SPY_SPY_COUNT = 1
 SPY_ROUND_SECONDS = 8 * 60
 SPY_DISCUSSION_SECONDS = 120
 SPY_FINAL_VOTE_SECONDS = 120
@@ -7227,7 +7241,8 @@ def _spy_spies(game_id, active_only=True):
 
 
 def _spy_spy_count(n):
-    return 2 if n >= 7 else 1
+    """Use the configured number of spies while preserving at least two civilians."""
+    return min(max(1, int(SPY_SPY_COUNT)), max(1, int(n) - 2))
 
 
 def _spy_lobby_keyboard(game_id, can_start=False):
@@ -7584,8 +7599,11 @@ def _spy_preflight_start(game_id):
         checks.append(f"недостаточно участников: {len(players)}/{SPY_MIN_PLAYERS}")
     if not SPY_LOCATIONS:
         checks.append("каталог локаций пуст")
-    if _spy_spy_count(len(players)) > len(players):
-        checks.append("некорректное количество шпионов")
+    if int(SPY_SPY_COUNT) > max(1, len(players) - 2):
+        checks.append(
+            f"для {len(players)} игроков можно выбрать не более {max(1, len(players) - 2)} шпионов; "
+            f"сейчас в настройках: {SPY_SPY_COUNT}"
+        )
     return checks
 
 
@@ -8998,6 +9016,7 @@ async def main():
     JF_NETWORK.init()
     JF_RAFFLES.init()
     JF_CLEAN.init()
+    JF_CONSOLE.init()
     init_justice_features_db()
     seed_role_catalog()
     seed_default_games()
@@ -9047,6 +9066,7 @@ async def main():
     asyncio.create_task(mafia_expiry_recovery_worker())
     asyncio.create_task(schedule_worker())
     feature_maintenance_task = asyncio.create_task(feature_maintenance_worker(), name="justice-feature-maintenance")
+    console_maintenance_task = asyncio.create_task(JF_CONSOLE.run_forever(), name="justice-console-maintenance")
 
     delivery_tasks = [
         asyncio.create_task(delivery_worker(i + 1), name=f"delivery-{i + 1}")
@@ -9083,6 +9103,9 @@ async def main():
         feature_maintenance_task.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await feature_maintenance_task
+        console_maintenance_task.cancel()
+        with suppress(asyncio.CancelledError, Exception):
+            await console_maintenance_task
 
         for task in delivery_tasks + broadcast_tasks:
             task.cancel()
