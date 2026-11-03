@@ -179,7 +179,7 @@ def load() -> None:
     S(Spec(
         "call", "Калл — роль новичку", "🎭", "roles",
         "«калл Кокоми» — назначить роль последнему новичку, поставить тег и снять ограничение.",
-        triggers=("калл <роль>",), access="owner", access_options=("owner", "admins"),
+        triggers=("калл <роль>",), access="admins", access_options=("owner", "admins"),
         where="group", where_options=("group",), cooldown=False,
         params=(
             Param("window_minutes", "Окно после входа новичка", "int", 10, "Калл работает на новичка, зашедшего не раньше, чем N минут назад.",
@@ -225,14 +225,10 @@ def load() -> None:
         ),
     ))
     S(Spec(
-        "roles_audit", "Аудит ролей", "🔎", "roles",
-        "Сводка по ролям и последние изменения.",
-        triggers=("/roles_audit",), access="owner", access_options=("owner", "admins"),
-        where="private", where_options=("private",), autodelete=False,
-        menu=(("roles_audit", "🔎 Проверить роли"),),
-        params=(
-            Param("history_limit", "Сколько последних изменений", "int", 10, min=3, max=30, step=1, presets=(5, 10, 20)),
-        ),
+        "member_confirm", "Подтверждение правил", "📜", "roles",
+        "Кнопка подтверждения ознакомления с правилами после вступления в чат.",
+        triggers=(), aliases=(), access="members", access_options=("owner", "admins", "members", "all"),
+        where="group", where_options=("group",), cooldown=False, autodelete=False,
     ))
     S(Spec(
         "who", "Карточка участника", "🪪", "roles",
@@ -296,6 +292,12 @@ def load() -> None:
         menu=(("mafia_leave", "🚪 Выйти из лобби"),),
     ))
     S(Spec(
+        "mafia_admin_action", "Мафия — закрыть лобби", "⛔", "games",
+        "Кнопка закрытия активного лобби мафии. Доступ дополнительно проверяется по создателю лобби или правам администратора.",
+        triggers=(), aliases=(), access="members", access_options=("owner", "admins", "members", "all"),
+        where="group", where_options=("group",), cooldown=False, autodelete=False,
+    ))
+    S(Spec(
         "spy", "Шпион", "🕵️", "games",
         "Игра «Шпион» с лобби, вопросами в ЛС, голосованием и финальной догадкой.",
         triggers=("/spy",), access="members", access_options=("owner", "admins", "members", "all"),
@@ -329,13 +331,25 @@ def load() -> None:
     S(Spec(
         "game_poll", "Опрос на игру", "🗳", "games",
         "Опрос: во что играем в ближайший слот расписания.",
-        triggers=("/game_poll",), access="owner", access_options=("owner", "admins"),
+        triggers=("/game_poll",), access="admins", access_options=("owner", "admins"),
         where="group", where_options=("group",), cooldown=False,
         menu=(("game_poll", "🗳 Опрос на игру"),),
         params=(
             Param("max_minutes", "Максимальная длительность опроса", "int", 10080, min=10, max=43200, step=60, unit="мин",
                   presets=(60, 1440, 10080)),
         ),
+    ))
+    S(Spec(
+        "game_poll_vote", "Опрос — голосование", "🗳", "games",
+        "Кнопка выбора игры в активном опросе. Каждый участник может изменить свой голос.",
+        triggers=(), aliases=(), access="members", access_options=("owner", "admins", "members", "all"),
+        where="group", where_options=("group",), cooldown=False, autodelete=False,
+    ))
+    S(Spec(
+        "game_poll_info", "Опрос — описание игры", "ℹ️", "games",
+        "Кнопка просмотра краткого описания варианта в опросе.",
+        triggers=(), aliases=(), access="members", access_options=("owner", "admins", "members", "all"),
+        where="group", where_options=("group",), cooldown=False, autodelete=False,
     ))
     S(Spec(
         "schedule", "Напоминания об играх", "⏰", "games",
@@ -370,6 +384,19 @@ def load() -> None:
             Param("max_reason", "Максимальная длина причины", "int", 2000, min=100, max=4000, step=100, unit="симв",
                   presets=(500, 1000, 2000)),
         ),
+    ))
+
+    S(Spec(
+        "anon_admin", "Анонимная связь — панель администрации", "🛡️", "anon",
+        "Кнопки просмотра обращений, ответа пользователям, блокировки и рассылки в личной панели владельца.",
+        triggers=(), aliases=(), access="owner", access_options=("owner",),
+        where="private", where_options=("private",), cooldown=False, autodelete=False,
+    ))
+    S(Spec(
+        "admin_panel", "Панель администрации", "🛡️", "system",
+        "Кнопки панели владельца: статистика, поиск, пользователи, сообщения и рассылки.",
+        triggers=(), aliases=(), access="owner", access_options=("owner",),
+        where="private", where_options=("private",), cooldown=False, autodelete=False,
     ))
 
     # ------------------------------------------------------------------ system

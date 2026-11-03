@@ -3,6 +3,7 @@ from __future__ import annotations
 import html,re,secrets,sqlite3,threading
 from contextlib import suppress
 from datetime import datetime,timezone
+import cmdcfg
 GROUP_TYPES={"group","supergroup"}
 COMMAND_PATTERN=(r"(?isu)^\s*(?:/jf_raffles(?:@[A-Za-z0-9_]+)?(?:\s|$)|[!.\/]{0,4}(?:(?:ирис(?:ка)?|iris)\s+)?(?:\+розыгрыш\s+\d+|розыгрыш статус|участвую|выйти из розыгрыша|завершить розыгрыш|победители розыгрыша))\s*$")
 def now():return datetime.now(timezone.utc).isoformat()
@@ -45,7 +46,7 @@ class Raffles:
   chat,uid=int(m.chat.id),int(m.from_user.id)
   if low.startswith("/jf_raffles"):return await self.reply(m,"<b>Бесплатный розыгрыш Justice Faite</b>\nСоздать: <code>+Розыгрыш 2</code> и описание символической награды на следующей строке. Войти: <code>Участвую</code>. Выйти: <code>Выйти из розыгрыша</code>. Завершить: <code>Завершить розыгрыш</code>. Без покупок, ставок и денежной награды.")
   if low.startswith("+розыгрыш "):
-   if await self.rank(chat,uid)<3:return await self.reply(m,"⛔ Создавать розыгрыши могут администраторы от 3 ранга.")
+   if not cmdcfg.access_was_checked(m) and await self.rank(chat,uid)<3:return await self.reply(m,"⛔ Создавать розыгрыши могут администраторы от 3 ранга.")
    try:n=int(first.split()[-1])
    except ValueError:return await self.reply(m,"Укажи число победителей от 1 до 10.")
    if not 1<=n<=10:return await self.reply(m,"Число победителей должно быть от 1 до 10.")
@@ -75,7 +76,7 @@ class Raffles:
    rows=self.store.run(lambda c:c.execute("SELECT user_id FROM jf_raffle_winners WHERE raffle_id=? ORDER BY position",(done["id"],)).fetchall())
    return await self.reply(m,f"<b>Победители розыгрыша №{done['id']}</b>\n"+("\n".join(f"{i}. {esc(self.name(chat,int(r[0])))}" for i,r in enumerate(rows,1)) or "Подходящих участников не было."))
   if low=="завершить розыгрыш":
-   if await self.rank(chat,uid)<3:return await self.reply(m,"⛔ Завершить розыгрыш могут администраторы от 3 ранга.")
+   if not cmdcfg.access_was_checked(m) and await self.rank(chat,uid)<3:return await self.reply(m,"⛔ Завершить розыгрыш могут администраторы от 3 ранга.")
    if not active:return await self.reply(m,"Активного розыгрыша нет.")
    entries=self.store.run(lambda c:c.execute("SELECT user_id FROM jf_raffle_entries WHERE raffle_id=? ORDER BY joined_at",(active["id"],)).fetchall())
    pool=[int(r[0]) for r in entries];count=min(int(active["winner_count"]),len(pool));winners=secrets.SystemRandom().sample(pool,count) if count else []

@@ -3,6 +3,7 @@ from __future__ import annotations
 import html,re,sqlite3,threading
 from contextlib import suppress
 from datetime import datetime,timezone,timedelta
+import cmdcfg
 GROUP_TYPES={"group","supergroup"}
 COMMAND_PATTERN=(r"(?isu)^\s*(?:/jf_reports(?:@[A-Za-z0-9_]+)?(?:\s|$)|"
  r"[!.\/]{0,4}(?:(?:ирис(?:ка)?|iris)\s+)?(?:!?репорт|репортлист|репорт закрыть\s+\d+|!?сброс репортов))\b.*$")
@@ -58,18 +59,18 @@ class Reports:
    if rid is None:return await self.reply(m,"Похожая жалоба уже находится в очереди. Подожди решения администрации.")
    return await self.reply(m,f"✅ Жалоба №{rid} передана администрации.")
   if low=="репортлист":
-   if await self.rank(chat,uid)<1:return await self.reply(m,"⛔ Очередь жалоб доступна модераторам от 1 ранга.")
+   if not cmdcfg.access_was_checked(m) and await self.rank(chat,uid)<1:return await self.reply(m,"⛔ Очередь жалоб доступна модераторам от 1 ранга.")
    rows=self.store.run(lambda c:c.execute("SELECT * FROM jf_reports WHERE chat_id=? AND status='open' ORDER BY id DESC LIMIT 30",(chat,)).fetchall())
    lines=[f"<b>#{r['id']}</b> · от ID {r['reporter_id']} на ID {r['target_id']} · сообщение {r['message_id']}\n{esc(r['reason'])}" for r in rows]
    return await self.reply(m,"<b>Открытые жалобы</b>\n"+("\n\n".join(lines) or "Очередь пуста.")+"\n\nЗакрыть: <code>Репорт закрыть ID</code>")
   if low.startswith("репорт закрыть "):
-   if await self.rank(chat,uid)<1:return await self.reply(m,"⛔ Закрывать жалобы могут модераторы от 1 ранга.")
+   if not cmdcfg.access_was_checked(m) and await self.rank(chat,uid)<1:return await self.reply(m,"⛔ Закрывать жалобы могут модераторы от 1 ранга.")
    try:rid=int(low.split()[-1])
    except ValueError:return await self.reply(m,"Укажи номер жалобы.")
    changed=self.store.run(lambda c:c.execute("UPDATE jf_reports SET status='closed',closed_by=?,closed_at=? WHERE chat_id=? AND id=? AND status='open'",(uid,now(),chat,rid)).rowcount)
    return await self.reply(m,"✅ Жалоба закрыта." if changed else "Открытая жалоба с таким номером не найдена.")
   if low in {"сброс репортов","!сброс репортов"}:
-   if await self.rank(chat,uid)<5:return await self.reply(m,"⛔ Полный сброс доступен только создателю чата.")
+   if not cmdcfg.access_was_checked(m) and await self.rank(chat,uid)<5:return await self.reply(m,"⛔ Полный сброс доступен только создателю чата.")
    count=self.store.run(lambda c:c.execute("DELETE FROM jf_reports WHERE chat_id=?",(chat,)).rowcount)
    return await self.reply(m,f"Удалено жалоб: {count}.")
 def register(dp,bot,F,db_path,manager,lock=None,owner_id=0):

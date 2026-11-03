@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio,html,re,sqlite3,threading
 from contextlib import suppress
 from datetime import datetime,timedelta,timezone
+import cmdcfg
 GROUP_TYPES={"group","supergroup"}
 COMMAND_PATTERN=(r"(?isu)^\s*(?:/jf_timers(?:@[A-Za-z0-9_]+)?(?:\s|$)|"
  r"[!.\/]{0,4}(?:(?:ирис(?:ка)?|iris)\s+)?(?:таймер через\s+\d+\s*(?:минут\w*|мин|м|час\w*|ч|дн\w*|д|недел\w*)|таймеры|-таймер\s+\d+|сбросить таймеры))\b.*$")
@@ -47,7 +48,7 @@ class Timers:
   chat,uid=int(m.chat.id),int(m.from_user.id)
   if low.startswith("/jf_timers"):return await self.reply(m,"<b>Таймеры Justice Faite</b>\n<code>Таймер через 30 минут</code>, затем текст напоминания на новой строке. <code>Таймеры</code> — список; <code>-Таймер ID</code> — отмена.")
   if low.startswith("таймер через "):
-   if await self.rank(chat,uid)<1:return await self.reply(m,"⛔ Таймеры доступны модераторам от 1 ранга.")
+   if not cmdcfg.access_was_checked(m) and await self.rank(chat,uid)<1:return await self.reply(m,"⛔ Таймеры доступны модераторам от 1 ранга.")
    if not body:return await self.reply(m,"Добавь текст напоминания на следующей строке.")
    mins=duration_minutes(first[len("таймер через "):])
    if mins is None:return await self.reply(m,"Период должен быть от 1 минуты до 1 года. Например: <code>Таймер через 30 минут</code>.")

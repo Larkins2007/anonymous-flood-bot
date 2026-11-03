@@ -4654,21 +4654,35 @@ async def apply_member_tag(chat_id, user_id, desired_tag):
         return False, None
 
 
-async def sync_member_tag(chat_id, user_id, *, user=None, refresh_roster=False, expected_role=None, force=False):
+async def sync_member_tag(chat_id, user_id, *, user=None, refresh_roster=False, expected_role=None, force=False, message_tag=None, tag_from_message=False):
+    """Synchronize a role from Telegram's message sender_tag or getChatMember fallback.
+
+    `tag_from_message=True` means message_tag is authoritative, including an empty
+    string (the member currently has no Telegram tag). This avoids an API request
+    for every message and keeps the role cache current immediately.
+    """
     cache_key=(chat_id,user_id); loop=asyncio.get_running_loop(); now_mono=loop.time()
-    if not force and cache_key in MEMBER_TAG_SYNC_CACHE and now_mono-MEMBER_TAG_SYNC_CACHE[cache_key] < MEMBER_TAG_SYNC_TTL_SECONDS:
+    if not tag_from_message and not force and cache_key in MEMBER_TAG_SYNC_CACHE and now_mono-MEMBER_TAG_SYNC_CACHE[cache_key] < MEMBER_TAG_SYNC_TTL_SECONDS:
         current=get_member(chat_id,user_id)
         return role_for(current["role_name"]) if current and current["role_name"] else role_for_tag(current["tag"]) if current and current["tag"] else None
-    try:
-        member=await bot.get_chat_member(chat_id,user_id); MEMBER_TAG_SYNC_CACHE[cache_key]=now_mono
-    except (TelegramForbiddenError,TelegramNotFound,TelegramBadRequest,TelegramNetworkError,TelegramServerError) as exc:
-        logger.warning("Could not read member state | chat=%s user=%s | %s",chat_id,user_id,exc); return None
-    target=user or getattr(member,"user",None)
+    member = None
+    if tag_from_message:
+        target = user
+        active = True
+        actual = str(message_tag or "").strip()
+    else:
+        try:
+            member=await bot.get_chat_member(chat_id,user_id); MEMBER_TAG_SYNC_CACHE[cache_key]=now_mono
+        except (TelegramForbiddenError,TelegramNotFound,TelegramBadRequest,TelegramNetworkError,TelegramServerError) as exc:
+            logger.warning("Could not read member state | chat=%s user=%s | %s",chat_id,user_id,exc); return None
+        target=user or getattr(member,"user",None)
+        active=_chat_member_is_active(member)
+        actual=(getattr(member,"tag",None) or getattr(member,"custom_title",None) or "").strip()
     if not target or getattr(target,"is_bot",False): return None
-    active=_chat_member_is_active(member); status=getattr(member,"status","")
-    actual=(getattr(member,"tag",None) or getattr(member,"custom_title",None) or "").strip()
     previous=get_member(chat_id,target.id)
     prev_role=role_for(previous["role_name"]) if previous and previous["role_name"] else None
+    if tag_from_message and previous and bool(previous["active"]) and (previous["tag"] or "") == actual:
+        return prev_role or (role_for_tag(actual) if actual else None)
     upsert_group_member(chat_id,target,active=active,tag=actual,confirmed=bool(previous["confirmed"]) if previous else False,tag_set_by_bot=None)
     note_roster_user(chat_id,target)
     if not active: return None
@@ -4689,6 +4703,38 @@ async def sync_member_tag(chat_id, user_id, *, user=None, refresh_roster=False, 
         record_role_history(chat_id,target.id,normalize_role(role["name"]),role["name"],actual,"synced")
     if refresh_roster: await update_group_roster(chat_id)
     return role or prev_role
+
+
+async def member_tag_capture_middleware(handler, event, data):
+    message = event
+    try:
+        chat = getattr(message, "chat", None)
+        user = getattr(message, "from_user", None)
+        sender_tag = getattr(message, "sender_tag", None)
+        if (
+            chat and getattr(chat, "type", None) in {"group", "supergroup"}
+            and int(getattr(chat, "id", 0) or 0) == PRIMARY_CHAT_ID
+            and user and not getattr(user, "is_bot", False)
+        ):
+            if sender_tag is not None:
+                # New Bot API: take the tag directly from the message, with no
+                # per-message getChatMember request.
+                await sync_member_tag(
+                    int(chat.id), int(user.id), user=user, message_tag=sender_tag,
+                    tag_from_message=True, force=True,
+                )
+            else:
+                # Older clients / messages may omit sender_tag. The fallback is
+                # throttled per user by MEMBER_TAG_SYNC_TTL_SECONDS.
+                await sync_member_tag(int(chat.id), int(user.id), user=user, force=False)
+    except Exception:
+        logger.exception("Could not capture Telegram sender_tag from message")
+    return await handler(event, data)
+
+
+# Middleware is deliberately non-blocking: it observes tags, then lets every
+# existing command/game/moderation handler process the same update as before.
+dp.message.outer_middleware(member_tag_capture_middleware)
 
 
 async def update_group_roster(chat_id: int):
@@ -4775,7 +4821,7 @@ async def send_or_edit_welcome(chat_id, user_id):
         if not row or not row["active"]:
             return
 
-        if not cmdcfg.get_bool("newcomers", "welcome"):
+        if not cmdcfg.is_enabled("newcomers") or not cmdcfg.get_bool("newcomers", "welcome"):
             return
         display = (row["username"] and "@" + row["username"]) or row["first_name"] or "участник"
         text = f"{title('🌸 Justice Faite')}\n\n" + jfui.render_template(cmdcfg.get_str("newcomers", "welcome_text"), name=display)
@@ -4868,7 +4914,7 @@ async def group_member_update(event: ChatMemberUpdated):
         await sync_member_tag(chat_id, user.id, user=user, refresh_roster=False, force=True)
         # Role assignment is deliberately NOT automatic.
         # The owner/admin performs the Call ID flow manually after the participant enters.
-        if cmdcfg.get_bool("newcomers", "restrict"):
+        if cmdcfg.is_enabled("newcomers") and cmdcfg.get_bool("newcomers", "restrict"):
             try:
                 await bot.restrict_chat_member(
                     chat_id,
@@ -4900,7 +4946,7 @@ async def group_member_update(event: ChatMemberUpdated):
             with suppress(Exception):
                 await bot.delete_message(chat_id, welcome_message_id)
 
-        if cmdcfg.get_bool("newcomers", "notify_leave"):
+        if cmdcfg.is_enabled("newcomers") and cmdcfg.get_bool("newcomers", "notify_leave"):
             with suppress(Exception):
                 await bot.send_message(
                     ADMIN_ID,
@@ -5389,7 +5435,7 @@ def custom_spec(row) -> "cmdcfg.Spec":
     name = row["command"]
     return cmdcfg.Spec(
         key="cc_" + name, title="/" + name, emoji="✨", category="custom",
-        desc=row["description"] or "Своя команда", triggers=("/" + name,),
+        desc=row["description"] or "Своя команда", triggers=("/" + name,), aliases=("/" + name,),
         access=access, where=where, menu=((name, (row["description"] or name)[:256]),), custom=True,
         params=(
             cmdcfg.Param("response", "Текст ответа", "text", row["response"],
@@ -5490,7 +5536,7 @@ async def help_cmd(message: Message):
     if not await cmdcfg.gate(message, "help"):
         return
     uid = int(message.from_user.id) if message.from_user else 0
-    level = await cmdcfg.level_of(uid)
+    level, rank, is_member = await cmdcfg._access_context(uid, int(message.chat.id))
     chat_type = message.chat.type
     compact = cmdcfg.get_bool("help", "compact")
     show_custom = cmdcfg.get_bool("help", "show_custom")
@@ -5502,7 +5548,8 @@ async def help_cmd(message: Message):
         for spec in sorted(cmdcfg.specs_in(cat), key=lambda s: s.title):
             if spec.feature or not spec.triggers:
                 continue
-            if not cmdcfg.visible(spec.key, chat_type=chat_type, level=level):
+            if not cmdcfg.visible(spec.key, chat_type=chat_type, level=level, rank=rank,
+                                  is_member=is_member, user_id=uid, chat_id=int(message.chat.id)):
                 continue
             trigger = next((t for t in spec.triggers if t != "кнопка в меню"), None)
             if not trigger:
@@ -5518,35 +5565,6 @@ async def help_cmd(message: Message):
             await cmdcfg.respond(message, "help", chunk)
         else:
             await message.answer(chunk)
-
-
-@dp.message(Command("roles_audit"), F.chat.type == "private")
-async def roles_audit_cmd(message: Message):
-    if not await cmdcfg.gate(message, "roles_audit"):
-        return
-    chat_id = PRIMARY_CHAT_ID
-    limit = cmdcfg.get_int("roles_audit", "history_limit")
-    active = group_db_op(lambda conn: conn.execute("SELECT COUNT(*) AS n FROM group_members WHERE chat_id=? AND active=1", (chat_id,)).fetchone())["n"]
-    assigned = group_db_op(lambda conn: conn.execute("SELECT COUNT(*) AS n FROM group_members WHERE chat_id=? AND active=1 AND role_key IS NOT NULL", (chat_id,)).fetchone())["n"]
-    recent = group_db_op(lambda conn: conn.execute(
-        "SELECT h.user_id,h.role_name,h.event,h.created_at,COALESCE(m.username,m.first_name,CAST(h.user_id AS TEXT)) AS who "
-        "FROM role_history h LEFT JOIN group_members m ON m.chat_id=h.chat_id AND m.user_id=h.user_id "
-        "WHERE h.chat_id=? ORDER BY h.id DESC LIMIT ?", (chat_id, limit)).fetchall())
-    lines = [
-        title("🔎 Аудит ролей"), "",
-        bullet(f"Основной чат: {chat_id}"),
-        bullet(f"Активных участников: {active}"),
-        bullet(f"С назначенной ролью: {assigned}"),
-        bullet(f"Без роли: {active - assigned}"),
-        "", section("Последние изменения"),
-    ]
-    if recent:
-        for r in recent:
-            who = f"@{r['who']}" if r["who"] and not str(r["who"]).startswith("@") and not str(r["who"]).isdigit() else str(r["who"])
-            lines.append(bullet(f"{who} — {r['role_name']} ({r['event']})"))
-    else:
-        lines.append(bullet("пока нет записей"))
-    await message.reply("\n".join(lines))
 
 
 @dp.message(Command("syncroles"))
@@ -6652,8 +6670,11 @@ def seed_default_games():
 
 def _menu_entries(level: str, chat_type: str):
     seen, result = set(), []
+    rank = cmdcfg._legacy_rank(level)
+    is_member = level in ("owner", "admins", "members")
     for spec in cmdcfg.REGISTRY.values():
-        if not spec.menu or not cmdcfg.visible(spec.key, chat_type=chat_type, level=level):
+        if not spec.menu or not cmdcfg.visible(spec.key, chat_type=chat_type, level=level,
+                                               rank=rank, is_member=is_member):
             continue
         for cmd, desc in spec.menu:
             if cmd in seen:
@@ -6661,6 +6682,17 @@ def _menu_entries(level: str, chat_type: str):
             seen.add(cmd)
             result.append(BotCommand(command=cmd, description=(desc or cmd)[:256]))
     return result[:100]
+
+
+def _append_menu_if_allowed(items, command: BotCommand, *, level: str, chat_type: str):
+    key = cmdcfg.match_command("/" + command.command)
+    if key is None:
+        return
+    rank = cmdcfg._legacy_rank(level)
+    is_member = level in ("owner", "admins", "members")
+    if cmdcfg.visible(key, chat_type=chat_type, level=level, rank=rank, is_member=is_member):
+        if all(existing.command != command.command for existing in items):
+            items.insert(0, command)
 
 
 async def setup_commands():
@@ -6686,30 +6718,15 @@ async def setup_commands():
     console_command = BotCommand(command="jf_console", description="🧠 Личная консоль владельца")
     memory_command = BotCommand(command="jf_memory", description="🗂️ Память и требования проекта")
     memory_save_command = BotCommand(command="jf_memory_save", description="📝 Сохранить блок памяти проекта")
-    if all(c.command != profile_command.command for c in group_user):
-        group_user.insert(0, profile_command)
-    for item in (reputation_command, reports_command, timers_command, automod_command, fun_command, network_command, raffles_command, clean_command):
-        if all(c.command != item.command for c in group_user): group_user.insert(0, item)
-    if all(c.command != stats_command.command for c in group_user):
-        group_user.insert(0, stats_command)
-    if all(c.command != chatconfig_command.command for c in group_user):
-        group_user.insert(0, chatconfig_command)
-    if all(c.command != community_command.command for c in group_user):
-        group_user.insert(0, community_command)
-    if all(c.command != manager_command.command for c in group_user):
-        group_user.insert(0, manager_command)
-    if all(c.command != profile_command.command for c in group_admin):
-        group_admin.insert(0, profile_command)
-    for item in (reputation_command, reports_command, timers_command, automod_command, fun_command, network_command, raffles_command, clean_command):
-        if all(c.command != item.command for c in group_admin): group_admin.insert(0, item)
-    if all(c.command != stats_command.command for c in group_admin):
-        group_admin.insert(0, stats_command)
-    if all(c.command != chatconfig_command.command for c in group_admin):
-        group_admin.insert(0, chatconfig_command)
-    if all(c.command != community_command.command for c in group_admin):
-        group_admin.insert(0, community_command)
-    if all(c.command != manager_command.command for c in group_admin):
-        group_admin.insert(0, manager_command)
+    memory_search_command = BotCommand(command="jf_memory_search", description="🔎 Найти запись в архиве ЛС")
+    console_refresh_command = BotCommand(command="jf_console_refresh", description="🔄 Обновить личную консоль")
+    group_extras = (profile_command, reputation_command, reports_command, timers_command,
+                    automod_command, fun_command, network_command, raffles_command,
+                    clean_command, stats_command, chatconfig_command, community_command,
+                    manager_command)
+    for item in group_extras:
+        _append_menu_if_allowed(group_user, item, level="members", chat_type="supergroup")
+        _append_menu_if_allowed(group_admin, item, level="admins", chat_type="supergroup")
 
     stale_scopes = [
         BotCommandScopeDefault(),
@@ -6726,7 +6743,7 @@ async def setup_commands():
         with suppress(Exception):
             await bot.set_my_commands([], scope=scope)
 
-    for item in (console_command, memory_command, memory_save_command):
+    for item in (console_command, console_refresh_command, memory_command, memory_save_command, memory_search_command):
         if all(c.command != item.command for c in owner_private):
             owner_private.insert(0, item)
 
@@ -8398,6 +8415,18 @@ async def spy_callback(callback: CallbackQuery):
         await callback.answer("Игра не найдена.", show_alert=True)
         return
 
+    # Some Spy buttons live in the player's private chat. Their policy belongs
+    # to the originating group, not to the private message carrying the button.
+    if not await cmdcfg.gate_callback(
+        callback,
+        "spy",
+        commit=False,
+        chat_id_override=int(game["chat_id"]),
+        chat_type_override="supergroup",
+        respect_cooldown=False,
+    ):
+        return
+
     if action == "rules":
         await callback.answer(
             "Случайный порядок: вопрос → ответ Да/Нет → отвечавший задаёт следующий вопрос. После 2–3 кругов — обсуждение и голосование. Раскрытый шпион получает 60 секунд на догадку локации.",
@@ -8740,8 +8769,18 @@ async def spy_callback(callback: CallbackQuery):
 
 try:
     cmdspecs.load()
-    cmdcfg.configure(bot=bot, owner_id=ADMIN_ID, primary_chat_id=PRIMARY_CHAT_ID)
+    import cmdcatalog
+    extra_command_count = cmdcatalog.load()
+    cmdcfg.configure(bot=bot, owner_id=ADMIN_ID, primary_chat_id=PRIMARY_CHAT_ID, manager=JF_MANAGER)
     cmdcfg.bind_db(group_db_op)
+    cmdcfg.set_menu_refresher(refresh_command_menu)
+    # Central, silent command-access gate: covers every command alias in the catalog,
+    # including modules that have their own broad text dispatcher.
+    dp.message.outer_middleware(cmdcfg.command_access_middleware)
+    # Interactive buttons follow the same per-command policy as their parent
+    # feature. Navigation-only buttons are intentionally not gated.
+    dp.callback_query.outer_middleware(cmdcfg.callback_access_middleware)
+    logger.info("Command access catalog loaded | total=%s | extra=%s", len(cmdcfg.REGISTRY), extra_command_count)
     cmdcfg.STORE.on_change(apply_setting)
     from justice_features import (
         register_justice_features,
@@ -8999,7 +9038,13 @@ async def custom_command_dispatch(message: Message):
 async def main():
     global DELIVERY_QUEUE, BROADCAST_QUEUE, FATAL_EVENT
 
-    logger.info("Starting Anonymous Feedback Bot...")
+    logger.info("Starting Justice Faite Manager...")
+
+    # Restore before any schema initializer touches the database. Render Free
+    # instances lose local SQLite files on restart/redeploy/idle spin-down.
+    restored = await JF_CONSOLE.restore_if_missing()
+    if restored:
+        logger.warning("Persistent SQLite state restored from the owner's pinned DM backup")
 
     init_db()
     migrate_db()

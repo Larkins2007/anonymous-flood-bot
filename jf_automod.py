@@ -7,6 +7,7 @@ from __future__ import annotations
 import html,re,sqlite3,threading
 from contextlib import suppress
 from datetime import datetime,timedelta,timezone
+import cmdcfg
 GROUP_TYPES={"group","supergroup"}
 COMMAND_PATTERN=(r"(?isu)^\s*(?:/jf_automod(?:@[A-Za-z0-9_]+)?(?:\s|$)|[!.\/]{0,4}(?:(?:ирис(?:ка)?|iris)\s+)?(?:\+триггер\s+.+|триггеры|-триггер\s+\d+))\s*$")
 def now():return datetime.now(timezone.utc)
@@ -50,13 +51,13 @@ class Automod:
    lines=[f"#{r['id']} · <b>{esc(r['keyword'])}</b> → {r['action']} · {'вкл' if r['enabled'] else 'выкл'}" for r in rows]
    return await self.reply(m,"<b>Триггеры чата</b>\n"+("\n".join(lines) or "Нет созданных триггеров."))
   if low.startswith("-триггер "):
-   if await self.rank(chat,uid)<3:return await self.reply(m,"⛔ Управлять триггерами могут администраторы от 3 ранга.")
+   if not cmdcfg.access_was_checked(m) and await self.rank(chat,uid)<3:return await self.reply(m,"⛔ Управлять триггерами могут администраторы от 3 ранга.")
    try:tid=int(low.split()[-1])
    except ValueError:return await self.reply(m,"Укажи номер триггера.")
    n=self.store.run(lambda c:c.execute("DELETE FROM jf_automod_triggers WHERE chat_id=? AND id=?",(chat,tid)).rowcount)
    return await self.reply(m,"Триггер удалён." if n else "Триггер не найден.")
   if low.startswith("+триггер "):
-   if await self.rank(chat,uid)<3:return await self.reply(m,"⛔ Управлять триггерами могут администраторы от 3 ранга.")
+   if not cmdcfg.access_was_checked(m) and await self.rank(chat,uid)<3:return await self.reply(m,"⛔ Управлять триггерами могут администраторы от 3 ранга.")
    payload=first[len("+Триггер "):].strip()
    if "|" not in payload:return await self.reply(m,"Формат: <code>+Триггер запрещённая фраза | удалить</code> или <code>| варн</code>.")
    keyword,action=[x.strip() for x in payload.rsplit("|",1)];action=action.casefold()

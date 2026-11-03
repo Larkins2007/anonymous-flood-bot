@@ -1,8 +1,8 @@
 """Единый визуальный стиль бота и мелкие текстовые/временные утилиты.
 
-Стиль: спокойные «карточки» — заголовок с ромбом, тонкая линия-разделитель,
-строки через «▸» и «·», статусы цветными кружками. Только обычный Unicode —
-никакой разметки, поэтому любой пользовательский текст безопасен.
+Стиль: компактные карточки — заголовок с эмодзи, пустая строка между блоками,
+короткие пункты с эмодзи. Декоративные горизонтальные линии отключены.
+Только обычный Unicode — никакой разметки, поэтому пользовательский текст безопасен.
 
 Модуль не зависит от aiogram, поэтому его можно тестировать офлайн.
 """
@@ -14,7 +14,8 @@ import re
 from datetime import datetime, timedelta, timezone
 from typing import Iterable, Optional
 
-RULE = "┈" * 14
+# Deliberately empty: project-wide messages use spacing, not horizontal rules.
+RULE = ""
 
 ICON_ON = "🟢"
 ICON_OFF = "⚫"
@@ -28,24 +29,25 @@ ICON_FAIL = "❌"
 # --------------------------------------------------------------------------
 
 def title(text: str) -> str:
-    """Заголовок карточки."""
-    return f"◈ {text}\n{RULE}"
+    """Заголовок карточки без декоративной линии."""
+    return f"✨ {text}"
 
 
 def section(text: str) -> str:
-    return f"▸ {text}"
+    return f"🔹 {text}"
 
 
 def bullet(text: str) -> str:
-    return f"  · {text}"
+    return f"🌿 {text}"
 
 
 def note(text: str) -> str:
-    return f"  ⌁ {text}"
+    return f"💡 {text}"
 
 
 def divider() -> str:
-    return RULE
+    """Совместимость со старым кодом: визуальные разделители отключены."""
+    return ""
 
 
 def warning(text: str) -> str:
@@ -61,7 +63,7 @@ def fail(text: str) -> str:
 
 
 def kv(label: str, value) -> str:
-    return f"  · {label}: {value}"
+    return f"🔸 {label}: {value}"
 
 
 def onoff(flag: bool) -> str:
@@ -77,7 +79,7 @@ def card(head: str, *blocks: Optional[str], footer: Optional[str] = None) -> str
         parts.append(block if isinstance(block, str) else "\n".join(block))
     text = "\n\n".join(parts)
     if footer:
-        text += f"\n\n{RULE}\n{footer}"
+        text += f"\n\n{footer}"
     return text
 
 

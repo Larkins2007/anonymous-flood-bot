@@ -6,6 +6,7 @@ import sqlite3
 import threading
 from contextlib import suppress
 from datetime import datetime, timezone
+import cmdcfg
 
 GROUP_TYPES={"group","supergroup"}
 COMMANDS=(
@@ -119,7 +120,7 @@ class Profiles:
             if command in {"-ник","ник удалить"}:
                 target,rest=self._resolve(m,args)
                 if target is None:target=uid
-                if target!=uid and await self.rank(chat_id,uid)<3:return await self.reply(m,"⛔ Установить или удалить ник другого участника может администратор.")
+                if target!=uid and await self.rank(chat_id,uid)<3 and not cmdcfg.access_was_checked(m):return await self.reply(m,"⛔ Установить или удалить ник другого участника может администратор.")
                 self.store.update(chat_id,target,"nickname","",uid);return await self.reply(m,"Ник удалён.")
             value=args[:30].strip()
             if not value:return await self.reply(m,"Формат: <code>+Ник Новый ник</code>")
@@ -131,7 +132,7 @@ class Profiles:
             if command in {"-звание","звание удалить"}:
                 target,rest=self._resolve(m,args)
                 if target is None:target=uid
-                if target!=uid and await self.rank(chat_id,uid)<3:return await self.reply(m,"⛔ Удалить чужое звание может администратор.")
+                if target!=uid and await self.rank(chat_id,uid)<3 and not cmdcfg.access_was_checked(m):return await self.reply(m,"⛔ Удалить чужое звание может администратор.")
                 self.store.update(chat_id,target,"title","",uid);return await self.reply(m,"Звание удалено.")
             value=args[:30].strip()
             if not value:return await self.reply(m,"Формат: <code>+Звание Участник месяца</code>")
@@ -152,7 +153,7 @@ class Profiles:
                 self.store.update(chat_id,uid,"motto",value,uid);return await self.reply(m,"✅ Девиз сохранён.")
             row=self.store.get(chat_id,uid);return await self.reply(m,f"Твой девиз: <i>{_esc(row['motto'] if row else '') or 'не установлен'}</i>")
         if command in {"назначить ник","удалить ник","назначить звание","удалить звание"}:
-            if await self.rank(chat_id,uid)<3:return await self.reply(m,"⛔ Команда доступна администраторам (ранг 3+) или ответом на сообщение участника.")
+            if await self.rank(chat_id,uid)<3 and not cmdcfg.access_was_checked(m):return await self.reply(m,"⛔ Команда доступна администраторам (ранг 3+) или ответом на сообщение участника.")
             target,value=self._resolve(m,args)
             if target is None:return await self.reply(m,"Укажи @username/ID в конце команды или ответь на сообщение участника.")
             key="nickname" if "ник" in command else "title"

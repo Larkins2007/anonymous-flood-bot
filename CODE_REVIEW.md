@@ -69,3 +69,31 @@ Validated locally after the addition:
 - `python3 tests/run_all.py` — all six suites pass, including new tests for ranks, access control, warning lifecycle, mute/ban/kick handlers, alias parsing, quiet kick, command routing, and schema isolation.
 
 This remains an offline validation using the project's aiogram stubs. It does not prove live compatibility with the Telegram API or the exact permissions in the production group. Test in a private group before enabling it in the main community.
+
+
+## Follow-up validation — Justice Faite Manager 0.5
+
+- Owner console now has five independently edited messages and a private owner-message journal with search.
+- A compressed SQLite snapshot is maintained as the latest pinned owner-DM document every five minutes. Startup validates the DB and attempts recovery before schema initialization; invalid local DB files are quarantined instead of blocking startup.
+- The group role database is the same configured `DB_PATH`, so role membership, tags, role history and project-memory records are included in the snapshot.
+- Telegram member tags are captured from `Message.sender_tag` on messages. When that field is missing, the bot falls back to `getChatMember` with per-user throttling.
+- Offline validation: `python3 -m compileall -q .` and `python3 tests/run_all.py` pass all 20 test modules.
+
+This backup is a recovery layer, not a guarantee equivalent to persistent storage. It depends on the pinned owner-DM document remaining available, Telegram being reachable, and the compressed database staying below the 18 MB safety threshold. The archive has not been started with a live bot token or deployed to Render in this environment.
+
+
+## Повторная проверка 0.6.0
+
+- Добавлена проверка пагинации карты ролей (20 участников на страницу), callback-кнопок и переходов назад/вперёд.
+- Проверены синтаксис Python и полный офлайн-набор модулей тестов.
+- Тесты используют заглушки aiogram; фактическая отправка, закрепление и редактирование сообщений Telegram должны быть проверены после развёртывания с настоящим токеном.
+
+
+## Повторная проверка 0.7.0 — единая политика команд
+
+- Реестр содержит 215 записей: 212 настраиваемых политик команд/действий кнопок и 3 автоматические функции. У каждой записи проверено наличие общих параметров и отсутствие конфликтов алиасов.
+- Текстовые команды проходят через `command_access_middleware` до прикладных обработчиков. Выключенная команда молча пропускается и не вызывает `getChatMember`; для callback-кнопок используется сопоставление с отдельной или родительской политикой.
+- Разделены администраторы Telegram и внутренние ранги. Членство и ранги запрашиваются для фактической группы, а не неизменно для основного флуда. Cooldown ключуется по команде, группе и пользователю.
+- Индивидуальные исключения могут быть глобальными или привязанными к chat_id; для каждого изменения создаётся запись аудита.
+- Проверены `python -m compileall -q .` и полный `python tests/run_all.py` (22 тестовых модуля). Это офлайн-тестирование с aiogram-заглушками, не тест реальной работы бота с Telegram API.
+- Живое развёртывание/запуск не выполнены: для этого нужны токен и доступ к сервису пользователя. Не запускайте вторую копию с тем же BOT_TOKEN одновременно с текущим экземпляром — Telegram вернёт конфликт polling.

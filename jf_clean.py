@@ -3,6 +3,7 @@ from __future__ import annotations
 import re,sqlite3,threading
 from contextlib import suppress
 from datetime import datetime,timedelta,timezone
+import cmdcfg
 GROUP_TYPES={"group","supergroup"}
 COMMAND_PATTERN=(r"(?isu)^\s*(?:/jf_clean(?:@[A-Za-z0-9_]+)?(?:\s|$)|[!.\/]{0,4}(?:(?:ирис(?:ка)?|iris)\s+)?(?:-смс(?:\s+\d+)?|!пург(?:\s+\d+)?(?:\s+тихо)?))\s*$")
 def now():return datetime.now(timezone.utc)
@@ -42,7 +43,7 @@ class Cleaner:
   chat,uid=int(m.chat.id),int(m.from_user.id)
   try:rank=await self.manager._rank(chat,uid)
   except Exception:rank=self.manager.store.rank(chat,uid)
-  if rank<2:return await self.reply(m,"⛔ Чистка доступна модераторам от 2 ранга.")
+  if rank<2 and not cmdcfg.access_was_checked(m):return await self.reply(m,"⛔ Чистка доступна модераторам от 2 ранга.")
   reply=getattr(m,"reply_to_message",None)
   command_id=int(getattr(m,"message_id",0) or 0)
   if low.startswith("-смс"):

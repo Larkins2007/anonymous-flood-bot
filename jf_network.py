@@ -3,6 +3,7 @@ from __future__ import annotations
 import html,re,secrets,sqlite3,threading
 from contextlib import suppress
 from datetime import datetime,timezone
+import cmdcfg
 GROUP_TYPES={"group","supergroup"}
 COMMAND_PATTERN=(r"(?isu)^\s*(?:/jf_network(?:@[A-Za-z0-9_]+)?(?:\s|$)|[!.\/]{0,4}(?:(?:ирис(?:ка)?|iris)\s+)?(?:сетка создать|сетка привязать\s+[A-Z0-9]{6,12}|сетка отвязать|сетка чаты|сетка \+модер\s+\d\s+.+|сетка -модер\s+.+|сетка модер|сетка баны|глобан\s+.+|глоразбан\s+.+))\s*$")
 def now():return datetime.now(timezone.utc).isoformat()
@@ -36,6 +37,8 @@ class Network:
   except Exception:return self.manager.store.rank(chat,uid)
  async def owner_only(self,m):
   uid=int(m.from_user.id)
+  if cmdcfg.access_was_checked(m):
+   return True
   if await self.rank(int(m.chat.id),uid)<5:
    await self.reply(m,"⛔ Управлять сеткой может только создатель чата (ранг 5).")
    return False

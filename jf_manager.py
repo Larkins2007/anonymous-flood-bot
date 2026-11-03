@@ -16,6 +16,8 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+import cmdcfg
+
 # Public command catalog: the same keys are used by command-access settings.
 COMMANDS = {
     "mod_add": ("Назначение модератора", 3),
@@ -460,11 +462,46 @@ class Manager:
         return rank
 
     async def _gate(self, message, key: str, *, silent: bool = True) -> bool:
+        # The middleware is the source of truth in production. Direct dispatcher
+        # calls (tests, integrations and future modules) use the same central
+        # policy instead of falling back to the retired per-chat access table.
+        if cmdcfg.access_was_checked(message):
+            return True
+        central_keys = {
+            "mod_add": "mgr_mod_add", "mod_remove": "mgr_mod_remove",
+            "mod_promote": "mgr_mod_promote", "mod_demote": "mgr_mod_demote",
+            "rank_label_set": "mgr_rank_labels",
+            "mod_list": "mgr_mod_list", "who_assigned": "mgr_who_assigned",
+            "mod_log": "mgr_mod_log", "ban": "mgr_ban", "unban": "mgr_unban",
+            "kick": "mgr_kick", "warn": "mgr_warn", "warnings": "mgr_warnings",
+            "warn_view": "mgr_warnings", "warn_list": "mgr_warn_list",
+            "warn_remove": "mgr_warn_remove",
+            "mute": "mgr_mute", "unmute": "mgr_unmute", "mute_list": "mgr_mute_list",
+            "mute_check": "mgr_mute_check", "ban_list": "mgr_ban_list",
+            "reason": "mgr_reason", "access_view": "mgr_access_view",
+            "access_view_self": "mgr_access_view_self",
+            "access_edit": "mgr_access_set", "access_log": "mgr_access_log",
+            "setting_warn_limit": "mgr_setting_warn_limit",
+            "setting_warn_period": "mgr_setting_warn_period",
+            "setting_warn_ban": "mgr_setting_warn_ban",
+            "setting_mute_period": "mgr_setting_mute_period",
+            "setting_ban_period": "mgr_setting_ban_period",
+            "rank_labels": "mgr_rank_labels",
+            "rank_label_set": "mgr_rank_labels",
+            "rank_labels_reset": "mgr_rank_labels_reset",
+        }
+        central_key = central_keys.get(key)
+        if central_key in cmdcfg.REGISTRY:
+            return await cmdcfg.gate(message, central_key, notify=not silent, commit=False)
         rank = await self._rank(int(message.chat.id), int(message.from_user.id))
         required = self.store.access(int(message.chat.id), key)
-        allowed = rank >= 5 or (required < 6 and rank >= required)
+        # Rank 6 means hard-disabled, including for the chat creator. The owner
+        # still retains access to the separate /settings command-access panel.
+        if required >= 6:
+            return False
+        allowed = rank >= required
         if not allowed and not silent:
-            await message.reply(f"⛔ Для команды требуется ранг {required if required < 6 else '— (отключена)'}. Твой ранг: {rank}.")
+            await message.reply(f"⛔ Для команды требуется ранг {required}. Твой ранг: {rank}.")
         return allowed
 
     async def _target(self, message, args: list[str]) -> tuple[Optional[int], list[str], str]:
@@ -693,12 +730,12 @@ class Manager:
         if key == "unknown":
             return
         if key == "rank_labels":
+            if not await self._gate(message, "rank_labels", silent=True): return
             labels = self.store.rank_labels(chat_id)
             await message.reply("<b>Названия рангов</b>\n" + "\n".join(f"{rank} — {html.escape(label)}" for rank,label in labels.items()))
             return
         if key == "rank_label_set":
-            if caller_rank < 5:
-                await self._send_error(message, "Изменять названия рангов может только создатель чата."); return
+            if not await self._gate(message, "rank_label_set", silent=True): return
             if len(args) < 2 or not args[0].isdigit() or not 0 <= int(args[0]) <= 5:
                 await self._send_error(message, "Формат: Ранг название 1 Младший модератор (ранг от 0 до 5)."); return
             rank = int(args[0]); label = " ".join(args[1:]).strip()
@@ -709,8 +746,7 @@ class Manager:
             await message.reply(f"✅ Название ранга {rank} изменено на «{html.escape(label)}».")
             return
         if key == "rank_labels_reset":
-            if caller_rank < 5:
-                await self._send_error(message, "Сбрасывать названия может только создатель чата."); return
+            if not await self._gate(message, "rank_labels_reset", silent=True): return
             self.store.reset_rank_labels(chat_id)
             await message.reply("Названия рангов возвращены к стандартным.")
             return
@@ -725,55 +761,106 @@ class Manager:
                 "<b>Ранги:</b>\n"
                 "+Модер [ранг] @user · Повысить @user · Понизить @user · Снять модер @user\n"
                 "Кто админ · Модер лог · Модераторы названия · Ранг название 1 Текст\n\n"
-                "<b>Настройки:</b> Доступ команд · ДК бан 3 · Варны лимит 3 · Варны период 30 дней\n"
+                "<b>Настройки:</b> /settings — полная панель доступа для каждой команды · ДК бан 3 · ДК /spy 6 — выключить\n"
                 "Участника удобнее всего указывать ответом на его сообщение. Для @username бот должен знать его ID."
             )
             return
 
-        # Command access menu.
+        # Unified command-access policy. The old per-manager access table is
+        # retained for database compatibility, but no longer decides access.
         if key in {"access_view", "access_view_self"}:
-            if not await self._gate(message, "access_view", silent=False): return
-            rows = []
-            for cmd, (label, default) in COMMANDS.items():
-                required = self.store.access(chat_id, cmd)
-                if key == "access_view_self":
-                    mark = "✅" if required < 6 and caller_rank >= required else "❌"
-                else:
-                    mark = "❌" if required == 6 else "✅"
-                status = "выключена" if required == 6 else f"ранг {required}"
-                rows.append(f"{mark} {label}: {status} (по умолчанию {default})")
-            heading = "Твой доступ команд" if key == "access_view_self" else "Доступ команд Justice Faite"
-            await message.reply(f"<b>{heading}</b>\n" + "\n".join(rows))
-            return
-        if key == "access_set":
-            if not await self._gate(message, "access_edit", silent=False): return
-            if len(args) < 2:
-                await message.reply("Формат: ДК бан 3 · ДК мут 2 · ДК бан 6 (отключить).\nДопустимые разделы: " + ", ".join(sorted(COMMANDS)))
+            if not await self._gate(message, key, silent=True):
                 return
-            command_name = "_".join(args[:-1]).casefold()
-            aliases = {"модер":"mod_add", "повысить":"mod_add", "снять модер":"mod_remove", "варн":"warn", "пред":"warn", "предупреждения":"warn_view", "предупреждения пользователя":"warn_view", "выдача варнов":"warn", "снятие варнов":"warn_remove", "мут":"mute", "выдача мута":"mute", "список мутов":"mute_list", "размут":"unmute", "бан":"ban", "выдача бана":"ban", "разбан":"unban", "кик":"kick", "кто админ":"mod_list", "банлист":"ban_list", "варнлист":"warn_view", "причина":"reason", "причина бана":"reason", "модер лог":"mod_log", "вызов дк":"access_view", "мдк":"access_view_self", "доступ команд":"access_view"}
-            command_key = aliases.get(" ".join(args[:-1]).casefold(), aliases.get(command_name, command_name))
-            if command_key not in COMMANDS:
-                await self._send_error(message, "Неизвестная команда. Используй название из списка /jf_manager."); return
-            try: rank = int(args[-1])
-            except ValueError:
-                await self._send_error(message, "Ранг должен быть числом от 0 до 6."); return
-            if not 0 <= rank <= 6:
-                await self._send_error(message, "Ранг должен быть числом от 0 до 6."); return
-            self.store.set_access(chat_id, command_key, rank, actor_id)
-            self.store.log_action(chat_id, actor_id, None, "access_set", None, f"{command_key}={rank}", {"command": command_key, "rank": rank})
-            await message.reply(f"⚙️ Доступ к «{COMMANDS[command_key][0]}»: {'отключён' if rank == 6 else f'с ранга {rank}'}.")
+            is_bot_owner = int(actor_id) == int(cmdcfg.RT.owner_id or 0)
+            level = "owner" if is_bot_owner else ("admins" if caller_rank >= 3 else "members")
+            all_specs = [spec for spec in cmdcfg.REGISTRY.values() if not spec.feature]
+            disabled_count = sum(1 for spec in all_specs if not cmdcfg.is_enabled(spec.key))
+            changed_count = sum(1 for spec in all_specs if cmdcfg.changed_from_default(spec.key))
+            if key == "access_view_self":
+                denied = []
+                for spec in all_specs:
+                    allowed = cmdcfg.is_enabled(spec.key) and cmdcfg.access_allowed(
+                        cmdcfg.get_str(spec.key, "access"), level=level, rank=caller_rank, is_member=True
+                    )
+                    if not allowed:
+                        denied.append(f"🚫 {html.escape(spec.title)}")
+                heading = "Твой доступ команд"
+                lines = denied[:18]
+                tail = f"\nЗакрыто для тебя: {len(denied)} из {len(all_specs)}."
+            else:
+                changed = []
+                for spec in all_specs:
+                    enabled = cmdcfg.is_enabled(spec.key)
+                    access = cmdcfg.get_str(spec.key, "access")
+                    if not enabled or access != spec.access or cmdcfg.get_str(spec.key, "where") != spec.where:
+                        label = cmdcfg.ACCESS_LABELS.get(access, access)
+                        state = "выключена" if not enabled else label
+                        changed.append(f"⚙️ {html.escape(spec.title)}: {html.escape(state)}")
+                heading = "Доступ команд Justice Faite"
+                lines = changed[:18]
+                tail = f"\nКоманд: {len(all_specs)} · выключено: {disabled_count} · настроено вручную: {changed_count}."
+            body = "\n".join(lines) if lines else ("Нет команд, закрытых для тебя." if key == "access_view_self" else "Все команды используют настройки по умолчанию.")
+            await message.reply(
+                f"<b>{heading}</b>\n{body}\n{tail}\n\n"
+                "Полный поиск и настройка каждой команды доступны владельцу через /settings."
+            )
             return
+
+        if key == "access_set":
+            if not await self._gate(message, key, silent=True):
+                return
+            if len(args) < 2:
+                await message.reply("Формат: ДК бан 3 · ДК /spy 0 · ДК мут 6. Ранг 0 — все, 1–5 — выбранный ранг и выше, 6 — выключить.")
+                return
+            target_name = " ".join(args[:-1]).strip()
+            command_key = cmdcfg.resolve_command_key(target_name)
+            if command_key is None:
+                await message.reply("Команда не найдена. Открой /settings и найди её по названию или алиасу.")
+                return
+            try:
+                rank = int(args[-1])
+            except ValueError:
+                await message.reply("Ранг должен быть числом от 0 до 6.")
+                return
+            if not 0 <= rank <= 6:
+                await message.reply("Ранг должен быть числом от 0 до 6.")
+                return
+            spec = cmdcfg.REGISTRY[command_key]
+            if rank == 6:
+                cmdcfg.set_value(command_key, "enabled", False, actor_id=actor_id)
+                status_text = "отключён; вызовы будут молча игнорироваться"
+            else:
+                access = "all" if rank == 0 else f"rank_{rank}"
+                ok, result = cmdcfg.set_value(command_key, "access", access, actor_id=actor_id)
+                if not ok:
+                    await message.reply(str(result))
+                    return
+                if not cmdcfg.is_enabled(command_key):
+                    cmdcfg.set_value(command_key, "enabled", True, actor_id=actor_id)
+                status_text = "доступна всем" if rank == 0 else f"доступна с ранга {rank}"
+            await message.reply(f"⚙️ <b>{html.escape(spec.title)}</b> · {status_text}.")
+            return
+
         if key == "access_log":
-            if not await self._gate(message, "access_edit", silent=False): return
-            rows = self.store.action_rows(chat_id, 20)
-            data = [r for r in rows if r["action"] == "access_set"]
-            await message.reply("<b>Последние действия с доступом</b>\n" + ("\n".join(f"#{r['id']} · {r['details_json']} · {r['created_at'][:16]}" for r in data[:10]) or "Изменений нет."))
+            if not await self._gate(message, key, silent=True):
+                return
+            rows = cmdcfg.STORE.audit_rows(20)
+            lines = []
+            for audit_id, command, setting, old, new, actor, stamp in rows[:12]:
+                spec = cmdcfg.REGISTRY.get(command)
+                title = spec.title if spec else command
+                old_value = "по умолчанию" if old is None else old
+                new_value = "по умолчанию" if new is None else new
+                lines.append(
+                    f"#{audit_id} · {html.escape(title)} · {html.escape(setting)}\n"
+                    f"{html.escape(str(old_value))} → {html.escape(str(new_value))} · ID {actor} · {html.escape(stamp[:16])}"
+                )
+            await message.reply("<b>📚 История настроек команд</b>\n" + ("\n".join(lines) or "Изменений пока нет."))
             return
 
         # Chat-specific configuration.
         if key.startswith("setting_"):
-            if not await self._gate(message, "settings", silent=False): return
+            if not await self._gate(message, key, silent=False): return
             raw = " ".join(args).strip()
             if key == "setting_warn_limit":
                 try: value = int(raw)
@@ -816,12 +903,13 @@ class Manager:
                 await message.reply("<b>Журнал модерации</b>\n" + ("\n".join(lines) or "Записей нет."))
                 return
             if key == "who_assigned":
-                if not await self._gate(message, "mod_list", silent=False): return
+                if not await self._gate(message, "who_assigned", silent=False): return
                 rows = self.store.action_rows(chat_id, 50, target_id)
                 item = next((r for r in rows if r["action"] == "rank_set"), None)
                 await message.reply(f"Кто назначил: <code>{item['actor_id']}</code>" if item else "История назначения не найдена.")
                 return
-            if not await self._gate(message, "mod_add" if key != "mod_remove" else "mod_remove", silent=False): return
+            access_key = key if key in {"mod_add", "mod_promote", "mod_demote", "mod_remove"} else "mod_remove"
+            if not await self._gate(message, access_key, silent=False): return
             allowed, why = await self._target_guard(message, target_id, caller_rank)
             if not allowed:
                 await self._send_error(message, why); return
@@ -849,7 +937,7 @@ class Manager:
                 if target_id is None and key not in {"warn_list"}:
                     await self._send_error(message, "Ответь на сообщение пользователя или укажи @username, которого бот уже видел, либо Telegram ID."); return
             if key in {"warnings", "warnings_self"}:
-                if target_id != actor_id and not await self._gate(message, "warn_view", silent=False): return
+                if not await self._gate(message, "warnings", silent=False): return
                 rows = self.store.active_warnings(chat_id, target_id)
                 lines = [f"#{r['id']} · {r['reason'] or 'без причины'} · до {r['expires_at'][:16]} UTC" for r in rows[:20]]
                 await message.reply(f"<b>Предупреждения · {len(rows)}</b>\n" + ("\n".join(lines) or "Активных предупреждений нет."))
@@ -910,7 +998,7 @@ class Manager:
             if key == "unmute":
                 await self._unmute(message, target_id, caller_rank); return
             if key == "mute_check":
-                if not await self._gate(message, "mute_list", silent=False): return
+                if not await self._gate(message, "mute_check", silent=False): return
                 rows = self.store.run(lambda c: c.execute("SELECT * FROM jf_manager_restrictions WHERE chat_id=? AND user_id=? AND kind='mute' AND active=1 ORDER BY id DESC LIMIT 1", (chat_id,target_id)).fetchone())
                 await message.reply("🔇 Мут активен." if rows and (not rows["expires_at"] or rows["expires_at"] > iso()) else "🔊 Активный мут не найден.")
                 return
@@ -941,7 +1029,7 @@ class Manager:
 
         # Lists and history.
         if key == "warn_list":
-            if not await self._gate(message, "warn_view", silent=False): return
+            if not await self._gate(message, "warn_list", silent=False): return
             rows = self.store.run(lambda c: c.execute("SELECT * FROM jf_manager_warnings WHERE chat_id=? ORDER BY id DESC LIMIT 20", (chat_id,)).fetchall())
             lines = [f"#{r['id']} · <code>{r['user_id']}</code> · {r['reason'] or 'без причины'} · {r['created_at'][:16]}" for r in rows]
             await message.reply("<b>Журнал предупреждений</b>\n" + ("\n".join(lines) or "Записей нет.")); return

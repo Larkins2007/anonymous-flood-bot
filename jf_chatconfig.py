@@ -6,6 +6,8 @@ import threading
 from contextlib import suppress
 from datetime import datetime, timezone
 
+import cmdcfg
+
 GROUP_TYPES = {"group", "supergroup"}
 COMMANDS = (
     "+правила", "-правила", "правила", "+приветствие", "-приветствие", "приветствие", "+входы", "-входы", "+выходы", "-выходы", "+входы-выходы", "-входы-выходы", "+описание чата", "-описание чата", "!название", "название чата",
@@ -101,6 +103,8 @@ class ChatConfig:
         try: await m.reply(text,parse_mode="HTML",disable_web_page_preview=True)
         except TypeError: await m.reply(text)
     async def admin_only(self,m):
+        if cmdcfg.access_was_checked(m):
+            return True
         rank = await self.rank(int(m.chat.id),int(m.from_user.id))
         if rank < 3:
             await self.reply(m,"⛔ Настраивать чат могут администраторы (ранг 3) и выше.")
