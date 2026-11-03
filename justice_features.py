@@ -76,6 +76,27 @@ def init_justice_features_db() -> None:
             );
             CREATE INDEX IF NOT EXISTS idx_jf_warnings_user ON jf_warnings(chat_id,user_id,removed_at);
 
+            -- Canonical warning ledger; jf_manager.Store adds its remaining schema too.
+            CREATE TABLE IF NOT EXISTS jf_manager_warnings (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                chat_id INTEGER NOT NULL,
+                user_id INTEGER NOT NULL,
+                moderator_id INTEGER NOT NULL,
+                reason TEXT NOT NULL DEFAULT '',
+                created_at TEXT NOT NULL,
+                expires_at TEXT NOT NULL,
+                removed_at TEXT,
+                removed_by INTEGER,
+                removal_note TEXT NOT NULL DEFAULT '',
+                level INTEGER NOT NULL DEFAULT 1,
+                eligible_at TEXT,
+                legacy_warning_id INTEGER
+            );
+            CREATE INDEX IF NOT EXISTS idx_jf_manager_warnings_active
+                ON jf_manager_warnings(chat_id,user_id,removed_at,expires_at);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_jf_manager_warnings_legacy
+                ON jf_manager_warnings(chat_id,legacy_warning_id) WHERE legacy_warning_id IS NOT NULL;
+
             CREATE TABLE IF NOT EXISTS jf_achievements (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 chat_id INTEGER NOT NULL,
@@ -145,6 +166,28 @@ def init_justice_features_db() -> None:
         rest_cols = {row[1] for row in conn.execute("PRAGMA table_info(jf_rest)").fetchall()}
         if "ended_notified_at" not in rest_cols:
             conn.execute("ALTER TABLE jf_rest ADD COLUMN ended_notified_at TEXT")
+        # Merge historical community warnings into the manager's canonical ledger.
+        # The legacy table remains untouched as an audit source; legacy_warning_id
+        # prevents duplicate imports if startup or migration runs more than once.
+        manager_cols = {row[1] for row in conn.execute("PRAGMA table_info(jf_manager_warnings)").fetchall()}
+        for column, definition in {
+            "level": "INTEGER NOT NULL DEFAULT 1",
+            "eligible_at": "TEXT",
+            "legacy_warning_id": "INTEGER",
+        }.items():
+            if column not in manager_cols:
+                conn.execute(f"ALTER TABLE jf_manager_warnings ADD COLUMN {column} {definition}")
+        conn.execute(
+            "CREATE UNIQUE INDEX IF NOT EXISTS idx_jf_manager_warnings_legacy "
+            "ON jf_manager_warnings(chat_id,legacy_warning_id) WHERE legacy_warning_id IS NOT NULL"
+        )
+        conn.execute(
+            """INSERT OR IGNORE INTO jf_manager_warnings
+               (chat_id,user_id,moderator_id,reason,created_at,expires_at,removed_at,removed_by,level,eligible_at,legacy_warning_id)
+               SELECT w.chat_id,w.user_id,w.issued_by,w.reason,w.issued_at,
+                      '9999-12-31T23:59:59+00:00',w.removed_at,w.removed_by,w.level,w.eligible_at,w.id
+               FROM jf_warnings w"""
+        )
         conn.commit()
 
     _q(op)
@@ -283,25 +326,26 @@ def warning_eligible_at(level: int, issued_at: str) -> Optional[str]:
 
 def active_warnings(chat_id: int, user_id: int) -> list:
     return _q(lambda conn: conn.execute(
-        "SELECT * FROM jf_warnings WHERE chat_id=? AND user_id=? AND removed_at IS NULL ORDER BY id",
-        (int(chat_id), int(user_id))).fetchall())
+        "SELECT * FROM jf_manager_warnings WHERE chat_id=? AND user_id=? AND removed_at IS NULL AND expires_at>? ORDER BY id",
+        (int(chat_id), int(user_id), _utc_iso())).fetchall())
 
 
 def issue_warning(chat_id: int, user_id: int, reason: str, issued_by: int):
-    """Новый уровень = число активных предупреждений + 1. Срок ожидания всех активных обновляется."""
+    """Create a warning in the manager's canonical ledger, shared by all modules."""
     now = _utc_iso()
+    far_future = "9999-12-31T23:59:59+00:00"
 
     def op(conn):
         active = conn.execute(
-            "SELECT id,level FROM jf_warnings WHERE chat_id=? AND user_id=? AND removed_at IS NULL ORDER BY id",
-            (int(chat_id), int(user_id))).fetchall()
+            "SELECT id,level FROM jf_manager_warnings WHERE chat_id=? AND user_id=? AND removed_at IS NULL AND expires_at>? ORDER BY id",
+            (int(chat_id), int(user_id), now)).fetchall()
         level = len(active) + 1
         eligible = warning_eligible_at(level, now)
         cur = conn.execute(
-            "INSERT INTO jf_warnings(chat_id,user_id,level,reason,issued_by,issued_at,eligible_at) VALUES(?,?,?,?,?,?,?)",
-            (int(chat_id), int(user_id), level, reason[:2000], int(issued_by), now, eligible))
+            "INSERT INTO jf_manager_warnings(chat_id,user_id,moderator_id,reason,created_at,expires_at,level,eligible_at) VALUES(?,?,?,?,?,?,?,?)",
+            (int(chat_id), int(user_id), int(issued_by), reason[:2000], now, far_future, level, eligible))
         for old in active:
-            conn.execute("UPDATE jf_warnings SET eligible_at=? WHERE id=?",
+            conn.execute("UPDATE jf_manager_warnings SET eligible_at=? WHERE id=?",
                          (warning_eligible_at(int(old["level"]), now), int(old["id"])))
         conn.commit()
         return cur.lastrowid, level, eligible, len(active) + 1
@@ -358,7 +402,7 @@ async def cmd_warnings(message: Message):
                                        "username": getattr(message.from_user, "username", "")}
     limit = cmdcfg.get_int("warnings", "limit")
     rows = _q(lambda conn: conn.execute(
-        "SELECT * FROM jf_warnings WHERE chat_id=? AND user_id=? ORDER BY id DESC LIMIT ?",
+        "SELECT * FROM jf_manager_warnings WHERE chat_id=? AND user_id=? ORDER BY id DESC LIMIT ?",
         (int(_primary_chat_id), int(target["user_id"]), limit)).fetchall())
     if not rows:
         await _reply(message, "warnings", ui.card("Предупреждения", ui.ok(f"У {ui.person(target)} нет предупреждений.")))
@@ -370,7 +414,7 @@ async def cmd_warnings(message: Message):
         extra = ""
         if not r["removed_at"] and r["eligible_at"]:
             extra = f" · снять можно с {ui.fmt_date(r['eligible_at'])}"
-        items.append(f"#{r['id']} · уровень {r['level']} · {status}{extra}\n   {ui.short(r['reason'], 160)} ({ui.fmt_date(r['issued_at'])})")
+        items.append(f"#{r['id']} · уровень {r['level']} · {status}{extra}\n   {ui.short(r['reason'], 160)} ({ui.fmt_date(r['created_at'])})")
     await _reply(message, "warnings", ui.card(
         f"Предупреждения · {ui.person(target)}", ui.kv("Активных", active), "\n".join(items)))
 
@@ -388,7 +432,7 @@ async def cmd_remove_warning(message: Message):
     enforce = cmdcfg.get_bool("warn_remove", "enforce_wait") and not force
 
     def op(conn):
-        row = conn.execute("SELECT * FROM jf_warnings WHERE id=?", (wid,)).fetchone()
+        row = conn.execute("SELECT * FROM jf_manager_warnings WHERE id=? AND chat_id=?", (wid, int(_primary_chat_id))).fetchone()
         if not row:
             return "missing", None
         if row["removed_at"]:
@@ -396,7 +440,7 @@ async def cmd_remove_warning(message: Message):
         eligible = ui.parse_iso(row["eligible_at"]) if row["eligible_at"] else None
         if enforce and eligible and eligible > datetime.now(timezone.utc):
             return "early", row
-        conn.execute("UPDATE jf_warnings SET removed_at=?,removed_by=? WHERE id=?", (_utc_iso(), int(message.from_user.id), wid))
+        conn.execute("UPDATE jf_manager_warnings SET removed_at=?,removed_by=? WHERE id=?", (_utc_iso(), int(message.from_user.id), wid))
         conn.commit()
         return "ok", row
 
@@ -531,6 +575,82 @@ async def cmd_rest(message: Message):
             await _bot.send_message(
                 int(_primary_chat_id),
                 f"🥹 {_mention_html(target)} на ресте до {ui.fmt_date(end_utc)}.", parse_mode="HTML")
+
+
+REST_SELF_FORMAT = ui.card(
+    "Взять рест себе",
+    ui.lines(
+        ui.bullet("взять рест на 7 дней"),
+        ui.bullet("взять рест на 2 недели"),
+        ui.bullet("взять рест до 15.11"),
+        ui.note("Самостоятельный рест ограничен 14 днями. Дату можно указать вместо срока."),
+    ),
+)
+
+
+def _self_rest_args(message: Message) -> str:
+    text = (message.text or "").strip()
+    match = re.match(r"(?iu)^(?:взять\s+рест|/take_rest(?:@\w+)?)\s*(.*)$", text, re.DOTALL)
+    return match.group(1).strip() if match else ""
+
+
+async def cmd_take_rest_self(message: Message):
+    """Участник оформляет короткий рест только для собственной учётной записи."""
+    if not await cmdcfg.gate(message, "rest_self"):
+        return
+    if message.chat.type not in GROUP_TYPES or int(message.chat.id) != int(_primary_chat_id):
+        return
+    user = message.from_user
+    if user is None or getattr(user, "is_bot", False):
+        return
+    args = _self_rest_args(message)
+    if not args:
+        await _reply(message, "rest_self", REST_SELF_FORMAT)
+        return
+
+    end_utc, days, note = parse_rest_period(args)
+    if end_utc is None or days is None:
+        await _reply(message, "rest_self", REST_SELF_FORMAT)
+        return
+    limit = cmdcfg.get_int("rest_self", "max_days")
+    if days < 1 or days > limit:
+        await _reply(message, "rest_self", ui.fail(f"Самостоятельный рест можно оформить максимум на {ui.days_word(limit)}."))
+        return
+
+    # A message in the configured group is proof of current membership; do not
+    # require a second getChatMember round-trip just to save the self-request.
+    with suppress(Exception):
+        _upsert_group_member(int(_primary_chat_id), user, active=True)
+
+    now = _utc_iso()
+    note = note[:300]
+
+    def op(conn):
+        previous = conn.execute(
+            "SELECT active FROM jf_rest WHERE chat_id=? AND user_id=?",
+            (int(_primary_chat_id), int(user.id)),
+        ).fetchone()
+        conn.execute(
+            "INSERT INTO jf_rest(chat_id,user_id,start_at,end_at,note,created_by,created_at,active,ended_notified_at) "
+            "VALUES(?,?,?,?,?,?,?,1,NULL) ON CONFLICT(chat_id,user_id) DO UPDATE SET "
+            "end_at=excluded.end_at,note=excluded.note,created_by=excluded.created_by,created_at=excluded.created_at,"
+            "active=1,ended_notified_at=NULL",
+            (int(_primary_chat_id), int(user.id), now, end_utc.isoformat(), note, int(user.id), now),
+        )
+        conn.commit()
+        return bool(previous and previous["active"])
+
+    extended = _q(op)
+    current = member_by_id(int(user.id)) or {
+        "user_id": int(user.id), "username": getattr(user, "username", ""),
+        "first_name": getattr(user, "first_name", "участник"),
+    }
+    lines = [ui.kv("Участник", ui.person(current)), ui.kv("До", ui.fmt_date(end_utc)),
+             ui.kv("Осталось", ui.left_text(end_utc))]
+    if note:
+        lines.append(ui.kv("Заметка", ui.short(note, 120)))
+    await _reply(message, "rest_self", ui.card("Твой рест продлён" if extended else "Твой рест оформлен",
+                                                ui.lines(*lines)))
 
 
 async def cmd_unrest(message: Message):
@@ -692,14 +812,24 @@ def _saved_birthday(user_id: int) -> Optional[tuple[int, int]]:
 
 _BDAY_HELP = ui.card("День рождения", ui.lines(
     ui.bullet("Отправьте дату: 24.03 или «24 марта». Год не нужен."),
+    ui.bullet("Во флуде: «др 24.03» — дата сохранится сразу в общей карте."),
     ui.bullet("«удалить» — убрать сохранённую дату.")))
+
+
+def _birthday_args(message: Message) -> str:
+    text = (message.text or "").strip()
+    slash = _command_args(message)
+    if text.startswith("/"):
+        return slash
+    match = re.match(r"(?iu)^(?:др|мой\s+др|день\s+рождения|мой\s+день\s+рождения)\s*(.*)$", text, re.DOTALL)
+    return match.group(1).strip() if match else ""
 
 
 async def cmd_birthday(message: Message, state: FSMContext):
     if not await cmdcfg.gate(message, "birthday"):
         return
     uid = int(message.from_user.id)
-    args = _command_args(message)
+    args = _birthday_args(message)
     if _is_owner(message) and args:                    # владелец задаёт дату другому
         target, rest = await resolve_target(message, args)
         if target and rest:
@@ -710,6 +840,35 @@ async def cmd_birthday(message: Message, state: FSMContext):
             _save_birthday(int(target["user_id"]), *parsed)
             await message.answer(ui.ok(f"{ui.person(target)}: {parsed[0]:02d}.{parsed[1]:02d}"))
             return
+    if message.chat.type in GROUP_TYPES:
+        # A user who has just sent a message in the primary group is already
+        # known to be present. Store that Telegram identity before saving the
+        # date so the birthday immediately appears in the shared directory.
+        if int(message.chat.id) != int(_primary_chat_id):
+            return
+        user = message.from_user
+        if user is None or getattr(user, "is_bot", False):
+            return
+        with suppress(Exception):
+            _upsert_group_member(int(_primary_chat_id), user, active=True)
+        current = _saved_birthday(uid)
+        if args:
+            if args.strip().casefold() in {"удалить", "убрать", "delete", "-"}:
+                await message.answer(ui.ok("Дата дня рождения удалена.") if _delete_birthday(uid)
+                                     else ui.note("У тебя не было сохранённой даты."))
+                return
+            parsed = parse_birthday(args)
+            if not parsed:
+                await message.answer(ui.fail("Не понял дату. Напиши: др 24.03 или др 24 марта."))
+                return
+            _save_birthday(uid, *parsed)
+            await message.answer(ui.ok(f"День рождения сохранён: {parsed[0]:02d}.{parsed[1]:02d}."))
+            return
+        head = ui.bullet(f"Сохранено сейчас: {current[0]:02d}.{current[1]:02d}") if current else None
+        await message.answer(ui.card("Мой день рождения", head,
+                                     ui.bullet("Напиши прямо в чате: др 24.03"),
+                                     ui.bullet("Чтобы удалить дату: др удалить")))
+        return
     if not await _is_active_member(uid) and not _is_owner(message):
         await message.answer(ui.card("Дни рождения", ui.note("Доступно участникам флуда.")))
         return
@@ -786,7 +945,9 @@ def dashboard_text() -> str:
                        ui.kv("Без роли", max(0, active - with_role)), ui.kv("На ресте", rest))]
     if cmdcfg.get_bool("dashboard", "show_warnings"):
         w = _q(lambda conn: conn.execute(
-            "SELECT COUNT(*) AS c, COUNT(DISTINCT user_id) AS u FROM jf_warnings WHERE chat_id=? AND removed_at IS NULL", (cid,)).fetchone())
+            "SELECT COUNT(*) AS c, COUNT(DISTINCT user_id) AS u "
+            "FROM jf_manager_warnings WHERE chat_id=? AND removed_at IS NULL AND expires_at>?",
+            (cid, now)).fetchone())
         blocks.append(ui.lines(ui.section("Предупреждения"), ui.kv("Активных", w["c"]), ui.kv("Участников с ними", w["u"])))
     if cmdcfg.get_bool("dashboard", "show_awards"):
         try:
@@ -824,6 +985,14 @@ async def natural_unrest_command(message: Message):
 
 async def natural_restlist_command(message: Message):
     await cmd_restlist(message)
+
+
+async def natural_take_rest_command(message: Message):
+    await cmd_take_rest_self(message)
+
+
+async def natural_birthday_command(message: Message, state: FSMContext):
+    await cmd_birthday(message, state)
 
 
 # --------------------------------------------------------------------------
@@ -919,18 +1088,23 @@ def register_justice_features(ns: dict[str, Any]):
     private = F.chat.type == "private"
     group = F.chat.type.in_(GROUP_TYPES)
 
-    _dp.message.register(cmd_birthday, Command("jf_birthday"), private)
+    _dp.message.register(cmd_birthday, Command("jf_birthday"))
     _dp.message.register(cmd_birthdays, Command("jf_birthdays"), private)
     _dp.message.register(birthday_state_text, BirthdayState.waiting_date, private, F.text, ~F.text.startswith("/"))
+    _dp.message.register(natural_birthday_command,
+                         F.chat.type.in_(GROUP_TYPES),
+                         F.text.regexp(r"(?iu)^\s*(?:др|мой\s+др|день\s+рождения|мой\s+день\s+рождения)(?:\s+.*)?$"))
 
     _dp.message.register(cmd_dashboard, Command("jf_dashboard"))
     _dp.message.register(cmd_warn, Command("jf_warn"))
     _dp.message.register(cmd_warnings, Command("jf_warnings"))
     _dp.message.register(cmd_remove_warning, Command("jf_warn_remove"))
     _dp.message.register(cmd_rest, Command("rest", "jf_rest"))
+    _dp.message.register(cmd_take_rest_self, Command("take_rest"))
     _dp.message.register(cmd_unrest, Command("unrest"))
     _dp.message.register(cmd_restlist, Command("jf_restlist", "restlist"))
 
     _dp.message.register(natural_restlist_command, F.text.regexp(r"(?iu)^\s*рестники\s*$"))
     _dp.message.register(natural_rest_command, F.text.regexp(r"(?iu)^\s*выдать\s+рест(?:\s+.+)?$"))
+    _dp.message.register(natural_take_rest_command, F.text.regexp(r"(?iu)^\s*взять\s+рест(?:\s+.+)?$"))
     _dp.message.register(natural_unrest_command, F.text.regexp(r"(?iu)^\s*снять\s+рест(?:\s+.+)?$"))

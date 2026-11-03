@@ -539,12 +539,19 @@ def _schedule_menu_refresh() -> None:
     if _MENU_REFRESHER is None:
         return
     try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        # Settings may also change during an offline migration or synchronous
+        # test. A coroutine cannot run there; close it explicitly so Python
+        # does not report an un-awaited coroutine during garbage collection.
+        loop = None
+    try:
         result = _MENU_REFRESHER()
         if asyncio.iscoroutine(result):
-            asyncio.get_running_loop().create_task(result)
-    except RuntimeError:
-        # A setting can also be changed from an offline migration or test.
-        pass
+            if loop is None:
+                result.close()
+            else:
+                loop.create_task(result)
     except Exception:
         logger.exception("could not refresh Telegram command menu")
 
@@ -570,7 +577,10 @@ def access_allowed(required: str, *, level: str, rank: Optional[int] = None, is_
     if required == "members":
         return bool(is_member if is_member is not None else level in ("owner", "admins", "members"))
     if required == "admins":
-        return level in ("owner", "admins") or (rank is not None and rank >= 3)
+        # This option means Telegram chat administrators only. Internal
+        # Justice Faite ranks are an independent policy and must be selected
+        # explicitly with rank_1 ... rank_5.
+        return level in ("owner", "admins")
     if required == "owner":
         return level == "owner"
     minimum = ACCESS_MIN_RANK.get(required)
@@ -628,15 +638,19 @@ def reset_runtime_state() -> None:
     _ACTIVE_ACCESS.clear()
 
 
-async def _member_state(user_id: int, *, chat_id: int = 0) -> tuple[str, bool]:
-    """(status, is_member) в целевом чате; в ЛС используется основной чат."""
+async def _member_state(user_id: int, *, chat_id: int = 0,
+                        observed_in_chat: bool = False) -> tuple[str, bool]:
+    """(status, is_member) в целевом чате; входящее сообщение — доказательство членства."""
     target_chat = int(chat_id) if int(chat_id or 0) < 0 else int(RT.primary_chat_id or 0)
-    if not RT.bot or not target_chat:
-        return "left", False
+    if not target_chat:
+        return ("member", True) if observed_in_chat else ("left", False)
+    if not RT.bot:
+        return ("member", True) if observed_in_chat else ("left", False)
     cache_key = (target_chat, int(user_id))
     cached = _MEMBER_CACHE.get(cache_key)
     now = time.monotonic()
-    if cached and now - cached[0] < MEMBER_TTL:
+    # A fresh incoming group message supersedes stale cached membership data.
+    if cached and now - cached[0] < MEMBER_TTL and not observed_in_chat:
         return cached[1], cached[2]
     status, is_member = "left", False
     try:
@@ -644,31 +658,41 @@ async def _member_state(user_id: int, *, chat_id: int = 0) -> tuple[str, bool]:
         status = str(getattr(member, "status", "left"))
         is_member = status in ("member", "administrator", "creator") or (
             status == "restricted" and bool(getattr(member, "is_member", False)))
-    except Exception as exc:  # сеть/права: считаем «не участник», но не падаем
+    except Exception as exc:  # сеть/права: не теряем доказательство из входящего сообщения
         logger.debug("member lookup failed | chat=%s | user=%s | %s", target_chat, user_id, exc)
+    if observed_in_chat and not is_member:
+        # Telegram delivered a message from this user in this exact group.
+        # This proves membership, but deliberately does not grant admin status.
+        status, is_member = "member", True
     _MEMBER_CACHE[cache_key] = (now, status, is_member)
     return status, is_member
 
 
-async def rank_of(user_id: int, *, chat_id: int = 0) -> tuple[int, bool, str]:
+async def rank_of(user_id: int, *, chat_id: int = 0,
+                  observed_in_chat: bool = False) -> tuple[int, bool, str]:
     """Возвращает (ранг 0–5 или -1, участник, legacy-уровень)."""
     if int(user_id) == RT.owner_id:
         return 5, True, "owner"
     target_chat = int(chat_id) if chat_id and chat_id < 0 else RT.primary_chat_id
-    status, is_member = await _member_state(user_id, chat_id=target_chat)
+    status, is_member = await _member_state(
+        user_id, chat_id=target_chat, observed_in_chat=observed_in_chat
+    )
     if not is_member:
         return -1, False, "all"
     rank = 0
     if RT.manager is not None and target_chat:
         try:
-            rank = int(await RT.manager._rank(target_chat, int(user_id)))
+            # Read only the rank explicitly assigned in Justice Faite.
+            # Manager._rank also raises ranks from Telegram permissions for
+            # moderation hierarchy; that is useful inside the manager module,
+            # but must not leak into the independent command-access policy.
+            rank_reader = getattr(RT.manager, "assigned_rank", None)
+            if callable(rank_reader):
+                rank = int(rank_reader(target_chat, int(user_id)))
         except Exception:
+            logger.exception("internal rank lookup failed | chat=%s | user=%s", target_chat, user_id)
             rank = 0
-    elif status in ("administrator", "creator"):
-        rank = 3
-    # "Администраторы" means Telegram administrators, independently of their
-    # internal Justice Faite rank. rank_3+ remains a separate, stricter option.
-    legacy = "admins" if status in ("administrator", "creator") or rank >= 3 else "members"
+    legacy = "admins" if status in ("administrator", "creator") else "members"
     return max(0, min(5, rank)), True, legacy
 
 
@@ -677,8 +701,11 @@ async def level_of(user_id: int) -> str:
     return level if is_member or level == "owner" else "all"
 
 
-async def _access_context(user_id: int, chat_id: int) -> tuple[str, int, bool]:
-    rank, is_member, level = await rank_of(user_id, chat_id=chat_id)
+async def _access_context(user_id: int, chat_id: int, *,
+                          observed_in_chat: bool = False) -> tuple[str, int, bool]:
+    rank, is_member, level = await rank_of(
+        user_id, chat_id=chat_id, observed_in_chat=observed_in_chat
+    )
     return level, rank, is_member
 
 DENY_TEXT = {
@@ -762,7 +789,9 @@ async def gate(message, command: str, *, notify: bool = True, commit: bool = Tru
                 pass
         return False
 
-    level, rank, is_member = await _access_context(uid, int(chat.id))
+    level, rank, is_member = await _access_context(
+        uid, int(chat.id), observed_in_chat=chat.type in ("group", "supergroup")
+    )
     ok, reason, wait = decide(command, chat_type=chat.type, chat_id=int(chat.id), user_id=uid,
                               level=level, rank=rank, is_member=is_member, commit=commit)
     if ok:

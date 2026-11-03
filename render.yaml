@@ -12,3 +12,9 @@ services:
         sync: false
       - key: PRIMARY_CHAT_ID
         sync: false
+      - key: JF_ALLOW_EMPTY_DB_BOOTSTRAP
+        value: "false"
+      - key: JF_STORAGE_DURABLE
+        value: "false"
+      - key: ROLE_SYNC_INTERVAL_SECONDS
+        value: "300"

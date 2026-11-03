@@ -24,7 +24,7 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger("justice-faite-console")
-PROJECT_VERSION = "0.6.0"
+PROJECT_VERSION = "0.7.3"
 BACKUP_MARKER = "JF_DB_BACKUP_V1"
 BACKUP_INTERVAL_SECONDS = 300
 
@@ -213,16 +213,18 @@ class Store:
 
 
 class Console:
-    def __init__(self, dp, bot, F, db_path, lock=None, owner_id=0):
+    def __init__(self, dp, bot, F, db_path, lock=None, owner_id=0, primary_chat_id=0):
         self.dp, self.bot, self.F = dp, bot, F
         self.store = Store(db_path, lock)
         self.owner_id = int(owner_id or 0)
-        self.primary_chat_id = int(os.getenv("PRIMARY_CHAT_ID", "0") or "0")
+        self.primary_chat_id = int(primary_chat_id or 0)
         self.registered = False
         self._last_backup_signature = None
         self._last_backup_error = None
         self._roles_page = 0
         self._roles_page_size = 20
+        # Wired by bot.py after the role synchronizer is defined.
+        self.role_sync = None
 
     def init(self):
         self.store.init()
@@ -348,6 +350,20 @@ class Console:
         parts = str(getattr(callback, "data", "")).split(":")
         section = parts[1] if len(parts) > 1 else "all"
         action = parts[2] if len(parts) > 2 else "refresh"
+        if section == "roles" and action == "sync":
+            if not callable(self.role_sync):
+                with suppress(Exception):
+                    await callback.answer("Синхронизация пока недоступна", show_alert=True)
+                return
+            try:
+                report = await self.role_sync()
+                if report:
+                    await self.bot.send_message(int(callback.message.chat.id), str(report))
+            except Exception:
+                logger.exception("Role sync from owner console failed")
+                with suppress(Exception):
+                    await callback.answer("Не удалось синхронизировать роли", show_alert=True)
+                return
         if section == "roles" and action in {"prev", "next"}:
             total = self._table_count("group_members", f"WHERE chat_id={self.primary_chat_id} AND active=1 AND role_key IS NOT NULL")
             pages = max(1, (total + self._roles_page_size - 1) // self._roles_page_size)
@@ -447,9 +463,39 @@ class Console:
             "SELECT COUNT(*) AS active, SUM(CASE WHEN role_key IS NOT NULL THEN 1 ELSE 0 END) AS assigned "
             "FROM group_members WHERE chat_id=? AND active=1", (chat_id,)
         ).fetchone())
-        lines.append(f"\n👥 Активных участников: {int(stats['active'] or 0)}")
-        lines.append(f"🎭 С распознанной ролью: {int(stats['assigned'] or 0)}")
-        total = int(stats["assigned"] or 0)
+        active_count = int(stats["active"] or 0)
+        assigned_count = int(stats["assigned"] or 0)
+        lines.append(f"\n👥 Участников, записанных по Telegram ID: {active_count}")
+        lines.append(f"🎭 С распознанной ролью: {assigned_count}")
+        lines.append(f"▫️ Пока без распознанной роли: {max(0, active_count - assigned_count)}")
+
+        if "participant_roster" in tables:
+            pending_count = self.store.run(lambda c: c.execute(
+                "SELECT COUNT(*) FROM participant_roster WHERE chat_id=? AND user_id IS NULL", (chat_id,)
+            ).fetchone()[0])
+            pending_names = self.store.run(lambda c: c.execute(
+                "SELECT username FROM participant_roster WHERE chat_id=? AND user_id IS NULL "
+                "ORDER BY username COLLATE NOCASE LIMIT 10", (chat_id,)
+            ).fetchall())
+            if pending_count:
+                names = ", ".join("@" + esc(r["username"]) for r in pending_names if r["username"])
+                remaining = max(0, int(pending_count) - len(pending_names))
+                lines.append(f"\n📥 В предварительном списке без Telegram ID: {int(pending_count)}")
+                if names:
+                    lines.append(f"Ожидают первого сообщения: {names}" + (f" и ещё {remaining}" if remaining else ""))
+
+        unassigned_rows = self.store.run(lambda c: c.execute(
+            "SELECT first_name,username,tag FROM group_members WHERE chat_id=? AND active=1 AND role_key IS NULL "
+            "ORDER BY lower(username),lower(first_name) LIMIT 8", (chat_id,)
+        ).fetchall())
+        if unassigned_rows:
+            lines.append("\n<b>Участники без распознанной роли:</b>")
+            for row in unassigned_rows:
+                who = ("@" + row["username"]) if row["username"] else (row["first_name"] or "участник")
+                tag = row["tag"] or "тег не получен"
+                lines.append(f"• {esc(who)} · <code>{esc(tag)}</code>")
+
+        total = assigned_count
         page_count = max(1, (total + self._roles_page_size - 1) // self._roles_page_size)
         self._roles_page = max(0, min(self._roles_page, page_count - 1))
         offset = self._roles_page * self._roles_page_size
@@ -464,8 +510,12 @@ class Console:
                 lines.append(f"• {esc(row['role_name'])} · {esc(who)} · <code>{esc(row['tag'] or 'тег не указан')}</code>")
             lines.append(f"\nВсего в карте ролей: {total}. Перелистывай кнопками под сообщением.")
         else:
-            lines.append("\nРоли появятся здесь после того, как участники напишут в чате или будут синхронизированы.")
-        lines.append("\n<i>Telegram sender_tag обновляется на сообщениях; getChatMember используется как резерв.</i>")
+            lines.append("\nПока нет участников с распознанными ролями.")
+        lines.append(
+            "\n<i>Важно: Telegram Bot API не выдаёт полный список обычных участников и не ищет их ID по @username. "
+            "Чтобы собирать новых участников автоматически, бот должен получать их сообщения: добавьте его администратором "
+            "или отключите Privacy Mode. Синхронизация проверяет только уже известные Telegram ID.</i>"
+        )
         return "\n".join(lines)
 
     def _memory_text(self):
@@ -492,6 +542,7 @@ class Console:
                     InlineKeyboardButton(text="▶️", callback_data="jfcon:roles:next"),
                 ],
                 [InlineKeyboardButton(text="🔄 Обновить карту", callback_data="jfcon:roles:refresh")],
+                [InlineKeyboardButton(text="🔎 Синхронизировать известные ID", callback_data="jfcon:roles:sync")],
             ])
         else:
             keyboard = InlineKeyboardMarkup(inline_keyboard=[[
@@ -695,7 +746,7 @@ class Console:
             await asyncio.sleep(BACKUP_INTERVAL_SECONDS)
 
 
-def register(dp, bot, F, db_path, lock=None, owner_id=0):
-    module = Console(dp, bot, F, db_path, lock=lock, owner_id=owner_id)
+def register(dp, bot, F, db_path, lock=None, owner_id=0, primary_chat_id=0):
+    module = Console(dp, bot, F, db_path, lock=lock, owner_id=owner_id, primary_chat_id=primary_chat_id)
     module.register()
     return module

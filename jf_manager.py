@@ -174,6 +174,7 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_jf_manager_warnings_active
                     ON jf_manager_warnings(chat_id, user_id, removed_at, expires_at);
+                -- The community module and the manager must use one warning ledger.
 
                 CREATE TABLE IF NOT EXISTS jf_manager_restrictions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -240,6 +241,18 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_jf_manager_member_names_username
                     ON jf_manager_member_names(chat_id, username);
             """)
+            warning_columns = {row["name"] for row in conn.execute("PRAGMA table_info(jf_manager_warnings)").fetchall()}
+            for column, definition in {
+                "level": "INTEGER NOT NULL DEFAULT 1",
+                "eligible_at": "TEXT",
+                "legacy_warning_id": "INTEGER",
+            }.items():
+                if column not in warning_columns:
+                    conn.execute(f"ALTER TABLE jf_manager_warnings ADD COLUMN {column} {definition}")
+            conn.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_jf_manager_warnings_legacy "
+                "ON jf_manager_warnings(chat_id,legacy_warning_id) WHERE legacy_warning_id IS NOT NULL"
+            )
             # Existing database is retained; settings are inserted only once.
             defaults = {
                 "warn_limit": "3",
@@ -326,10 +339,12 @@ class Store:
         def op(c):
             created = iso()
             expires = iso(utcnow() + timedelta(seconds=period))
-            cur = c.execute("INSERT INTO jf_manager_warnings(chat_id,user_id,moderator_id,reason,created_at,expires_at) VALUES(?,?,?,?,?,?)",
-                            (chat_id, user_id, actor_id, reason[:1000], created, expires))
-            count = c.execute("SELECT COUNT(*) AS n FROM jf_manager_warnings WHERE chat_id=? AND user_id=? AND removed_at IS NULL AND expires_at> ?",
-                              (chat_id, user_id, created)).fetchone()["n"]
+            count_before = c.execute("SELECT COUNT(*) AS n FROM jf_manager_warnings WHERE chat_id=? AND user_id=? AND removed_at IS NULL AND expires_at> ?",
+                                     (chat_id, user_id, created)).fetchone()["n"]
+            level = int(count_before) + 1
+            cur = c.execute("INSERT INTO jf_manager_warnings(chat_id,user_id,moderator_id,reason,created_at,expires_at,level) VALUES(?,?,?,?,?,?,?)",
+                            (chat_id, user_id, actor_id, reason[:1000], created, expires, level))
+            count = int(count_before) + 1
             return int(cur.lastrowid), int(count)
         return self.run(op)
 
@@ -441,6 +456,16 @@ class Manager:
             return
         self.dp.message.register(self.handle, self.F.chat.type.in_({"group", "supergroup"}), self.F.text.regexp(COMMAND_PATTERN))
         self._registered = True
+
+    def assigned_rank(self, chat_id: int, user_id: int) -> int:
+        """Return only the Justice Faite rank explicitly assigned in its DB.
+
+        Telegram admin privileges are intentionally excluded. Command-access
+        policies use this method for rank_1..rank_5, while _rank() remains the
+        broader moderation-hierarchy helper used by moderation actions.
+        """
+        self.init()
+        return int(self.store.rank(int(chat_id), int(user_id)))
 
     async def _rank(self, chat_id: int, user_id: int) -> int:
         if self.owner_id and user_id == self.owner_id:

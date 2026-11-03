@@ -63,8 +63,11 @@ from ui import title, section, bullet, note, divider, warning
 
 BOT_TOKEN = os.getenv("BOT_TOKEN", "").strip()
 
-ADMIN_ID = int(os.getenv("ADMIN_ID", "1682289834") or "1682289834")
-PRIMARY_CHAT_ID = int(os.getenv("PRIMARY_CHAT_ID", "-1004313546398") or "-1004313546398")
+ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or "0")
+PRIMARY_CHAT_ID = int(os.getenv("PRIMARY_CHAT_ID", "0") or "0")
+JF_ALLOW_EMPTY_DB_BOOTSTRAP = os.getenv("JF_ALLOW_EMPTY_DB_BOOTSTRAP", "false").strip().casefold() in {"1", "true", "yes", "on"}
+JF_STORAGE_DURABLE = os.getenv("JF_STORAGE_DURABLE", "false").strip().casefold() in {"1", "true", "yes", "on"}
+ROLE_SYNC_INTERVAL_SECONDS = max(300, int(os.getenv("ROLE_SYNC_INTERVAL_SECONDS", "300") or "300"))
 
 DB_PATH = os.getenv("DB_PATH", "users.db").strip() or "users.db"
 PORT = int(os.getenv("PORT", "10000"))
@@ -216,7 +219,7 @@ import jf_clean
 JF_CLEAN = jf_clean.register(dp, bot=bot, F=F, db_path=DB_PATH, manager=JF_MANAGER, lock=DB_LOCK)
 
 import jf_console
-JF_CONSOLE = jf_console.register(dp, bot=bot, F=F, db_path=DB_PATH, lock=DB_LOCK, owner_id=ADMIN_ID)
+JF_CONSOLE = jf_console.register(dp, bot=bot, F=F, db_path=DB_PATH, lock=DB_LOCK, owner_id=ADMIN_ID, primary_chat_id=PRIMARY_CHAT_ID)
 
 DELIVERY_QUEUE = None
 BROADCAST_QUEUE = None
@@ -764,7 +767,7 @@ def seed_participant_roster():
                 """INSERT INTO participant_roster(chat_id,username,user_id,first_seen,last_seen,source)
                    VALUES(?,?,NULL,?,?,?)
                    ON CONFLICT(chat_id,username) DO NOTHING""",
-                (PRIMARY_CHAT_ID, username, now_ts, now_ts, "manual_seed")
+                (PRIMARY_CHAT_ID, username.casefold(), now_ts, now_ts, "manual_seed")
             )
         conn.commit()
     group_db_op(op)
@@ -774,27 +777,49 @@ def note_roster_user(chat_id, user):
     if not username:
         return
     now_ts = now()
+    uid = int(user.id)
     def op(conn):
-        conn.execute(
-            """INSERT INTO participant_roster(chat_id,username,user_id,first_seen,last_seen,source)
-               VALUES(?,?,?,?,?,?)
-               ON CONFLICT(chat_id,username) DO UPDATE SET
-                   user_id=excluded.user_id, last_seen=excluded.last_seen
-            """,
-            (chat_id, username, int(user.id), now_ts, now_ts, "observed")
-        )
+        # Match usernames without case sensitivity so a seeded @Name row is
+        # linked to the observed Telegram ID instead of creating @name twice.
+        existing = conn.execute(
+            "SELECT username,user_id FROM participant_roster WHERE chat_id=? AND lower(username)=? LIMIT 1",
+            (chat_id, username),
+        ).fetchone()
+        if existing:
+            if existing["user_id"] is not None and int(existing["user_id"]) == uid:
+                return
+            conn.execute(
+                "UPDATE participant_roster SET user_id=?,last_seen=?,source='observed' "
+                "WHERE chat_id=? AND username=?",
+                (uid, now_ts, chat_id, existing["username"]),
+            )
+        else:
+            conn.execute(
+                "INSERT INTO participant_roster(chat_id,username,user_id,first_seen,last_seen,source) "
+                "VALUES(?,?,?,?,?,?) ON CONFLICT(chat_id,username) DO UPDATE SET "
+                "user_id=excluded.user_id,last_seen=excluded.last_seen,source='observed'",
+                (chat_id, username, uid, now_ts, now_ts, "observed"),
+            )
         conn.commit()
     group_db_op(op)
 
 def role_snapshot_rows(chat_id):
     return group_db_op(lambda conn: conn.execute(
-        """SELECT r.username, r.user_id, COALESCE(m.role_name,'') AS role_name,
+        """SELECT COALESCE(NULLIF(m.username,''),r.username,'') AS username,
+                  m.user_id AS user_id, COALESCE(m.role_name,'') AS role_name,
                   COALESCE(m.tag,'') AS tag, COALESCE(m.active,0) AS active
+           FROM group_members m
+           LEFT JOIN participant_roster r ON r.chat_id=m.chat_id AND r.user_id=m.user_id
+           WHERE m.chat_id=?
+           UNION ALL
+           SELECT r.username AS username, r.user_id AS user_id, '' AS role_name,
+                  '' AS tag, 0 AS active
            FROM participant_roster r
-           LEFT JOIN group_members m ON m.chat_id=r.chat_id AND m.user_id=r.user_id
-           WHERE r.chat_id=?
-           ORDER BY r.username COLLATE NOCASE""",
-        (chat_id,)
+           WHERE r.chat_id=? AND (r.user_id IS NULL OR NOT EXISTS (
+               SELECT 1 FROM group_members m WHERE m.chat_id=r.chat_id AND m.user_id=r.user_id
+           ))
+           ORDER BY username COLLATE NOCASE""",
+        (chat_id, chat_id)
     ).fetchall())
 
 async def update_role_snapshot(chat_id: int):
@@ -802,8 +827,10 @@ async def update_role_snapshot(chat_id: int):
     visible=[]
     for row in rows:
         uid=row["user_id"]
-        if not uid: continue
         uname=f"@{row['username']}" if row["username"] else str(uid)
+        if not uid:
+            visible.append(f"Telegram ID ожидается — {uname}")
+            continue
         role_name=row["role_name"] or "роль не назначена"
         tag=row["tag"] or ""
         if uname.lower()=="@justice_faite_bot": continue
@@ -4352,7 +4379,7 @@ _ROLE_GROUPS = [
     ]),
 ]
 
-ROLE_CATALOG = [(name, english, region) for region, entries in _ROLE_GROUPS for name, english in entries]
+ROLE_CATALOG = [(name, english, region) for region, entries in _ROLE_GROUPS for name, english in sorted(entries, key=lambda item: item[1].casefold())]
 ROLE_BY_KEY = {}
 for _name, _english, _region in ROLE_CATALOG:
     ROLE_BY_KEY[" ".join(_name.casefold().replace("ё", "е").split())] = {
@@ -4541,6 +4568,9 @@ def assign_role_db_atomic(chat_id, user, role):
         if state and state["user_id"] not in (None, user.id):
             conn.rollback()
             raise ValueError("ROLE_OCCUPIED")
+        if state and state["user_id"] is None and state["status"] in {STATUS_WANTED, STATUS_RESERVED, STATUS_TAKEN}:
+            conn.rollback()
+            raise ValueError("ROLE_RESERVED")
         old = conn.execute(
             "SELECT role_key FROM group_members WHERE chat_id=? AND user_id=? AND active=1",
             (chat_id, user.id),
@@ -4716,6 +4746,14 @@ async def member_tag_capture_middleware(handler, event, data):
             and int(getattr(chat, "id", 0) or 0) == PRIMARY_CHAT_ID
             and user and not getattr(user, "is_bot", False)
         ):
+            # The incoming update itself confirms that this account is in the
+            # group. Save a new/rejoining/renamed member even if getChatMember
+            # is unavailable to a non-admin bot. Avoid a DB write on every message.
+            previous = get_member(int(chat.id), int(user.id))
+            if (not previous or not bool(previous["active"])
+                    or (previous["username"] or "") != (getattr(user, "username", None) or "")):
+                upsert_group_member(int(chat.id), user, active=True)
+            note_roster_user(int(chat.id), user)
             if sender_tag is not None:
                 # New Bot API: take the tag directly from the message, with no
                 # per-message getChatMember request.
@@ -5129,6 +5167,8 @@ async def call_assign_role(message: Message):
     except ValueError as exc:
         if str(exc) == "ROLE_OCCUPIED":
             await message.reply(f"{title('🎭 Роль занята')}\n\n{bullet('Эта роль уже занята.')}")
+        elif str(exc) == "ROLE_RESERVED":
+            await message.reply(f"{title('🎭 Роль недоступна')}\n\n{bullet('Роль отмечена как ожидающая или зарезервированная. Сначала измени её статус через /role_status свободна Имя.')}")
         else:
             logger.exception("Kall role assignment failed")
     except Exception:
@@ -5224,6 +5264,8 @@ async def bind_role_from_private_admin(message: Message):
     except ValueError as exc:
         if str(exc) == "ROLE_OCCUPIED":
             await message.reply(f"{title('🔗 Привязка роли')}\n\n{bullet('Эта роль уже занята в основном чате.')}")
+        elif str(exc) == "ROLE_RESERVED":
+            await message.reply(f"{title('🔗 Привязка роли')}\n\n{bullet('Роль ожидает или зарезервирована. Сначала измени её статус через /role_status свободна Имя.')}")
         else:
             logger.exception("Private bind role failed")
             await message.reply(f"{title('🔗 Привязка роли')}\n\n{bullet('Не удалось привязать роль.')}")
@@ -5567,55 +5609,160 @@ async def help_cmd(message: Message):
             await message.answer(chunk)
 
 
+async def synchronize_known_member_roles(chat_id: int) -> dict:
+    """Обновляет роли только для участников, Telegram ID которых уже известен базе."""
+    rows = group_db_op(lambda conn: conn.execute(
+        "SELECT DISTINCT user_id FROM participant_roster WHERE chat_id=? AND user_id IS NOT NULL", (chat_id,)
+    ).fetchall())
+    rows2 = group_db_op(lambda conn: conn.execute(
+        "SELECT DISTINCT user_id FROM group_members WHERE chat_id=? AND user_id IS NOT NULL", (chat_id,)
+    ).fetchall())
+    known = {int(r["user_id"]) for r in rows} | {int(r["user_id"]) for r in rows2}
+    try:
+        admins = await bot.get_chat_administrators(chat_id)
+        known.update(int(a.user.id) for a in admins if not getattr(a.user, "is_bot", False))
+    except Exception:
+        logger.info("Could not add administrators to role sync scope | chat=%s", chat_id)
+
+    checked = recognized = adopted = without_role = bots = admins_checked = left = errors = 0
+    details = []
+    for uid in sorted(known):
+        try:
+            member = await bot.get_chat_member(chat_id, uid)
+            target = getattr(member, "user", None)
+            if not target or getattr(target, "is_bot", False):
+                bots += 1
+                continue
+            if not _chat_member_is_active(member):
+                left += 1
+                mark_member_left(chat_id, uid)
+                continue
+            checked += 1
+            if getattr(member, "status", "") in {"administrator", "creator"}:
+                admins_checked += 1
+            tag = (getattr(member, "tag", None) or getattr(member, "custom_title", None) or "").strip()
+            role = role_for_tag(tag)
+            previous = get_member(chat_id, uid)
+            if role:
+                recognized += 1
+                if (not previous or previous["role_name"] != role["name"] or previous["tag"] != tag
+                        or int(previous["tag_set_by_bot"] or 0) == 0):
+                    adopted += 1
+                await sync_member_tag(chat_id, uid, user=target, force=True)
+            elif not tag:
+                without_role += 1
+                await sync_member_tag(chat_id, uid, user=target, force=True)
+            elif previous and previous["role_name"]:
+                # Keep the known role until a trustworthy role tag is observed.
+                upsert_group_member(chat_id, target, active=True, tag=tag,
+                                    confirmed=bool(previous["confirmed"]), tag_set_by_bot=None)
+            else:
+                without_role += 1
+        except (TelegramForbiddenError, TelegramNotFound, TelegramBadRequest):
+            errors += 1
+            details.append(f"{uid}: участник недоступен через Telegram")
+        except (TelegramNetworkError, TelegramServerError):
+            errors += 1
+            details.append(f"{uid}: временная ошибка Telegram")
+        except Exception as exc:
+            errors += 1
+            details.append(f"{uid}: {type(exc).__name__}")
+            logger.exception("Role sync failed | chat=%s user=%s", chat_id, uid)
+
+    with suppress(Exception):
+        await update_role_snapshot(chat_id)
+
+    pending_rows = group_db_op(lambda conn: conn.execute(
+        "SELECT username FROM participant_roster WHERE chat_id=? AND user_id IS NULL "
+        "ORDER BY username COLLATE NOCASE", (chat_id,)
+    ).fetchall())
+    pending_names = [str(row["username"]) for row in pending_rows if row["username"]]
+
+    visibility_note = "Не удалось проверить режим получения сообщений бота."
+    try:
+        me = await bot.get_me()
+        bot_id = int(me.id)
+        bot_member = await bot.get_chat_member(chat_id, bot_id)
+        if getattr(bot_member, "status", "") in {"administrator", "creator"}:
+            visibility_note = "Бот — администратор основного чата; новые сообщения участников должны поступать ему."
+        elif bool(getattr(me, "can_read_all_group_messages", False)):
+            visibility_note = "Privacy Mode выключен; бот может получать обычные сообщения группы."
+        else:
+            visibility_note = ("⚠️ Бот не администратор, а Privacy Mode включён. Обычные сообщения участников "
+                               "могут не поступать боту; добавьте его администратором или отключите Privacy Mode.")
+    except Exception:
+        logger.info("Could not verify bot visibility settings | chat=%s", chat_id)
+
+    report_lines = [
+        "◈ 🔄 Синхронизация ролей",
+        "",
+        f"Известных Telegram ID: {len(known)}",
+        f"Проверено активных участников: {checked}",
+        f"Ролей распознано: {recognized}",
+        f"Новых/обновлённых ролей: {adopted}",
+        f"Без распознанной роли: {without_role}",
+        f"Ботов пропущено: {bots}",
+        f"Администраторов проверено: {admins_checked}",
+        f"Вышедших: {left}",
+        f"Ошибок проверки: {errors}",
+        "",
+        f"Предварительных @username без Telegram ID: {len(pending_names)}",
+        visibility_note,
+    ]
+    if pending_names:
+        report_lines += ["", "Ожидают первого сообщения: " + ", ".join("@" + x for x in pending_names[:20])]
+        if len(pending_names) > 20:
+            report_lines.append(f"И ещё {len(pending_names) - 20}.")
+        report_lines += [
+            "Telegram Bot API не позволяет получить user_id по @username или выгрузить полный список обычных участников."
+        ]
+    if details:
+        report_lines += ["", "Ошибки:"] + [f"• {item}" for item in details[:12]]
+    return {
+        "known": len(known), "checked": checked, "recognized": recognized,
+        "adopted": adopted, "without_role": without_role, "bots": bots,
+        "admins_checked": admins_checked, "left": left, "errors": errors,
+        "pending_names": pending_names, "visibility_note": visibility_note,
+        "report": "\n".join(report_lines),
+    }
+
+
 @dp.message(Command("syncroles"))
 async def sync_roles_cmd(message: Message):
     if not await cmdcfg.gate(message, "syncroles"):
         return
-    chat_id=PRIMARY_CHAT_ID
-    rows=group_db_op(lambda conn: conn.execute("SELECT DISTINCT user_id FROM participant_roster WHERE chat_id=? AND user_id IS NOT NULL",(chat_id,)).fetchall())
-    rows2=group_db_op(lambda conn: conn.execute("SELECT DISTINCT user_id FROM group_members WHERE chat_id=? AND user_id IS NOT NULL",(chat_id,)).fetchall())
-    known={int(r["user_id"]) for r in rows}|{int(r["user_id"]) for r in rows2}
-    try:
-        admins=await bot.get_chat_administrators(chat_id)
-        known.update(int(a.user.id) for a in admins if not getattr(a.user,"is_bot",False))
-    except Exception: pass
-    checked=recognized=adopted=without_role=bots=admins_checked=left=errors=0; details=[]
-    for uid in sorted(known):
-        try:
-            member=await bot.get_chat_member(chat_id,uid)
-            target=getattr(member,"user",None)
-            if not target or getattr(target,"is_bot",False): bots+=1; continue
-            if not _chat_member_is_active(member):
-                left+=1; mark_member_left(chat_id,uid); continue
-            checked+=1
-            if getattr(member,"status","") in {"administrator","creator"}: admins_checked+=1
-            tag=(getattr(member,"tag",None) or getattr(member,"custom_title",None) or "").strip()
-            role=role_for_tag(tag)
-            previous=get_member(chat_id,uid)
-            if role:
-                recognized+=1
-                if not previous or previous["role_name"]!=role["name"] or previous["tag"]!=tag or int(previous["tag_set_by_bot"] or 0)==0:
-                    adopted+=1
-                await sync_member_tag(chat_id,uid,user=target,force=True)
-            elif not tag:
-                without_role+=1; await sync_member_tag(chat_id,uid,user=target,force=True)
-            elif previous and previous["role_name"]:
-                # Keep the known role until a trustworthy role tag is observed.
-                upsert_group_member(chat_id,target,active=True,tag=tag,confirmed=bool(previous["confirmed"]),tag_set_by_bot=None)
-            else:
-                without_role+=1
-        except (TelegramForbiddenError,TelegramNotFound,TelegramBadRequest):
-            errors+=1; details.append(f"{uid}: участник недоступен через Telegram")
-        except (TelegramNetworkError,TelegramServerError):
-            errors+=1; details.append(f"{uid}: временная ошибка Telegram")
-        except Exception as exc:
-            errors+=1; details.append(f"{uid}: {type(exc).__name__}"); logger.exception("Role sync failed | chat=%s user=%s",chat_id,uid)
-    with suppress(Exception): await update_role_snapshot(chat_id)
-    lines=["◈ 🔄 Синхронизация ролей","",f"Проверено участников: {checked}",f"Ролей распознано: {recognized}",f"Новых/обновлённых ролей: {adopted}",f"Без роли: {without_role}",f"Ботов пропущено: {bots}",f"Администраторов проверено: {admins_checked}",f"Вышедших: {left}",f"Ошибок проверки: {errors}"]
-    if details: lines += ["","Ошибки:"]+[f"• {x}" for x in details[:12]]
+    result = await synchronize_known_member_roles(PRIMARY_CHAT_ID)
     report_to = ADMIN_ID if cmdcfg.get_str("syncroles", "report_to") != "here" else message.chat.id
-    await bot.send_message(report_to, "\n".join(lines))
+    await bot.send_message(report_to, result["report"])
 
+
+async def _console_sync_roles() -> str:
+    result = await synchronize_known_member_roles(PRIMARY_CHAT_ID)
+    return result["report"]
+
+
+# The owner console's role button runs a real Telegram check, not only a redraw
+# of the SQLite snapshot.
+JF_CONSOLE.role_sync = _console_sync_roles
+
+
+async def role_sync_worker():
+    """Refresh known Telegram member tags/roles on a bounded five-minute cycle."""
+    await asyncio.sleep(60)  # allow startup and polling to settle first
+    while True:
+        try:
+            if PRIMARY_CHAT_ID:
+                result = await synchronize_known_member_roles(PRIMARY_CHAT_ID)
+                logger.info(
+                    "Periodic role sync | chat=%s known=%s checked=%s recognized=%s errors=%s pending=%s",
+                    PRIMARY_CHAT_ID, result["known"], result["checked"],
+                    result["recognized"], result["errors"], len(result["pending_names"]),
+                )
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Periodic role synchronization failed")
+        await asyncio.sleep(ROLE_SYNC_INTERVAL_SECONDS)
 
 
 @dp.message(Command("who"))
@@ -6794,6 +6941,72 @@ def apply_all_settings() -> None:
         apply_setting(command, key, None)
 
 
+def set_role_catalog_status(chat_id: int, role: dict, status: str) -> None:
+    """Set free/awaiting/reserved state for an unassigned catalog role."""
+    allowed = {STATUS_FREE, STATUS_WANTED, STATUS_RESERVED}
+    if status not in allowed:
+        raise ValueError("INVALID_STATUS")
+    role_key = normalize_role(role["name"])
+    marker = STATUS_MARKER.get(status, "")
+    emoji_id = CUSTOM_EMOJI_IDS.get(status)
+
+    def op(conn):
+        conn.execute("BEGIN IMMEDIATE")
+        current = conn.execute(
+            "SELECT user_id FROM role_state WHERE chat_id=? AND role_key=?",
+            (int(chat_id), role_key),
+        ).fetchone()
+        if current and current["user_id"] is not None:
+            conn.rollback()
+            raise ValueError("ROLE_HAS_HOLDER")
+        conn.execute(
+            "INSERT INTO role_state(chat_id,role_key,role_name,user_id,status,legacy_marker,legacy_custom_emoji_id,bot_managed) "
+            "VALUES(?,?,?,NULL,?,?,?,0) ON CONFLICT(chat_id,role_key) DO UPDATE SET "
+            "role_name=excluded.role_name,status=excluded.status,legacy_marker=excluded.legacy_marker, "
+            "legacy_custom_emoji_id=excluded.legacy_custom_emoji_id,bot_managed=0",
+            (int(chat_id), role_key, role["name"], status, marker, emoji_id),
+        )
+        conn.commit()
+    group_db_op(op)
+
+
+@dp.message(Command("role_status"))
+async def role_status_cmd(message: Message):
+    if not await cmdcfg.gate(message, "role_status"):
+        return
+    if not await _spy_command_admin_ok(message):
+        await message.reply("Недостаточно прав для изменения статуса роли.")
+        return
+    raw = (message.text or "").split(maxsplit=1)
+    if len(raw) < 2:
+        await message.reply(
+            "Формат: /role_status свободна|ожидает|резерв ИмяПерсонажа\n"
+            "Пример: /role_status резерв Alhaitham"
+        )
+        return
+    args = raw[1].strip()
+    status_token, _, role_name = args.partition(" ")
+    status_map = {
+        "свободна": STATUS_FREE, "свободно": STATUS_FREE, "free": STATUS_FREE,
+        "ожидает": STATUS_WANTED, "ожидание": STATUS_WANTED, "awaiting": STATUS_WANTED, "wanted": STATUS_WANTED,
+        "резерв": STATUS_RESERVED, "зарезервирована": STATUS_RESERVED, "reserved": STATUS_RESERVED,
+    }
+    status = status_map.get(status_token.casefold())
+    role = role_for(role_name.strip()) if role_name.strip() else None
+    if not status or not role:
+        await message.reply("Не удалось распознать статус или персонажа. Используй свободна, ожидает или резерв и точное имя роли.")
+        return
+    try:
+        set_role_catalog_status(int(message.chat.id), role, status)
+    except ValueError as exc:
+        if str(exc) == "ROLE_HAS_HOLDER":
+            await message.reply("Эта роль уже назначена участнику. Сначала освободи её через снятие роли.")
+            return
+        raise
+    label = {STATUS_FREE: "свободна", STATUS_WANTED: "ожидает", STATUS_RESERVED: "в резерве"}[status]
+    await message.reply(f"Статус роли «{role['name']}» обновлён: {label}.")
+
+
 # =========================================================
 # RENDER HTTP
 # =========================================================
@@ -7174,11 +7387,161 @@ SPY_LOCATION_ALIASES = {
     for alias in ([name] + list(data.get("aliases", [])))
 }
 
+# Built-in packs keep the classic location set and add broader word categories.
+# Each word has two hints and aliases for natural-language guesses.
+SPY_BUILTIN_PACKS = {
+    "places": ("Места", SPY_LOCATIONS),
+    "objects": ("Предметы", {
+        "Телефон": {"hints": ["Это вещь, которая помогает людям оставаться на связи.", "Её часто носят с собой и используют каждый день."], "aliases": ["телефон", "смартфон", "phone", "smartphone"]},
+        "Зонт": {"hints": ["Эта вещь особенно полезна в определённую погоду.", "Её раскрывают над собой, чтобы защититься от осадков."], "aliases": ["зонт", "umbrella"]},
+        "Чемодан": {"hints": ["Эта вещь часто сопровождает человека в поездках.", "Внутри перевозят личные вещи."], "aliases": ["чемодан", "багаж", "suitcase", "luggage"]},
+        "Зеркало": {"hints": ["Эта вещь помогает увидеть собственное отражение.", "Её часто размещают в ванной или прихожей."], "aliases": ["зеркало", "mirror"]},
+        "Наушники": {"hints": ["Эта вещь связана со звуком.", "Её используют, чтобы слушать, не мешая окружающим."], "aliases": ["наушники", "earphones", "headphones"]},
+        "Ключ": {"hints": ["Эта вещь помогает получить доступ к чему-то закрытому.", "Её легко потерять, поэтому часто носят на связке."], "aliases": ["ключ", "ключик", "key"]},
+        "Часы": {"hints": ["Эта вещь помогает следить за временем.", "Она может быть настенной, настольной или наручной."], "aliases": ["часы", "watch", "clock"]},
+        "Рюкзак": {"hints": ["Эта вещь освобождает руки при переноске вещей.", "Её обычно носят за спиной."], "aliases": ["рюкзак", "backpack"]},
+    }),
+    "animals": ("Животные", {
+        "Кошка": {"hints": ["Это домашнее животное часто живёт рядом с человеком.", "Оно умеет мурлыкать и ловко передвигаться."], "aliases": ["кошка", "кот", "cat"]},
+        "Собака": {"hints": ["Это животное часто становится компаньоном человека.", "Многие представители любят прогулки и игры с мячом."], "aliases": ["собака", "пёс", "пес", "dog"]},
+        "Лиса": {"hints": ["Это дикое животное известно осторожностью.", "У неё пушистый хвост и рыжая окраска у многих видов."], "aliases": ["лиса", "лисица", "fox"]},
+        "Дельфин": {"hints": ["Это животное живёт в воде и дышит воздухом.", "Оно известно общительностью и высоким интеллектом."], "aliases": ["дельфин", "dolphin"]},
+        "Пингвин": {"hints": ["Эта птица не летает.", "Она отлично плавает и часто ассоциируется с холодными регионами."], "aliases": ["пингвин", "penguin"]},
+        "Лошадь": {"hints": ["Это животное давно помогает людям в передвижении.", "На нём можно ездить верхом."], "aliases": ["лошадь", "конь", "horse"]},
+        "Сова": {"hints": ["Эта птица хорошо ориентируется в сумерках.", "Её часто связывают с мудростью."], "aliases": ["сова", "owl"]},
+        "Черепаха": {"hints": ["Это животное защищено прочным панцирем.", "Многие виды передвигаются довольно медленно."], "aliases": ["черепаха", "turtle", "tortoise"]},
+    }),
+    "food": ("Еда", {
+        "Пицца": {"hints": ["Это блюдо часто делят на несколько порций.", "Обычно его подают горячим и с начинкой на основе теста."], "aliases": ["пицца", "pizza"]},
+        "Суши": {"hints": ["Это блюдо связано с японской кухней.", "В распространённом варианте используют рис и морепродукты."], "aliases": ["суши", "sushi"]},
+        "Блины": {"hints": ["Это блюдо готовят на горячей плоской поверхности.", "Его едят со сладкими и несладкими добавками."], "aliases": ["блины", "блин", "pancakes", "crepes"]},
+        "Шоколад": {"hints": ["Это лакомство часто делают из какао.", "Его выпускают плитками, конфетами и в виде напитков."], "aliases": ["шоколад", "chocolate"]},
+        "Яблоко": {"hints": ["Это распространённый фрукт.", "У него обычно есть сердцевина с семенами."], "aliases": ["яблоко", "apple"]},
+        "Мороженое": {"hints": ["Это холодный десерт.", "Его часто подают в вафельном стаканчике или креманке."], "aliases": ["мороженое", "ice cream"]},
+        "Суп": {"hints": ["Это блюдо обычно едят ложкой.", "Оно может быть горячим или холодным."], "aliases": ["суп", "soup"]},
+        "Бургер": {"hints": ["Это блюдо состоит из нескольких слоёв.", "Часто между булочками кладут котлету и овощи."], "aliases": ["бургер", "гамбургер", "burger", "hamburger"]},
+    }),
+    "professions": ("Профессии", {
+        "Врач": {"hints": ["Эта профессия связана с заботой о здоровье.", "Специалист может работать в клинике или больнице."], "aliases": ["врач", "доктор", "doctor"]},
+        "Учитель": {"hints": ["Эта профессия связана с обучением.", "Специалист часто работает с классом или группой учеников."], "aliases": ["учитель", "преподаватель", "teacher"]},
+        "Повар": {"hints": ["Эта профессия требует знания продуктов и рецептов.", "Рабочее место часто связано с кухней."], "aliases": ["повар", "chef", "cook"]},
+        "Пилот": {"hints": ["Эта профессия связана с транспортом.", "Специалист управляет воздушным судном."], "aliases": ["пилот", "pilot"]},
+        "Архитектор": {"hints": ["Эта профессия соединяет творчество и точные расчёты.", "Специалист проектирует здания и пространства."], "aliases": ["архитектор", "architect"]},
+        "Фотограф": {"hints": ["Эта профессия связана с изображениями.", "Специалист работает с камерой, светом и композицией."], "aliases": ["фотограф", "photographer"]},
+        "Пожарный": {"hints": ["Эта профессия связана с общественной безопасностью.", "Специалист проходит специальную подготовку для чрезвычайных ситуаций."], "aliases": ["пожарный", "firefighter"]},
+        "Почтальон": {"hints": ["Эта профессия связана с доставкой.", "Специалист приносит письма и посылки адресатам."], "aliases": ["почтальон", "mail carrier", "postman"]},
+    }),
+    "transport": ("Транспорт", {
+        "Самолёт": {"hints": ["Это средство передвижения работает в воздухе.", "Для дальних поездок часто используют аэропорты."], "aliases": ["самолет", "самолёт", "airplane", "plane"]},
+        "Поезд": {"hints": ["Это средство передвижения связано с рельсами.", "Оно может перевозить много пассажиров одновременно."], "aliases": ["поезд", "train"]},
+        "Велосипед": {"hints": ["Это средство передвижения приводится в движение человеком.", "Обычно у него два колеса и руль."], "aliases": ["велосипед", "bike", "bicycle"]},
+        "Автобус": {"hints": ["Это общественный транспорт.", "Он часто следует по маршруту с несколькими остановками."], "aliases": ["автобус", "bus"]},
+        "Корабль": {"hints": ["Это средство передвижения используют на воде.", "Некоторые суда могут перевозить тысячи пассажиров."], "aliases": ["корабль", "судно", "ship"]},
+        "Такси": {"hints": ["Это транспорт за индивидуальную поездку.", "Заказ часто оформляют через приложение или по телефону."], "aliases": ["такси", "taxi", "cab"]},
+        "Трамвай": {"hints": ["Это городской транспорт на рельсах.", "Он часто движется по улицам."], "aliases": ["трамвай", "tram"]},
+        "Метро": {"hints": ["Это городской транспорт с отдельными линиями.", "Большая часть маршрутов проходит под землёй."], "aliases": ["метро", "subway", "underground"]},
+    }),
+    "nature": ("Природа", {
+        "Водопад": {"hints": ["Это природное явление связано с движением воды.", "Вода здесь падает с высоты."], "aliases": ["водопад", "waterfall"]},
+        "Гора": {"hints": ["Это крупная форма рельефа.", "На вершину часто поднимаются ради вида или маршрута."], "aliases": ["гора", "mountain"]},
+        "Лес": {"hints": ["Это природная экосистема с большим количеством деревьев.", "Здесь обитают многие виды животных и растений."], "aliases": ["лес", "forest", "woods"]},
+        "Река": {"hints": ["Это естественный водный поток.", "Она может проходить через города и долины."], "aliases": ["река", "river"]},
+        "Пустыня": {"hints": ["Это природная зона с очень малым количеством осадков.", "Днём здесь часто жарко, а ночью может быть прохладно."], "aliases": ["пустыня", "desert"]},
+        "Вулкан": {"hints": ["Это геологический объект.", "Иногда из него выходят лава, пепел и газы."], "aliases": ["вулкан", "volcano"]},
+        "Озеро": {"hints": ["Это водоём, окружённый сушей.", "Оно может быть пресным или солёным."], "aliases": ["озеро", "lake"]},
+        "Остров": {"hints": ["Это участок суши, окружённый водой.", "До него часто добираются по воде или воздуху."], "aliases": ["остров", "island"]},
+    }),
+}
 
-def _spy_location_guess_matches(guess: str, location: str) -> bool:
+SPY_CATEGORY_ALIASES = {
+    alias: key
+    for key, aliases in {
+        "places": ("места", "место", "локации", "локация", "places", "locations"),
+        "objects": ("предметы", "предмет", "вещи", "objects", "things"),
+        "animals": ("животные", "животное", "animals"),
+        "food": ("еда", "блюда", "продукты", "food"),
+        "professions": ("профессии", "профессия", "работа", "professions", "jobs"),
+        "transport": ("транспорт", "transport", "vehicles"),
+        "nature": ("природа", "nature"),
+    }.items() for alias in aliases
+}
+
+
+def _spy_category_key(value: str) -> str:
+    normalized = _spy_normalize_location_guess(value)
+    if normalized in SPY_CATEGORY_ALIASES:
+        return SPY_CATEGORY_ALIASES[normalized]
+    return re.sub(r"[^\w]+", "_", normalized, flags=re.UNICODE).strip("_")[:48]
+
+
+def _spy_game_categories(game) -> list[str]:
+    try:
+        values = json.loads(str(game["categories_json"] or "[\"places\"]"))
+    except (KeyError, TypeError, ValueError, json.JSONDecodeError):
+        values = ["places"]
+    if not isinstance(values, list):
+        return ["places"]
+    cleaned = list(dict.fromkeys(str(value)[:48] for value in values if str(value).strip()))
+    return cleaned or ["places"]
+
+
+def _spy_category_catalog(chat_id: int) -> dict[str, str]:
+    result = {key: label for key, (label, _entries) in SPY_BUILTIN_PACKS.items()}
+    try:
+        rows = group_db_op(lambda conn: conn.execute(
+            "SELECT category_key,MAX(category_name) AS category_name FROM spy_custom_words WHERE chat_id=? GROUP BY category_key",
+            (int(chat_id),)).fetchall())
+        for row in rows:
+            result[str(row["category_key"])] = str(row["category_name"])
+    except sqlite3.Error:
+        pass
+    return result
+
+
+def _spy_word_entries(chat_id: int, category_keys: list[str]) -> list[dict]:
+    entries: list[dict] = []
+    for key in category_keys:
+        builtin = SPY_BUILTIN_PACKS.get(key)
+        if builtin:
+            label, words = builtin
+            for word, data in words.items():
+                entries.append({"word": word, "category_key": key, "category_name": label,
+                                "hints": list(data.get("hints", [])), "aliases": list(data.get("aliases", []))})
+        try:
+            rows = group_db_op(lambda conn, k=key: conn.execute(
+                "SELECT category_name,word,aliases_json,hints_json FROM spy_custom_words WHERE chat_id=? AND category_key=? ORDER BY word COLLATE NOCASE",
+                (int(chat_id), k)).fetchall())
+        except sqlite3.Error:
+            rows = []
+        for row in rows:
+            with suppress(Exception):
+                aliases = json.loads(row["aliases_json"] or "[]")
+                hints = json.loads(row["hints_json"] or "[]")
+                entries.append({"word": str(row["word"]), "category_key": key,
+                                "category_name": str(row["category_name"]),
+                                "hints": hints if isinstance(hints, list) else [],
+                                "aliases": aliases if isinstance(aliases, list) else []})
+    return entries
+
+
+def _spy_word_entry(chat_id: int, category_key: str, word: str) -> dict:
+    canonical = _spy_normalize_location_guess(word)
+    for entry in _spy_word_entries(int(chat_id), [str(category_key or "places")]):
+        if _spy_normalize_location_guess(entry["word"]) == canonical:
+            return entry
+    return {"word": word, "hints": [], "aliases": []}
+
+
+def _spy_location_guess_matches(guess: str, location: str, chat_id: int = 0, category_key: str = "places") -> bool:
     normalized = _spy_normalize_location_guess(guess)
     canonical = _spy_normalize_location_guess(location)
-    return SPY_LOCATION_ALIASES.get(normalized) == location or normalized == canonical
+    if normalized == canonical:
+        return True
+    for entry in _spy_word_entries(int(chat_id or 0), [str(category_key or "places")]):
+        if _spy_normalize_location_guess(entry["word"]) != canonical:
+            continue
+        return any(_spy_normalize_location_guess(alias) == normalized for alias in entry.get("aliases", []))
+    return False
 
 
 
@@ -7194,6 +7557,29 @@ def _spy_ensure_schema():
         game_cols = {r["name"] for r in conn.execute("PRAGMA table_info(spy_games)").fetchall()}
         if "summary_sent_round" not in game_cols:
             conn.execute("ALTER TABLE spy_games ADD COLUMN summary_sent_round INTEGER NOT NULL DEFAULT 0")
+        if "categories_json" not in game_cols:
+            conn.execute("ALTER TABLE spy_games ADD COLUMN categories_json TEXT NOT NULL DEFAULT '[\"places\"]'")
+        if "category_key" not in game_cols:
+            conn.execute("ALTER TABLE spy_games ADD COLUMN category_key TEXT NOT NULL DEFAULT 'places'")
+        conn.execute("""CREATE TABLE IF NOT EXISTS spy_custom_words (
+            chat_id INTEGER NOT NULL,
+            category_key TEXT NOT NULL,
+            category_name TEXT NOT NULL,
+            word TEXT NOT NULL,
+            word_norm TEXT NOT NULL,
+            aliases_json TEXT NOT NULL DEFAULT '[]',
+            hints_json TEXT NOT NULL DEFAULT '[]',
+            created_by INTEGER NOT NULL,
+            created_at TEXT NOT NULL,
+            PRIMARY KEY(chat_id,category_key,word_norm)
+        )""")
+        word_cols = {r["name"] for r in conn.execute("PRAGMA table_info(spy_custom_words)").fetchall()}
+        if "word_norm" not in word_cols:
+            conn.execute("ALTER TABLE spy_custom_words ADD COLUMN word_norm TEXT NOT NULL DEFAULT ''")
+            rows = conn.execute("SELECT rowid,word FROM spy_custom_words").fetchall()
+            for row in rows:
+                normalized = _spy_normalize_location_guess(row["word"])
+                conn.execute("UPDATE spy_custom_words SET word_norm=? WHERE rowid=?", (normalized, row["rowid"]))
         wanted = {
             "turn_count": "INTEGER NOT NULL DEFAULT 0",
             "round_target": "INTEGER NOT NULL DEFAULT 2",
@@ -7481,7 +7867,7 @@ def _spy_join(game_id, user):
         return True, "Вы уже участвуете."
     players = _spy_players(game_id)
     if len(players) >= SPY_MAX_PLAYERS:
-        return False, "Достигнут максимум — 10 участников."
+        return False, f"Достигнут максимум — {SPY_MAX_PLAYERS} участников."
     group_db_op(lambda conn: (
         conn.execute(
             "INSERT INTO spy_players(game_id,user_id,username,display_name,joined_at,turn_order,dm_ready) VALUES(?,?,?,?,?,?,0)",
@@ -7530,7 +7916,7 @@ def _spy_reset_transient_state(game_id):
     ))
 
 
-def _spy_start_db(game_id, location, spy_ids, assignments, order):
+def _spy_start_db(game_id, location, spy_ids, assignments, order, category_key="places"):
     target_rounds = _spy_round_target(len(assignments))
     first = int(order[0])
     second = int(order[1])
@@ -7543,8 +7929,8 @@ def _spy_start_db(game_id, location, spy_ids, assignments, order):
                 (int(bool(is_spy)), idx, int(game_id), int(uid)),
             )
         conn.execute(
-            "UPDATE spy_games SET status='STARTING',phase='QUESTION',started_at=?,expires_at=?,location=?,spy_user_id=?,current_asker_id=?,current_target_id=?,turn_count=0,round_target=?,vote_round=0,cycle_start_turn=0,cycle_expected_turns=?,vote_session=0,accusation_suspect_id=NULL,updated_at=? WHERE id=?",
-            (now(), deadline, location, primary_spy, first, second, len(assignments), len(assignments), now(), int(game_id)),
+            "UPDATE spy_games SET status='STARTING',phase='QUESTION',started_at=?,expires_at=?,location=?,category_key=?,spy_user_id=?,current_asker_id=?,current_target_id=?,turn_count=0,round_target=?,vote_round=0,cycle_start_turn=0,cycle_expected_turns=?,vote_session=0,accusation_suspect_id=NULL,updated_at=? WHERE id=?",
+            (now(), deadline, location, str(category_key), primary_spy, first, second, len(assignments), len(assignments), now(), int(game_id)),
         )
         conn.commit()
     group_db_op(op)
@@ -7557,14 +7943,14 @@ async def _spy_send_card(game_id, user_id, location, role_name, is_spy):
         text = (
             "◈ Шпион\n\n"
             "🕵️ Ты — ШПИОН.\n\n"
-            "Ты не знаешь локацию. Твоя задача — вычислить её по вопросам и ответам, не выдать себя и при необходимости попытаться угадать её.\n\n"
+            "Ты не знаешь секретное слово. Твоя задача — вычислить его по вопросам и ответам, не выдать себя и при необходимости попытаться угадать его.\n\n"
             "У тебя две подсказки: первая после полного круга вопросов, вторая — после следующего. Они дают направление, а не название места. Хорошей игры!"
         )
     else:
         text = (
             "◈ Шпион\n\n"
-            f"Локация: {location}\n\n"
-            "Не называй локацию напрямую. Отвечай на вопросы так, чтобы не помочь шпиону слишком легко вычислить место.\n\n"
+            f"Секретное слово: {location}\n\n"
+            "Не называй секретное слово напрямую. Отвечай на вопросы так, чтобы не помочь шпиону слишком легко его вычислить.\n\n"
             "Хорошей игры!"
         )
     await bot.send_message(
@@ -7579,13 +7965,17 @@ def _spy_start_round_sync(game_id):
     players = _spy_players(game_id)
     if not game or len(players) < SPY_MIN_PLAYERS:
         return None, "Нужно минимум 3 участника."
-    location = random.choice(list(SPY_LOCATIONS.keys()))
+    entries = _spy_word_entries(int(game["chat_id"]), _spy_game_categories(game))
+    if not entries:
+        return None, "В выбранных категориях нет слов. Выбери другие категории или добавь слова."
+    secret = random.choice(entries)
+    location = str(secret["word"])
     order = [int(p["user_id"]) for p in players]
     random.shuffle(order)
     spy_ids = random.sample(order, _spy_spy_count(len(players)))
     assignments = [(uid, "", uid in spy_ids) for uid in order]
     _spy_reset_transient_state(game_id)
-    _spy_start_db(game_id, location, spy_ids, assignments, order)
+    _spy_start_db(game_id, location, spy_ids, assignments, order, str(secret["category_key"]))
     return assignments, None
 
 
@@ -7614,8 +8004,8 @@ def _spy_preflight_start(game_id):
     players = _spy_players(game_id)
     if len(players) < SPY_MIN_PLAYERS:
         checks.append(f"недостаточно участников: {len(players)}/{SPY_MIN_PLAYERS}")
-    if not SPY_LOCATIONS:
-        checks.append("каталог локаций пуст")
+    if not _spy_word_entries(int(game["chat_id"]), _spy_game_categories(game)):
+        checks.append("в выбранных категориях нет слов")
     if int(SPY_SPY_COUNT) > max(1, len(players) - 2):
         checks.append(
             f"для {len(players)} игроков можно выбрать не более {max(1, len(players) - 2)} шпионов; "
@@ -7662,12 +8052,18 @@ async def _spy_start_round(game_id):
     results = await asyncio.gather(*tasks)
     failures = [r for r in results if r]
     if failures:
-        _spy_set_state(game_id, status="WAITING", phase="LOBBY", current_asker_id=None, current_target_id=None, expires_at=None)
+        # Some private cards may already have reached players. Never reopen this
+        # same game and risk a second, contradictory role distribution.
+        _spy_set_state(game_id, status="ABORTED", phase="FINISHED", current_asker_id=None,
+                       current_target_id=None, expires_at=None)
         group_db_op(lambda conn: (
-            conn.execute("UPDATE spy_players SET role_name='',is_spy=0,hints_used=0 WHERE game_id=?", (int(game_id),)),
+            conn.execute("UPDATE spy_players SET active=0 WHERE game_id=?", (int(game_id),)),
             conn.commit(),
         ))
-        return False, _spy_format_start_error("раздача секретных карточек", details=failures)
+        return False, _spy_format_start_error(
+            "раздача секретных карточек",
+            details=[f"Успешно отправлено: {len(assignments) - len(failures)} из {len(assignments)} карточек.",
+                     "Партия закрыта: некоторые секретные карточки уже могли быть доставлены."] + failures)
 
     _spy_set_state(game_id, status="PLAYING", phase="QUESTION")
     return True, "Игра началась."
@@ -7858,7 +8254,7 @@ async def _spy_start_final_guess(game_id, reason="После шести раун
                 chat_id=int(game["chat_id"]),
                 message_id=int(game["lobby_message_id"]),
                 text=("◈ Spyfall · ФИНАЛЬНАЯ ДОГАДКА\n\n"
-                      "Оставшимся шпионам дано 60 секунд, чтобы назвать локацию."),
+                      "Оставшимся шпионам дано 60 секунд, чтобы назвать секретное слово."),
                 reply_markup=None,
             )
 
@@ -7916,14 +8312,14 @@ async def _spy_resolve_accusation(game_id, suspect_id):
                     message_id=int(game["lobby_message_id"]),
                     text=("◈ Spyfall · ШПИОН РАСКРЫТ\n\n"
                           f"Подозреваемый: {_spy_display(suspect)}.\n"
-                          "У него 60 секунд на последнюю попытку угадать локацию."),
+                          "У него 60 секунд на последнюю попытку угадать секретное слово."),
                     reply_markup=None,
                 )
         with suppress(Exception):
             await bot.send_message(
                 int(suspect_id),
                 "◈ Шпион\n\n"
-                "Тебя раскрыли. У тебя 60 секунд на последнюю попытку угадать локацию.",
+                "Тебя раскрыли. У тебя 60 секунд на последнюю попытку угадать секретное слово.",
                 reply_markup=_spy_guess_keyboard(game_id),
             )
         return
@@ -7965,7 +8361,7 @@ async def _spy_finish_message(game_id, winner, reason, location_override=None):
                 message_id=int(game["lobby_message_id"]),
                 text=("◈ Spyfall · ИГРА ОКОНЧЕНА\n\n"
                       f"Победитель: {winner}\n{reason}\n\n"
-                      f"Локация: {location}\nШпион(ы): {spy_names}"),
+                      f"Секретное слово: {location}\nШпион(ы): {spy_names}"),
                 reply_markup=None,
             )
     with suppress(Exception):
@@ -7975,7 +8371,7 @@ async def _spy_finish_message(game_id, winner, reason, location_override=None):
             int(game["chat_id"]),
             "◈ Spyfall · ФИНАЛ\n\n"
             f"Победитель: {winner}\n{reason}\n\n"
-            f"Локация: {location}\n"
+            f"Секретное слово: {location}\n"
             f"Шпион(ы): {spy_names}",
         )
     for p in players:
@@ -7984,7 +8380,7 @@ async def _spy_finish_message(game_id, winner, reason, location_override=None):
                 int(p["user_id"]),
                 "◈ Шпион\n\n"
                 "Раунд завершён.\n"
-                f"Локация: {location}\n"
+                f"Секретное слово: {location}\n"
                 f"Шпион(ы): {spy_names}",
             )
 
@@ -8196,10 +8592,10 @@ async def spy_kick_cmd(message: Message):
                 message.chat.id,
                 "◈ Spyfall · ШПИОН РАСКРЫТ\n\n"
                 f"Администратор исключил {_spy_display(target)}.\n"
-                "Это оказался шпион. Ему даётся 60 секунд на последнюю попытку угадать локацию.",
+                "Это оказался шпион. Ему даётся 60 секунд на последнюю попытку угадать секретное слово.",
             )
         await _spy_resolve_accusation(game_id, target_id)
-        await message.reply(f"{_spy_display(target)} оказался шпионом. Запущена финальная попытка угадать локацию.")
+        await message.reply(f"{_spy_display(target)} оказался шпионом. Запущена финальная попытка угадать секретное слово.")
         return
 
     group_db_op(lambda conn: (
@@ -8227,6 +8623,149 @@ async def spy_end_cmd(message: Message):
         f"Игра принудительно завершена администратором { _spy_display(_spy_player(game['id'], message.from_user.id)) }.",
     )
     await message.reply("Игра завершена. Все таймеры и активные этапы закрыты.")
+
+
+@dp.message(Command("spy_categories"))
+async def spy_categories_cmd(message: Message):
+    if not await cmdcfg.gate(message, "spy_categories"):
+        return
+    catalog = _spy_category_catalog(int(message.chat.id))
+    lines = ["◈ Шпион · КАТЕГОРИИ", "", "Доступные наборы слов:"]
+    for key, label in catalog.items():
+        count = len(_spy_word_entries(int(message.chat.id), [key]))
+        lines.append(f"• {label} — {count} слов (ключ: {key})")
+    lines += ["", "Выбрать для следующего лобби: /spy_category места, предметы"]
+    lines += ["Добавить своё слово: /spy_word_add категория | слово | алиасы | подсказки"]
+    await message.reply("\n".join(lines))
+
+
+@dp.message(Command("spy_category"))
+async def spy_category_cmd(message: Message):
+    if not await cmdcfg.gate(message, "spy_category"):
+        return
+    game = _spy_open_game(int(message.chat.id))
+    if not game or game["status"] != "WAITING":
+        await message.reply("Категории можно выбрать только в открытом лобби до старта игры.")
+        return
+    uid = int(message.from_user.id) if message.from_user else 0
+    if uid != int(game["created_by"]) and not await _spy_command_admin_ok(message):
+        await message.reply("Выбрать категории может создатель лобби или администратор чата.")
+        return
+    raw = _spy_command_arg(message)
+    parts = [part.strip() for part in raw.split(",") if part.strip()]
+    if not parts:
+        await message.reply("Формат: /spy_category места, предметы, животные")
+        return
+    catalog = _spy_category_catalog(int(message.chat.id))
+    keys = []
+    unknown = []
+    for part in parts:
+        key = _spy_category_key(part)
+        if key not in catalog:
+            unknown.append(part)
+        elif key not in keys:
+            keys.append(key)
+    if unknown:
+        await message.reply("Неизвестные категории: " + ", ".join(unknown) + ". Список: /spy_categories")
+        return
+    if not _spy_word_entries(int(message.chat.id), keys):
+        await message.reply("В этих категориях пока нет слов. Добавь слова или выбери другие наборы.")
+        return
+    group_db_op(lambda conn: (
+        conn.execute("UPDATE spy_games SET categories_json=?,updated_at=? WHERE id=? AND status='WAITING'",
+                     (json.dumps(keys, ensure_ascii=False), now(), int(game["id"]))),
+        conn.commit(),
+    ))
+    await message.reply("✅ Категории следующей игры: " + ", ".join(catalog[key] for key in keys))
+
+
+@dp.message(Command("spy_word_add"))
+async def spy_word_add_cmd(message: Message):
+    if not await cmdcfg.gate(message, "spy_word_add"):
+        return
+    if not await _spy_command_admin_ok(message):
+        await message.reply("Добавлять слова может только администратор чата.")
+        return
+    parts = [part.strip() for part in _spy_command_arg(message).split("|", 3)]
+    if len(parts) < 2:
+        await message.reply(
+            "Формат: /spy_word_add категория | слово | алиасы через запятую | подсказки через ;\n"
+            "Пример: /spy_word_add фантастика | Дракон | драконы, dragon | Мифическое существо; Часто встречается в фэнтези"
+        )
+        return
+    category_name, word = parts[0], parts[1]
+    if not category_name or len(category_name) > 48 or not word or len(word) > 60:
+        await message.reply("Категория — до 48 символов, слово — до 60 символов.")
+        return
+    category_key = _spy_category_key(category_name)
+    normalized = _spy_normalize_location_guess(word)
+    if not category_key or not normalized:
+        await message.reply("Не удалось распознать категорию или слово.")
+        return
+    aliases = [x.strip() for x in (parts[2] if len(parts) > 2 else "").split(",") if x.strip()]
+    hints = [x.strip() for x in (parts[3] if len(parts) > 3 else "").split(";") if x.strip()]
+    if len(aliases) > 12 or any(len(x) > 60 for x in aliases) or len(hints) > 5 or any(len(x) > 240 for x in hints):
+        await message.reply("Ограничение: до 12 алиасов по 60 символов и до 5 подсказок по 240 символов.")
+        return
+    if not hints:
+        hints = ["Это слово относится к набору «" + category_name + "».", "Попробуй догадаться по вопросам и ответам игроков."]
+    try:
+        def op(conn):
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO spy_custom_words(chat_id,category_key,category_name,word,word_norm,aliases_json,hints_json,created_by,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (int(message.chat.id), category_key, category_name, word, normalized,
+                 json.dumps(aliases, ensure_ascii=False), json.dumps(hints, ensure_ascii=False),
+                 int(message.from_user.id), now()),
+            )
+            conn.commit()
+            return cur.rowcount
+        inserted = group_db_op(op)
+    except sqlite3.IntegrityError:
+        inserted = 0
+    if inserted:
+        await message.reply(f"✅ Слово «{word}» добавлено в категорию «{category_name}».")
+    else:
+        await message.reply("Такое слово уже есть в этой категории.")
+
+
+@dp.message(Command("spy_word_remove"))
+async def spy_word_remove_cmd(message: Message):
+    if not await cmdcfg.gate(message, "spy_word_remove"):
+        return
+    if not await _spy_command_admin_ok(message):
+        await message.reply("Удалять слова может только администратор чата.")
+        return
+    parts = [part.strip() for part in _spy_command_arg(message).split("|", 1)]
+    if len(parts) != 2 or not all(parts):
+        await message.reply("Формат: /spy_word_remove категория | слово")
+        return
+    key, normalized = _spy_category_key(parts[0]), _spy_normalize_location_guess(parts[1])
+    removed = group_db_op(lambda conn: conn.execute(
+        "DELETE FROM spy_custom_words WHERE chat_id=? AND category_key=? AND word_norm=?",
+        (int(message.chat.id), key, normalized)).rowcount)
+    await message.reply("✅ Пользовательское слово удалено." if removed else "Такого пользовательского слова нет.")
+
+
+@dp.message(Command("spy_leave"))
+async def spy_leave_cmd(message: Message):
+    if not await cmdcfg.gate(message, "spy_leave"):
+        return
+    if not message.from_user:
+        return
+    game = _spy_open_game(int(message.chat.id))
+    if not game or game["status"] != "WAITING":
+        await message.reply("Выйти можно только до начала игры.")
+        return
+    if not _spy_leave(int(game["id"]), int(message.from_user.id)):
+        await message.reply("Ты не участвуешь в этом лобби.")
+        return
+    players = _spy_players(int(game["id"]))
+    await message.reply("Ты вышел из лобби.")
+    if game["lobby_message_id"]:
+        with suppress(Exception):
+            await bot.edit_message_text(chat_id=int(message.chat.id), message_id=int(game["lobby_message_id"]),
+                                        text=_spy_lobby_text(int(game["id"])),
+                                        reply_markup=_spy_lobby_keyboard(int(game["id"]), len(players) >= SPY_MIN_PLAYERS))
 
 
 @dp.message(Command("spy"))
@@ -8266,11 +8805,21 @@ async def spy_handle_deep_link(message: Message, game_id: int):
         return
     try:
         member = await bot.get_chat_member(int(game["chat_id"]), int(message.from_user.id))
-        if getattr(member, "status", "") in {"left", "kicked"}:
+        if not _chat_member_is_active(member):
             await message.answer("◈ Шпион\n\nТы сейчас не являешься участником чата игры.")
             return
+    except (TelegramForbiddenError, TelegramNotFound, TelegramBadRequest) as exc:
+        logger.warning("Spy membership could not be verified | game=%s user=%s | %s", game_id, message.from_user.id, exc)
+        await message.answer("◈ Шпион\n\nНе удалось подтвердить участие в чате. Попроси ведущего проверить статус бота и повтори попытку.")
+        return
+    except (TelegramNetworkError, TelegramServerError) as exc:
+        logger.warning("Temporary Telegram failure during Spy membership check | game=%s user=%s | %s", game_id, message.from_user.id, exc)
+        await message.answer("◈ Шпион\n\nTelegram временно недоступен. Попробуй подключиться ещё раз чуть позже.")
+        return
     except Exception:
-        logger.debug("Spy membership lookup failed | game=%s user=%s", game_id, message.from_user.id, exc_info=True)
+        logger.exception("Unexpected Spy membership check failure | game=%s user=%s", game_id, message.from_user.id)
+        await message.answer("◈ Шпион\n\nНе удалось проверить членство в чате. Подключение не выполнено.")
+        return
     existed = _spy_player(game_id, message.from_user.id)
     ok, text = _spy_join(game_id, message.from_user)
     if ok:
@@ -8345,13 +8894,18 @@ async def _spy_launch_game_task(game_id: int, chat_id: int, lobby_message_id: in
 
         ok, msg = await asyncio.wait_for(_spy_start_round(game_id), timeout=45)
         if not ok:
-            _spy_set_state(game_id, status="WAITING", phase="LOBBY", expires_at=None)
+            failed_game = _spy_get_game(game_id)
+            aborted = bool(failed_game and failed_game["status"] == "ABORTED")
+            if not aborted:
+                _spy_set_state(game_id, status="WAITING", phase="LOBBY", expires_at=None)
             with suppress(Exception):
                 await bot.edit_message_text(
                     chat_id=chat_id,
                     message_id=lobby_message_id,
-                    text="◈ Шпион\n\n❌ Игра не запущена.\n" + str(msg),
-                    reply_markup=_spy_lobby_keyboard(game_id, len(_spy_players(game_id)) >= SPY_MIN_PLAYERS),
+                    text=("◈ Шпион\n\n❌ Партия отменена.\n" + str(msg) +
+                          "\n\nСоздай новое лобби командой /spy; эту партию повторно запускать нельзя.") if aborted else
+                         ("◈ Шпион\n\n❌ Игра не запущена.\n" + str(msg)),
+                    reply_markup=None if aborted else _spy_lobby_keyboard(game_id, len(_spy_players(game_id)) >= SPY_MIN_PLAYERS),
                 )
             return
 
@@ -8372,7 +8926,7 @@ async def _spy_launch_game_task(game_id: int, chat_id: int, lobby_message_id: in
             await _spy_prepare_turn_dm(game_id, int(started["current_asker_id"]))
     except asyncio.TimeoutError as exc:
         logger.exception("Spy launch timed out | game=%s", game_id)
-        _spy_set_state(game_id, status="WAITING", phase="LOBBY", expires_at=None, current_asker_id=None, current_target_id=None)
+        _spy_set_state(game_id, status="ABORTED", phase="FINISHED", expires_at=None, current_asker_id=None, current_target_id=None)
         diagnostic = _spy_format_start_error("общий таймаут запуска", exc=exc, details=["Операция превысила 45 секунд.", "Карточки теперь отправляются параллельно, поэтому повторный запуск должен показать точную проблемную стадию."])
         with suppress(Exception):
             await bot.edit_message_text(
@@ -8380,11 +8934,11 @@ async def _spy_launch_game_task(game_id: int, chat_id: int, lobby_message_id: in
                 message_id=lobby_message_id,
                 text=("◈ Шпион\n\n❌ Запуск занял слишком много времени и был отменён.\n\n"
                       f"{diagnostic}"),
-                reply_markup=_spy_lobby_keyboard(game_id, len(_spy_players(game_id)) >= SPY_MIN_PLAYERS),
+                reply_markup=None,
             )
     except Exception as exc:
         logger.exception("Spy launch task failed | game=%s", game_id)
-        _spy_set_state(game_id, status="WAITING", phase="LOBBY", expires_at=None, current_asker_id=None, current_target_id=None)
+        _spy_set_state(game_id, status="ABORTED", phase="FINISHED", expires_at=None, current_asker_id=None, current_target_id=None)
         diagnostic = _spy_format_start_error("необработанное исключение запуска", exc=exc)
         with suppress(Exception):
             await bot.edit_message_text(
@@ -8392,8 +8946,8 @@ async def _spy_launch_game_task(game_id: int, chat_id: int, lobby_message_id: in
                 message_id=lobby_message_id,
                 text=("◈ Шпион\n\n❌ При запуске произошла ошибка.\n\n"
                       f"{diagnostic}\n\n"
-                      "Лобби возвращено в состояние ожидания — данные участников сохранены."),
-                reply_markup=_spy_lobby_keyboard(game_id, len(_spy_players(game_id)) >= SPY_MIN_PLAYERS),
+                      "Партия закрыта во избежание повторной раздачи секретных карточек. Создай новое лобби командой /spy."),
+                reply_markup=None,
             )
 
 
@@ -8446,7 +9000,7 @@ async def spy_callback(callback: CallbackQuery):
             await callback.answer("Ты — ШПИОН. Локация тебе неизвестна.", show_alert=True)
         else:
             loc = str(game["location"] or "")
-            await callback.answer(f"Локация: {loc}", show_alert=True)
+            await callback.answer(f"Секретное слово: {loc}", show_alert=True)
         return
 
     if action == "leave":
@@ -8703,7 +9257,8 @@ async def spy_callback(callback: CallbackQuery):
             if current_round < required_round:
                 await callback.answer(f"Эта подсказка откроется после завершения {required_round - 1}-го круга.", show_alert=True)
                 return
-            hints = SPY_LOCATIONS.get(str(game["location"] or ""), {}).get("hints", [])
+            hints = _spy_word_entry(int(game["chat_id"]), str(game["category_key"] or "places"),
+                                    str(game["location"] or "")).get("hints", [])
             if used >= len(hints):
                 await callback.answer("Для этой локации подсказки закончились.", show_alert=True)
                 return
@@ -8736,14 +9291,14 @@ async def spy_callback(callback: CallbackQuery):
                     conn.execute("INSERT OR REPLACE INTO spy_guesses(game_id,user_id,phase,guess,created_at) VALUES(?,?,?,?,?)", (int(game_id), int(uid), "EARLY_PENDING", "", now())),
                     conn.commit(),
                 ))
-                await callback.message.answer("🎯 Напиши название локации одним сообщением. Это будет твоя досрочная попытка.")
+                await callback.message.answer("🎯 Напиши секретное слово одним сообщением. Это будет твоя досрочная попытка.")
                 await callback.answer("Жду твою догадку.")
                 return
             if phase == "GUESS":
                 if int(game["accusation_suspect_id"] or 0) != uid:
                     await callback.answer("Эта попытка сейчас не для тебя.", show_alert=True)
                     return
-                await callback.message.answer("🎯 Напиши название локации одним сообщением. У тебя 60 секунд.")
+                await callback.message.answer("🎯 Напиши секретное слово одним сообщением. У тебя 60 секунд.")
                 await callback.answer("Жду твою догадку.")
                 return
             if phase == "FINAL_GUESS":
@@ -8754,7 +9309,7 @@ async def spy_callback(callback: CallbackQuery):
                 if already_final:
                     await callback.answer("Ты уже использовал финальную попытку.", show_alert=True)
                     return
-                await callback.message.answer("🎯 Напиши название локации одним сообщением. У тебя 60 секунд.")
+                await callback.message.answer("🎯 Напиши секретное слово одним сообщением. У тебя 60 секунд.")
                 await callback.answer("Жду твою догадку.")
                 return
             await callback.answer("Угадывание сейчас недоступно.", show_alert=True)
@@ -8832,8 +9387,8 @@ async def spy_private_text(message: Message):
             conn.execute("UPDATE spy_guesses SET phase='EARLY',guess=?,created_at=? WHERE game_id=? AND user_id=? AND phase='EARLY_PENDING'", (message.text.strip(), now(), int(game["id"]), int(uid))),
             conn.commit(),
         ))
-        if _spy_location_guess_matches(message.text.strip(), location):
-            await _spy_finish_message(game["id"], "шпионы", f"{_spy_display(player)} угадал локацию досрочно: {game['location']}")
+        if _spy_location_guess_matches(message.text.strip(), location, int(game["chat_id"]), str(game["category_key"] or "places")):
+            await _spy_finish_message(game["id"], "шпионы", f"{_spy_display(player)} угадал секретное слово досрочно: {game['location']}")
         else:
             await message.answer("❌ Неверно. Досрочная попытка исчерпана. Игра продолжается.")
         return
@@ -8887,10 +9442,10 @@ async def spy_private_text(message: Message):
                     return
             guess = unicodedata.normalize("NFKC", message.text.strip()).casefold()
             location = str(game["location"] or "")
-            correct = _spy_location_guess_matches(message.text.strip(), location)
+            correct = _spy_location_guess_matches(message.text.strip(), location, int(game["chat_id"]), str(game["category_key"] or "places"))
             if game["phase"] == "GUESS":
                 if correct:
-                    await _spy_finish_message(game["id"], "шпионы", f"{_spy_display(player)} угадал локацию: {game['location']}")
+                    await _spy_finish_message(game["id"], "шпионы", f"{_spy_display(player)} угадал секретное слово: {game['location']}")
                 else:
                     group_db_op(lambda conn: (
                         conn.execute("UPDATE spy_players SET active=0 WHERE game_id=? AND user_id=?", (int(game["id"]), int(uid))),
@@ -8906,14 +9461,14 @@ async def spy_private_text(message: Message):
                         await message.answer("❌ Неверно. Твоя последняя попытка закончена, но другие шпионы продолжают игру.")
                         await _spy_resume_question_cycle(game["id"])
                     else:
-                        await _spy_finish_message(game["id"], "мирные игроки", f"Шпион не угадал локацию. Правильная локация: {game['location']}")
+                        await _spy_finish_message(game["id"], "мирные игроки", f"Шпион не угадал секретное слово. Правильное слово: {game['location']}")
             else:
                 group_db_op(lambda conn: (
                     conn.execute("INSERT OR REPLACE INTO spy_guesses(game_id,user_id,phase,guess,created_at) VALUES(?,?,?,?,?)", (int(game["id"]), int(uid), "FINAL", message.text.strip(), now())),
                     conn.commit(),
                 ))
                 if correct:
-                    await _spy_finish_message(game["id"], "шпионы", f"{_spy_display(player)} угадал локацию: {game['location']}")
+                    await _spy_finish_message(game["id"], "шпионы", f"{_spy_display(player)} угадал секретное слово: {game['location']}")
                 else:
                     active_spies = _spy_spies(game["id"], active_only=True)
                     attempted = group_db_op(lambda conn: conn.execute(
@@ -8921,7 +9476,7 @@ async def spy_private_text(message: Message):
                         (int(game["id"]),),
                     ).fetchone())["c"]
                     if not active_spies or int(attempted) >= len(active_spies):
-                        await _spy_finish_message(game["id"], "мирные игроки", f"Шпионы не угадали локацию. Правильная локация: {game['location']}")
+                        await _spy_finish_message(game["id"], "мирные игроки", f"Шпионы не угадали локацию. Правильное слово: {game['location']}")
                     else:
                         await message.answer("❌ Неверно. Если останутся попытки других шпионов, они продолжают финальную догадку.")
 
@@ -8992,13 +9547,13 @@ async def _spy_recovery_worker():
                             remaining = _spy_spies(gid, active_only=True)
                             civilians = len([p for p in _spy_players(gid) if int(p["is_spy"] or 0) == 0])
                             if not remaining:
-                                await _spy_finish_message(gid, "мирные игроки", "Шпион не успел угадать локацию.")
+                                await _spy_finish_message(gid, "мирные игроки", "Шпион не успел угадать секретное слово.")
                             elif len(remaining) >= civilians:
                                 await _spy_finish_message(gid, "шпионы", "Шпионов стало не меньше, чем мирных игроков.")
                             else:
                                 await _spy_resume_question_cycle(gid)
                         elif phase == "FINAL_GUESS":
-                            await _spy_finish_message(gid, "мирные игроки", f"Шпионы не успели угадать локацию. Правильная локация: {current_game['location']}")
+                            await _spy_finish_message(gid, "мирные игроки", f"Шпионы не успели угадать секретное слово. Правильное слово: {current_game['location']}")
                 except Exception:
                     logger.exception("Spy recovery expiry failed | game=%s", game["id"])
         except asyncio.CancelledError:
@@ -9035,20 +9590,62 @@ async def custom_command_dispatch(message: Message):
         cmdcfg.schedule_delete(int(message.chat.id), int(sent.message_id), delay)
 
 
+def validate_database_bootstrap_policy(database_was_present: bool, database_valid: bool,
+                                        allow_empty_bootstrap: bool) -> bool:
+    """Return True only for an explicitly approved first-ever empty DB bootstrap."""
+    if database_valid:
+        return False
+    if database_was_present or not allow_empty_bootstrap:
+        raise RuntimeError(
+            "SQLite database is missing/invalid and a valid pinned backup could not be restored. "
+            "Startup stopped to prevent silent data loss. For a genuinely new installation only, "
+            "set JF_ALLOW_EMPTY_DB_BOOTSTRAP=true for the first start, then remove/disable it."
+        )
+    return True
+
+
 async def main():
     global DELIVERY_QUEUE, BROADCAST_QUEUE, FATAL_EVENT
 
     logger.info("Starting Justice Faite Manager...")
 
-    # Restore before any schema initializer touches the database. Render Free
-    # instances lose local SQLite files on restart/redeploy/idle spin-down.
+    # One authoritative configuration for the primary flood and owner console.
+    if ADMIN_ID <= 0:
+        raise RuntimeError("ADMIN_ID is missing or invalid. Set it to the numeric owner Telegram ID.")
+    if PRIMARY_CHAT_ID >= 0:
+        raise RuntimeError("PRIMARY_CHAT_ID is missing or invalid. Set the negative Telegram supergroup ID.")
+
+    # A missing/invalid DB must never silently become a new empty DB. A fresh
+    # installation is allowed only when the operator explicitly opts in once.
+    os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
+    database_was_present = os.path.exists(DB_PATH)
     restored = await JF_CONSOLE.restore_if_missing()
     if restored:
         logger.warning("Persistent SQLite state restored from the owner's pinned DM backup")
+    should_bootstrap_empty_database = validate_database_bootstrap_policy(
+        database_was_present=database_was_present,
+        database_valid=JF_CONSOLE._valid_database(DB_PATH),
+        allow_empty_bootstrap=JF_ALLOW_EMPTY_DB_BOOTSTRAP,
+    )
+    if should_bootstrap_empty_database:
+        logger.critical(
+            "Explicit first-run empty database bootstrap enabled. Disable JF_ALLOW_EMPTY_DB_BOOTSTRAP "
+            "after the first successful startup and verify the owner backup."
+        )
+    if JF_STORAGE_DURABLE and not os.path.isabs(DB_PATH):
+        raise RuntimeError("JF_STORAGE_DURABLE=true requires DB_PATH to be an absolute persistent-volume path.")
+    if not JF_STORAGE_DURABLE:
+        logger.critical(
+            "DB_PATH=%s is not declared durable. Local files may be lost on host restart/redeploy; "
+            "use a persistent disk or managed database before relying on this bot.", DB_PATH
+        )
 
     init_db()
     migrate_db()
     init_group_db()
+    # Load the known username roster once per database; unresolved names remain
+    # visibly pending until Telegram supplies a real user ID from an update.
+    seed_participant_roster()
     JF_MANAGER.init()
     JF_COMMUNITY.init()
     JF_CHATCONFIG.init()
@@ -9070,8 +9667,9 @@ async def main():
     apply_all_settings()
 
     _spy_ensure_schema()
-    asyncio.create_task(_spy_recovery_worker())
-    asyncio.create_task(JF_TIMERS.run_forever())
+    asyncio.create_task(_spy_recovery_worker(), name="spy-recovery")
+    asyncio.create_task(JF_TIMERS.run_forever(), name="jf-timers")
+    asyncio.create_task(role_sync_worker(), name="jf-role-sync")
 
     DELIVERY_QUEUE = asyncio.Queue()
     BROADCAST_QUEUE = asyncio.Queue()
@@ -9104,6 +9702,15 @@ async def main():
         raise
     except Exception:
         logger.exception("Could not configure commands; continuing")
+
+    backup_ok = await JF_CONSOLE.backup_once()
+    if not backup_ok:
+        logger.error("Initial owner-DM backup could not be confirmed: %s", JF_CONSOLE._last_backup_error or "unknown error")
+        if not JF_STORAGE_DURABLE:
+            raise RuntimeError(
+                "No durable storage is declared and the initial remote backup failed. "
+                "Startup stopped to avoid running without a recovery path."
+            )
 
     http_runner = await start_http_server()
     asyncio.create_task(game_poll_refresh_worker())

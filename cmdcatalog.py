@@ -15,10 +15,11 @@ from cmdcfg import Spec
 EXISTING_ALIASES = {
     "start": ("/start",),
     "help": ("/help",),
-    "birthday": ("/jf_birthday",),
+    "birthday": ("/jf_birthday", "др", "мой др", "день рождения"),
     "birthdays": ("/jf_birthdays",),
     "dashboard": ("/jf_dashboard",),
     "rest": ("выдать рест", "/rest", "/jf_rest"),
+    "rest_self": ("взять рест", "/take_rest"),
     "unrest": ("снять рест", "/unrest"),
     "restlist": ("рестники", "/jf_restlist"),
     "warn": ("/jf_warn",),
@@ -49,6 +50,7 @@ EXTRA = [
     # All manager and module commands use this shared command policy as the
     # single configurable access layer. Resource ownership and hierarchy checks
     # remain inside the relevant module as data-integrity safeguards.
+    ("role_status", "Статус персонажа", "🏷️", "roles", ("/role_status",), "members", "group", "Установить статус персонажа: свободна, ожидает или резерв. Дополнительно проверяется Telegram-администратор/владелец."),
     ("mgr_help", "Справка модерации", "🛡️", "moderation", ("/jf_manager",), "members", "group", "Справка по модерации Justice Faite."),
     ("community_help", "Справка по сообществу", "👥", "community", ("/jf_community",), "members", "group", "Справка по кланам, кружкам, заметкам и закладкам."),
     ("mgr_mod_add", "Назначить модератора", "➕", "moderation", ("+модер", "+админ", "!модер", "!!модер", "!!!модер", "!!!!модер", "/jf_mod"), "rank_3", "Назначить модераторский ранг участнику."),

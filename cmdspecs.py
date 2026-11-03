@@ -57,9 +57,9 @@ def load() -> None:
     ))
     S(Spec(
         "birthday", "Мой день рождения", "🎂", "community",
-        "Участник сохраняет свою дату (ДД.ММ). Владелец может задать дату любому: /jf_birthday @user 24.03",
-        triggers=("/jf_birthday",), access="members", access_options=("owner", "members"),
-        where="private", where_options=("private",),
+        "Участник сохраняет свою дату в ЛС или прямо во флуде: «др 24.03». Владелец может задать дату любому: /jf_birthday @user 24.03",
+        triggers=("/jf_birthday", "др", "мой др", "день рождения"), access="members", access_options=("owner", "members"),
+        where="both", where_options=("private", "group", "both"),
         menu=(("jf_birthday", "🎂 Сохранить день рождения"),),
     ))
     S(Spec(
@@ -107,6 +107,17 @@ def load() -> None:
             Param("announce", "Объявлять во флуде, если выдан из ЛС", "bool", False),
             Param("notify_end", "Сообщать об окончании реста во флуде", "bool", True),
             Param("end_text", "Текст об окончании", "text", DEFAULT_REST_END_TEXT, "Доступно: {name}.", max_len=300),
+        ),
+    ))
+    S(Spec(
+        "rest_self", "Взять рест", "🌿", "community",
+        "Участник может оформить рест себе прямо во флуде: «взять рест на 7 дней» или «взять рест до 15.11». Максимум — 14 дней.",
+        triggers=("взять рест", "/take_rest"), access="members", access_options=("owner", "admins", "members"),
+        where="group", where_options=("group",), cooldown_default=30,
+        menu=(("take_rest", "🌿 Взять рест себе"),),
+        params=(
+            Param("max_days", "Максимальный срок самостоятельного реста", "int", 14,
+                  "Ограничение самостоятельного реста участника.", min=1, max=14, step=1, unit="дн", presets=(7, 10, 14)),
         ),
     ))
     S(Spec(
@@ -313,6 +324,36 @@ def load() -> None:
             Param("final_guess_seconds", "Финальная догадка шпиона", "int", 60, min=20, max=300, step=10, unit="с"),
             Param("max_hints", "Подсказок за игру", "int", 2, min=0, max=5, step=1),
         ),
+    ))
+    S(Spec(
+        "spy_leave", "Шпион — выйти из лобби", "🚪", "games",
+        "Участник самостоятельно выходит из ожидающего лобби.",
+        triggers=("/spy_leave",), aliases=("/spy_leave",), access="members", access_options=("owner", "admins", "members", "all"),
+        where="group", where_options=("group",), cooldown=False,
+    ))
+    S(Spec(
+        "spy_categories", "Шпион — список категорий", "📚", "games",
+        "Показать встроенные и пользовательские категории слов.",
+        triggers=("/spy_categories",), aliases=("/spy_categories",), access="members", access_options=("owner", "admins", "members", "all"),
+        where="group", where_options=("group",), cooldown=False,
+    ))
+    S(Spec(
+        "spy_category", "Шпион — выбор категорий", "🗂️", "games",
+        "Выбрать категории слов для текущего лобби.",
+        triggers=("/spy_category",), aliases=("/spy_category",), access="admins", access_options=("owner", "admins"),
+        where="group", where_options=("group",), cooldown=False,
+    ))
+    S(Spec(
+        "spy_word_add", "Шпион — добавить слово", "➕", "games",
+        "Добавить пользовательское слово, алиасы и подсказки в категорию текущего чата.",
+        triggers=("/spy_word_add",), aliases=("/spy_word_add",), access="admins", access_options=("owner", "admins"),
+        where="group", where_options=("group",), cooldown=False,
+    ))
+    S(Spec(
+        "spy_word_remove", "Шпион — удалить слово", "➖", "games",
+        "Удалить пользовательское слово из категории текущего чата.",
+        triggers=("/spy_word_remove",), aliases=("/spy_word_remove",), access="admins", access_options=("owner", "admins"),
+        where="group", where_options=("group",), cooldown=False,
     ))
     S(Spec(
         "spy_kick", "Шпион — исключить", "🕵️", "games",
