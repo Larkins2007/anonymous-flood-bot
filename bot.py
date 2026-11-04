@@ -822,6 +822,19 @@ def role_snapshot_rows(chat_id):
         (chat_id, chat_id)
     ).fetchall())
 
+async def refresh_owner_roles_console(chat_id: int) -> bool:
+    """Refresh the role map in the owner's main console, not only the side snapshot."""
+    if not ADMIN_ID or not JF_CONSOLE:
+        return False
+    try:
+        JF_CONSOLE.primary_chat_id = int(chat_id)
+        await JF_CONSOLE.refresh_all(int(ADMIN_ID), only="roles")
+        return True
+    except Exception:
+        logger.exception("Could not refresh the owner role console | chat=%s", chat_id)
+        return False
+
+
 async def update_role_snapshot(chat_id: int):
     rows=role_snapshot_rows(chat_id)
     visible=[]
@@ -836,18 +849,33 @@ async def update_role_snapshot(chat_id: int):
         if uname.lower()=="@justice_faite_bot": continue
         visible.append(f"Роль участника — {role_name} — {uname}" + (f" — {tag}" if tag else ""))
     lines=["◈ 🎭 Снимок ролей","",f"Основной чат: {chat_id}",f"Участников в базе: {len(visible)}",""]+ (visible or ["Пока нет сохранённых участников."])
-    text="\n".join(lines)[:3900]
+    snapshot_text="\n".join(lines)[:3900]
     state=group_db_op(lambda conn: conn.execute("SELECT owner_message_id FROM role_snapshot_state WHERE chat_id=?",(chat_id,)).fetchone())
     mid=state["owner_message_id"] if state else None
-    if mid:
+    saved_mid = int(mid) if mid else None
+    if saved_mid:
         try:
-            await bot.edit_message_text(chat_id=ADMIN_ID,message_id=mid,text=text)
-            return mid
+            await bot.edit_message_text(chat_id=ADMIN_ID,message_id=saved_mid,text=snapshot_text)
+        except Exception as exc:
+            # Telegram raises this when the snapshot is already current; do not
+            # create a duplicate DM message on every periodic synchronization.
+            if "message is not modified" not in str(exc).lower():
+                saved_mid = None
+    if not saved_mid:
+        try:
+            sent=await bot.send_message(ADMIN_ID,snapshot_text)
+            saved_mid = int(sent.message_id)
         except Exception:
-            pass
-    sent=await bot.send_message(ADMIN_ID,text)
-    group_db_op(lambda conn:(conn.execute("INSERT INTO role_snapshot_state(chat_id,owner_message_id,updated_at) VALUES(?,?,?) ON CONFLICT(chat_id) DO UPDATE SET owner_message_id=excluded.owner_message_id,updated_at=excluded.updated_at",(chat_id,sent.message_id,now())),conn.commit()))
-    return sent.message_id
+            logger.exception("Could not publish the role snapshot | chat=%s", chat_id)
+    if saved_mid:
+        group_db_op(lambda conn:(conn.execute(
+            "INSERT INTO role_snapshot_state(chat_id,owner_message_id,updated_at) VALUES(?,?,?) "
+            "ON CONFLICT(chat_id) DO UPDATE SET owner_message_id=excluded.owner_message_id,updated_at=excluded.updated_at",
+            (chat_id,saved_mid,now()),
+        ),conn.commit()))
+    # The standalone snapshot and the persistent console card are separate messages.
+    await refresh_owner_roles_console(chat_id)
+    return saved_mid
 
 
 def seed_role_catalog():
@@ -5029,6 +5057,7 @@ async def group_member_update(event: ChatMemberUpdated):
         previous = get_member(chat_id, user.id)
         welcome_message_id = previous["welcome_message_id"] if previous else None
         old = mark_member_left(chat_id, user.id)
+        await refresh_owner_roles_console(chat_id)
         role_text = (old or {}).get("role_name") or (old or {}).get("tag") or "роль не назначена"
         old_tag = (old or {}).get("tag") or ""
         username = f"@{user.username}" if user.username else user.first_name or str(user.id)
@@ -5195,6 +5224,7 @@ async def call_assign_role(message: Message):
             return
 
         finalize_role_assignment(message.chat.id, target.id, role_key, actual or tag)
+        await refresh_owner_roles_console(message.chat.id)
         confirm_member(message.chat.id, target.id)
         restriction_lifted = await lift_member_restriction(message.chat.id, target.id) if cmdcfg.get_bool("call", "lift_restriction") else False
         await send_or_edit_welcome(message.chat.id, target.id)
@@ -5305,6 +5335,7 @@ async def bind_role_from_private_admin(message: Message):
             await message.reply(f"{title('🔗 Привязка роли')}\n\n{bullet('Telegram не разрешил установить тег. Изменение отменено.')}")
             return
         finalize_role_assignment(chat_id, target.id, role_key, actual or tag)
+        await refresh_owner_roles_console(chat_id)
         if cmdcfg.get_bool("bindrole", "lift_restriction"):
             await lift_member_restriction(chat_id, target.id)
         await send_or_edit_welcome(chat_id, target.id)
@@ -5420,6 +5451,7 @@ async def setrole_cmd(message: Message):
             release_role_assignment(message.chat.id, target.id, key)
             raise RuntimeError("TAG_FAIL")
         finalize_role_assignment(message.chat.id, target.id, key, actual or tag)
+        await refresh_owner_roles_console(message.chat.id)
         confirm_member(message.chat.id, target.id)
         lifted = await lift_member_restriction(message.chat.id, target.id) if cmdcfg.get_bool("setrole", "lift_restriction") else False
         await cmdcfg.respond(
@@ -6550,6 +6582,7 @@ async def role_assign_from_text(message: Message, state: FSMContext):
             await message.reply("◈ Тег Telegram\n\nНе удалось установить тег. Назначение отменено.")
             return
         finalize_role_assignment(chat_id,target.id,key,actual or tag)
+        await refresh_owner_roles_console(chat_id)
         confirm_member(chat_id,target.id)
         lifted=await lift_member_restriction(chat_id,target.id)
         await message.reply(f"✅ Назначено\n{display_username_for_group(target)}\nРоль: {role['name']}\nТег: {actual or tag}\nОграничение снято: {'да' if lifted else 'нет'}")
@@ -6599,6 +6632,7 @@ async def sign_assigned_role_for_user(message: Message):
         await message.reply("◈ Ошибка тега\n\nНе удалось установить Telegram-тег. Проверь права бота в чате.")
         return
     finalize_role_assignment(int(row["chat_id"]), user_id, normalize_role(role["name"]), actual or desired)
+    await refresh_owner_roles_console(int(row["chat_id"]))
     await message.reply(
         "◈ 🏷 Тег роли\n\n"
         f"Роль: {role['name']}\n"
@@ -7060,6 +7094,7 @@ async def role_status_cmd(message: Message):
         raise
     label = {STATUS_FREE: "свободна", STATUS_WANTED: "ожидает", STATUS_RESERVED: "в резерве"}[status]
     await message.reply(f"Статус роли «{role['name']}» обновлён: {label}.")
+    await refresh_owner_roles_console(int(message.chat.id))
 
 
 # =========================================================
@@ -7818,10 +7853,15 @@ def _spy_record_turn(game_id, turn_no, round_no, asker_id, target_id, question, 
 
 
 def _spy_complete_turn_answer(game_id, turn_no, answer):
+    """Set an answer exactly once; stale/repeated buttons cannot overwrite it."""
     def op(conn):
-        conn.execute("UPDATE spy_turns SET answer=? WHERE game_id=? AND turn_no=?", (str(answer), int(game_id), int(turn_no)))
+        cur = conn.execute(
+            "UPDATE spy_turns SET answer=? WHERE game_id=? AND turn_no=? AND COALESCE(answer,'')=''",
+            (str(answer), int(game_id), int(turn_no)),
+        )
         conn.commit()
-    group_db_op(op)
+        return cur.rowcount == 1
+    return bool(group_db_op(op))
 
 
 def _spy_round_summary_text(game_id, round_no):
@@ -7898,6 +7938,18 @@ def _spy_next_player(game_id, user_id):
 
 def _spy_round_target(player_count):
     return 2 if player_count <= 5 else 3
+
+
+def _spy_claim_start(game_id: int) -> bool:
+    """Atomically claim the lobby; only one duplicate callback can start it."""
+    def op(conn):
+        cur = conn.execute(
+            "UPDATE spy_games SET status='STARTING',phase='LOBBY',updated_at=? WHERE id=? AND status='WAITING'",
+            (now(), int(game_id)),
+        )
+        conn.commit()
+        return cur.rowcount == 1
+    return bool(group_db_op(op))
 
 
 def _spy_create_game(chat_id, creator_id):
@@ -7985,7 +8037,7 @@ def _spy_start_db(game_id, location, spy_ids, assignments, order, category_key="
             )
         conn.execute(
             "UPDATE spy_games SET status='STARTING',phase='QUESTION',started_at=?,expires_at=?,location=?,category_key=?,spy_user_id=?,current_asker_id=?,current_target_id=?,turn_count=0,round_target=?,vote_round=0,cycle_start_turn=0,cycle_expected_turns=?,vote_session=0,accusation_suspect_id=NULL,updated_at=? WHERE id=?",
-            (now(), deadline, location, str(category_key), primary_spy, first, second, len(assignments), len(assignments), now(), int(game_id)),
+            (now(), deadline, location, str(category_key), primary_spy, first, second, target_rounds, len(assignments), now(), int(game_id)),
         )
         conn.commit()
     group_db_op(op)
@@ -8124,6 +8176,54 @@ async def _spy_start_round(game_id):
     return True, "Игра началась."
 
 
+async def _spy_publish_panel(game_id, text, reply_markup=None, *, pin=False) -> bool:
+    """Edit the saved group panel and recreate it when the old Telegram message is gone."""
+    game = _spy_get_game(game_id)
+    if not game:
+        return False
+    chat_id = int(game["chat_id"])
+    old_id = int(game["lobby_message_id"] or 0)
+    if old_id:
+        try:
+            await bot.edit_message_text(
+                chat_id=chat_id,
+                message_id=old_id,
+                text=str(text)[:3900],
+                reply_markup=reply_markup,
+            )
+            if pin:
+                with suppress(Exception):
+                    await bot.pin_chat_message(chat_id, old_id, disable_notification=True)
+            return True
+        except Exception as exc:
+            if "message is not modified" in str(exc).lower():
+                return True
+            logger.warning(
+                "Spy panel edit failed; recreating | game=%s message=%s: %s",
+                game_id, old_id, exc,
+            )
+    try:
+        sent = await bot.send_message(chat_id, str(text)[:3900], reply_markup=reply_markup)
+        new_id = int(sent.message_id)
+        group_db_op(lambda conn: (
+            conn.execute(
+                "UPDATE spy_games SET lobby_message_id=?,updated_at=? WHERE id=?",
+                (new_id, now(), int(game_id)),
+            ),
+            conn.commit(),
+        ))
+        if pin:
+            with suppress(Exception):
+                await bot.pin_chat_message(chat_id, new_id, disable_notification=True)
+            if old_id and old_id != new_id:
+                with suppress(Exception):
+                    await bot.unpin_chat_message(chat_id, old_id)
+        return True
+    except Exception:
+        logger.exception("Spy panel could not be edited or recreated | game=%s", game_id)
+        return False
+
+
 async def _spy_prepare_turn_dm(game_id, asker_id):
     game = _spy_get_game(game_id)
     if not game or game["status"] != "PLAYING" or game["phase"] != "QUESTION":
@@ -8133,6 +8233,15 @@ async def _spy_prepare_turn_dm(game_id, asker_id):
     if not asker or not target:
         return
     turn_no = int(game["turn_count"] or 0) + 1
+    last_turn = group_db_op(lambda conn: conn.execute(
+        "SELECT question,answer FROM spy_turns WHERE game_id=? AND COALESCE(answer,'')<>'' ORDER BY turn_no DESC LIMIT 1",
+        (int(game_id),),
+    ).fetchone())
+    last_result = (
+        f"\nПоследний ответ: {'✅ Да' if str(last_turn['answer']).casefold() == 'да' else '❌ Нет'}\n"
+        f"На вопрос: «{last_turn['question']}»\n"
+        if last_turn else ""
+    )
     await bot.send_message(
         int(asker_id),
         "◈ Шпион\n\n"
@@ -8141,16 +8250,14 @@ async def _spy_prepare_turn_dm(game_id, asker_id):
         "На него должно быть возможно ответить только «Да» или «Нет».",
         reply_markup=_spy_question_keyboard(game_id, asker_id, turn_no),
     )
-    with suppress(Exception):
-        await bot.edit_message_text(
-            chat_id=int(game["chat_id"]),
-            message_id=int(game["lobby_message_id"]),
-            text=("◈ Spyfall · ХОД\n\n"
-                  f"Сейчас ходит {_spy_display(asker)}.\n"
-                  f"Вопрос: {_spy_display(target)}\n\n"
-                  f"Вопрос №{turn_no}.") if game["lobby_message_id"] else "",
-            reply_markup=_spy_group_controls(game_id),
-        ) if game["lobby_message_id"] else None
+    await _spy_publish_panel(
+        game_id,
+        ("◈ Spyfall · ХОД\n\n"
+         f"Сейчас ходит {_spy_display(asker)}.\n"
+         f"Вопрос: {_spy_display(target)}\n\n"
+         f"Вопрос №{turn_no}." + last_result),
+        _spy_group_controls(game_id),
+    )
 
 
 async def _spy_resume_question_cycle(game_id):
@@ -8196,18 +8303,22 @@ async def _spy_start_discussion(game_id):
         current_target_id=None,
         expires_at=(datetime.now(timezone.utc) + timedelta(seconds=SPY_DISCUSSION_SECONDS)).isoformat(),
     )
-    with suppress(Exception):
-        control_id = game["lobby_message_id"]
-        if control_id:
-            await bot.edit_message_text(
-                chat_id=int(game["chat_id"]),
-                message_id=int(control_id),
-                text=("◈ Spyfall · ОБСУЖДЕНИЕ\n\n"
-                      "Вопросы закончены. У вас 2 минуты на обсуждение.\n\n"
-                      "Можно дождаться таймера или сразу перейти к голосованию."),
-                reply_markup=_spy_group_controls(game_id, discussion=True),
+    published = await _spy_publish_panel(
+        game_id,
+        ("◈ Spyfall · ОБСУЖДЕНИЕ\n\n"
+         "Вопросы закончены. У вас 2 минуты на обсуждение.\n\n"
+         "Можно дождаться таймера или сразу перейти к голосованию."),
+        _spy_group_controls(game_id, discussion=True),
+        pin=True,
+    )
+    if not published:
+        logger.error("Spy discussion panel unavailable | game=%s", game_id)
+        with suppress(Exception):
+            await bot.send_message(
+                int(game["chat_id"]),
+                "◈ Spyfall: началось обсуждение. Панель недоступна, автоматическое голосование сработает по таймеру.",
             )
-    return True
+    return published
 
 
 def _spy_vote_snapshot(game_id):
@@ -8266,14 +8377,23 @@ async def _spy_start_vote(game_id):
         "Выберите подозреваемого. Голос можно изменить до завершения голосования.\n\n"
         "○ — никто не голосовал\n● — есть голоса"
     )
-    with suppress(Exception):
-        if game["lobby_message_id"]:
-            await bot.edit_message_text(
-                chat_id=int(game["chat_id"]),
-                message_id=int(game["lobby_message_id"]),
-                text=text,
-                reply_markup=_spy_vote_keyboard(game_id, session),
+    published = await _spy_publish_panel(
+        game_id, text, _spy_vote_keyboard(game_id, session), pin=True,
+    )
+    if not published:
+        # Never leave a game in an invisible voting phase.
+        _spy_set_state(
+            game_id,
+            status="DISCUSSION",
+            phase="DISCUSSION",
+            expires_at=(datetime.now(timezone.utc) + timedelta(seconds=SPY_DISCUSSION_SECONDS)).isoformat(),
+        )
+        with suppress(Exception):
+            await bot.send_message(
+                int(game["chat_id"]),
+                "Не удалось показать кнопки голосования. Игра вернулась к обсуждению; попробуйте перейти к голосованию ещё раз.",
             )
+        return False
     return True
 
 
@@ -8303,15 +8423,13 @@ async def _spy_start_final_guess(game_id, reason="После шести раун
                 f"{reason}.\nУ тебя 60 секунд на финальную догадку.",
                 reply_markup=_spy_guess_keyboard(game_id),
             )
-    with suppress(Exception):
-        if game["lobby_message_id"]:
-            await bot.edit_message_text(
-                chat_id=int(game["chat_id"]),
-                message_id=int(game["lobby_message_id"]),
-                text=("◈ Spyfall · ФИНАЛЬНАЯ ДОГАДКА\n\n"
-                      "Оставшимся шпионам дано 60 секунд, чтобы назвать секретное слово."),
-                reply_markup=None,
-            )
+    await _spy_publish_panel(
+        game_id,
+        ("◈ Spyfall · ФИНАЛЬНАЯ ДОГАДКА\n\n"
+         "Оставшимся шпионам дано 60 секунд, чтобы назвать секретное слово."),
+        None,
+        pin=True,
+    )
 
 
 async def _spy_resolve_vote_session(game_id, vote_session):
@@ -8360,16 +8478,14 @@ async def _spy_resolve_accusation(game_id, suspect_id):
             vote_round=current_round,
             expires_at=(datetime.now(timezone.utc) + timedelta(seconds=SPY_FINAL_GUESS_SECONDS)).isoformat(),
         )
-        with suppress(Exception):
-            if game["lobby_message_id"]:
-                await bot.edit_message_text(
-                    chat_id=int(game["chat_id"]),
-                    message_id=int(game["lobby_message_id"]),
-                    text=("◈ Spyfall · ШПИОН РАСКРЫТ\n\n"
-                          f"Подозреваемый: {_spy_display(suspect)}.\n"
-                          "У него 60 секунд на последнюю попытку угадать секретное слово."),
-                    reply_markup=None,
-                )
+        await _spy_publish_panel(
+            game_id,
+            ("◈ Spyfall · ШПИОН РАСКРЫТ\n\n"
+             f"Подозреваемый: {_spy_display(suspect)}.\n"
+             "У него 60 секунд на последнюю попытку угадать секретное слово."),
+            None,
+            pin=True,
+        )
         with suppress(Exception):
             await bot.send_message(
                 int(suspect_id),
@@ -8401,24 +8517,34 @@ async def _spy_resolve_accusation(game_id, suspect_id):
 
 
 async def _spy_finish_message(game_id, winner, reason, location_override=None):
-    game = _spy_get_game(game_id)
+    # Claim the terminal state before sending a single final notification.
+    # Timers, callbacks and recovery workers may race; only one can finish it.
+    def claim(conn):
+        row = conn.execute("SELECT * FROM spy_games WHERE id=?", (int(game_id),)).fetchone()
+        if not row or row["status"] in {"FINISHED", "CANCELLED", "ABORTED"}:
+            return None
+        cur = conn.execute(
+            "UPDATE spy_games SET status='FINISHED',phase='FINISHED',current_asker_id=NULL,current_target_id=NULL,expires_at=NULL,updated_at=? "
+            "WHERE id=? AND status IN ('WAITING','STARTING','PLAYING','DISCUSSION','VOTING')",
+            (now(), int(game_id)),
+        )
+        conn.commit()
+        return row if cur.rowcount == 1 else None
+    game = group_db_op(claim)
     if not game:
         return
     players = _spy_players(game_id, active_only=False)
     location = location_override or game["location"]
     spies = [p for p in players if int(p["is_spy"] or 0) == 1]
     spy_names = ", ".join(_spy_display(p) for p in spies) or "не определён"
-    _spy_set_state(game_id, status="FINISHED", phase="FINISHED", current_asker_id=None, current_target_id=None, expires_at=None)
-    with suppress(Exception):
-        if game["lobby_message_id"]:
-            await bot.edit_message_text(
-                chat_id=int(game["chat_id"]),
-                message_id=int(game["lobby_message_id"]),
-                text=("◈ Spyfall · ИГРА ОКОНЧЕНА\n\n"
-                      f"Победитель: {winner}\n{reason}\n\n"
-                      f"Секретное слово: {location}\nШпион(ы): {spy_names}"),
-                reply_markup=None,
-            )
+    await _spy_publish_panel(
+        game_id,
+        ("◈ Spyfall · ИГРА ОКОНЧЕНА\n\n"
+         f"Победитель: {winner}\n{reason}\n\n"
+         f"Секретное слово: {location}\nШпион(ы): {spy_names}"),
+        None,
+        pin=False,
+    )
     with suppress(Exception):
         await bot.unpin_chat_message(int(game["chat_id"]), int(game["lobby_message_id"])) if game["lobby_message_id"] else None
     with suppress(Exception):
@@ -9103,9 +9229,11 @@ async def spy_callback(callback: CallbackQuery):
             await callback.answer("Нужно минимум 3 участника.", show_alert=True)
             return
 
-        # Lock before spawning the launch task. This makes the button idempotent
-        # even if Telegram delivers two clicks almost simultaneously.
-        _spy_set_state(game_id, status="STARTING", phase="LOBBY")
+        # Conditional SQL update is the source of truth: only one click can
+        # claim the lobby even when two callbacks were read before either write.
+        if not _spy_claim_start(game_id):
+            await callback.answer("Эта игра уже запускается или была запущена.", show_alert=False)
+            return
         await callback.answer("Запускаю игру…", show_alert=False)
 
         # Do not keep the Telegram callback open while sending secret DMs.
@@ -9190,11 +9318,39 @@ async def spy_callback(callback: CallbackQuery):
                 await callback.answer("Не удалось определить следующий ход.", show_alert=True)
                 return
             answer = "Да" if value else "Нет"
-            _spy_complete_turn_answer(game_id, callback_turn_no, answer)
+            turn = group_db_op(lambda conn: conn.execute(
+                "SELECT asker_id,target_id,question,round_no,answer FROM spy_turns WHERE game_id=? AND turn_no=?",
+                (int(game_id), int(callback_turn_no)),
+            ).fetchone())
+            if not turn or str(turn["answer"] or ""):
+                await callback.answer("Ответ на этот вопрос уже принят или ход устарел.", show_alert=True)
+                return
+            if not _spy_complete_turn_answer(game_id, callback_turn_no, answer):
+                await callback.answer("Ответ уже принят. Следи за следующим ходом.", show_alert=True)
+                return
             new_count = callback_turn_no
-            # Answer is private game data; the pinned panel/round state is enough for the group.
             with suppress(Exception):
                 await callback.message.edit_reply_markup(reply_markup=None)
+
+            # The answer is a public game event, while the original asker also
+            # receives a private confirmation so their question never vanishes.
+            asker = _spy_player(game_id, int(turn["asker_id"]))
+            result_line = (
+                f"💬 {_spy_display(target)} ответил на вопрос "
+                f"от {_spy_display(asker) if asker else 'участника'}: "
+                f"{'✅ Да' if value else '❌ Нет'}\n«{turn['question']}»"
+            )
+            try:
+                await bot.send_message(int(game["chat_id"]), result_line)
+            except Exception:
+                # Keep the failure visible in logs; the next edited group panel
+                # also carries the latest persisted Q/A pair as a fallback.
+                logger.exception("Could not publish Spy answer in group | game=%s turn=%s", game_id, callback_turn_no)
+            with suppress(Exception):
+                await bot.send_message(
+                    int(turn["asker_id"]),
+                    f"◈ Шпион\n\nОтвет на твой вопрос «{turn['question']}»: {answer}.\n\nТеперь ход переходит к ответившему игроку.",
+                )
     
             current = _spy_get_game(game_id)
             cycle_start = int(current["cycle_start_turn"] or 0) if current else 0
@@ -9211,8 +9367,9 @@ async def spy_callback(callback: CallbackQuery):
                 players_count = max(1, len(_spy_players(game_id)))
                 completed_round = ((new_count - 1) // players_count) + 1
                 await _spy_send_round_summary(game_id, completed_round)
-                if int(current["vote_round"] or 0) == 0 and completed_round < SPY_INITIAL_QUESTION_ROUNDS:
-                    # First voting phase always comes only after two complete question circles.
+                target_rounds = max(1, int(current["round_target"] or SPY_INITIAL_QUESTION_ROUNDS))
+                if int(current["vote_round"] or 0) == 0 and completed_round < target_rounds:
+                    # Each player count uses the configured number of complete circles.
                     _spy_set_state(game_id, cycle_start_turn=new_count, cycle_expected_turns=players_count)
                     await _spy_prepare_turn_dm(game_id, uid)
                 else:
@@ -9282,16 +9439,24 @@ async def spy_callback(callback: CallbackQuery):
 
             current = _spy_get_game(game_id)
             if current and current["phase"] == "VOTING" and current["status"] == "VOTING" and int(current["vote_session"] or 0) == session:
-                with suppress(Exception):
-                    await bot.edit_message_text(
-                        chat_id=int(current["chat_id"]),
-                        message_id=int(current["lobby_message_id"]),
-                        text=("◈ Spyfall · ГОЛОСОВАНИЕ\n\n"
-                              f"Раунд {int(current['vote_round'] or 0) + 1}/{SPY_MAX_VOTE_ROUNDS}.\n"
-                              "Выберите подозреваемого. Голос можно изменить до завершения голосования.\n\n"
-                              "○ — нет голосов\n● — есть голоса"),
-                        reply_markup=_spy_vote_keyboard(game_id, session),
+                published = await _spy_publish_panel(
+                    game_id,
+                    ("◈ Spyfall · ГОЛОСОВАНИЕ\n\n"
+                     f"Раунд {int(current['vote_round'] or 0) + 1}/{SPY_MAX_VOTE_ROUNDS}.\n"
+                     "Выберите подозреваемого. Голос можно изменить до завершения голосования.\n\n"
+                     "○ — нет голосов\n● — есть голоса"),
+                    _spy_vote_keyboard(game_id, session),
+                    pin=True,
+                )
+                if not published:
+                    _spy_set_state(
+                        game_id, status="DISCUSSION", phase="DISCUSSION",
+                        expires_at=(datetime.now(timezone.utc) + timedelta(seconds=SPY_DISCUSSION_SECONDS)).isoformat(),
                     )
+                    with suppress(Exception):
+                        await bot.send_message(int(current["chat_id"]),
+                            "Панель голосования недоступна. Возвращаемся к обсуждению; запустите голосование повторно.")
+                    return
                 result = _spy_vote_result(game_id)
                 if result["total"] >= result["active"]:
                     await _spy_resolve_vote_session(game_id, session)
@@ -9299,8 +9464,9 @@ async def spy_callback(callback: CallbackQuery):
 
     if action == "hint":
         async with _spy_game_lock(game_id):
+            game = _spy_get_game(game_id)
             player = _spy_player(game_id, uid)
-            if callback.message.chat.type != "private" or not player or not int(player["is_spy"] or 0) or not int(player["active"] or 0) or game["status"] != "PLAYING" or game["phase"] not in {"QUESTION", "ASKING", "ANSWERING", "DISCUSSION", "VOTING"}:
+            if callback.message.chat.type != "private" or not game or not player or not int(player["is_spy"] or 0) or not int(player["active"] or 0) or game["status"] not in {"PLAYING", "DISCUSSION", "VOTING"} or game["phase"] not in {"QUESTION", "ASKING", "ANSWERING", "DISCUSSION", "VOTING"}:
                 await callback.answer("Подсказка сейчас недоступна.", show_alert=True)
                 return
             used = int(player["hints_used"] or 0)
@@ -9329,12 +9495,13 @@ async def spy_callback(callback: CallbackQuery):
 
     if action == "guess":
         async with _spy_game_lock(game_id):
+            game = _spy_get_game(game_id)
             player = _spy_player(game_id, uid)
-            if callback.message.chat.type != "private" or not player or not int(player["is_spy"] or 0) or not int(player["active"] or 0):
+            if callback.message.chat.type != "private" or not game or not player or not int(player["is_spy"] or 0) or not int(player["active"] or 0):
                 await callback.answer("Эта кнопка сейчас недоступна.", show_alert=True)
                 return
             phase = str(game["phase"] or "")
-            if game["status"] == "PLAYING" and phase in {"QUESTION", "ASKING", "ANSWERING", "DISCUSSION", "VOTING"}:
+            if game["status"] in {"PLAYING", "DISCUSSION", "VOTING"} and phase in {"QUESTION", "ASKING", "ANSWERING", "DISCUSSION", "VOTING"}:
                 exists = group_db_op(lambda conn: conn.execute(
                     "SELECT 1 FROM spy_guesses WHERE game_id=? AND user_id=? AND phase IN ('EARLY_PENDING','EARLY')",
                     (int(game_id), int(uid)),
@@ -9432,7 +9599,7 @@ async def spy_private_text(message: Message):
         "SELECT 1 FROM spy_guesses WHERE game_id=? AND user_id=? AND phase='EARLY_PENDING'",
         (int(game["id"]), int(uid)),
     ).fetchone())
-    if early_pending and game["status"] == "PLAYING":
+    if early_pending and game["status"] in {"PLAYING", "DISCUSSION", "VOTING"}:
         player = _spy_player(game["id"], uid)
         if not player or not int(player["is_spy"] or 0) or not int(player["active"] or 0):
             return
@@ -9450,9 +9617,13 @@ async def spy_private_text(message: Message):
 
     async with _spy_game_lock(game["id"]):
         game = _spy_get_game(game["id"])
-        if not game or game["phase"] != "ASKING" or int(game["current_asker_id"] or 0) != uid:
+        if not game:
             return
-        if game["phase"] == "ASKING" and int(game["current_asker_id"] or 0) == uid:
+        # Only consume ordinary text here when the sender is the current asker.
+        # Other phases (GUESS / FINAL_GUESS) must fall through to the next block.
+        if game["phase"] == "ASKING":
+            if int(game["current_asker_id"] or 0) != uid:
+                return
             text = message.text.strip()
             if not text or len(text) > 300 or not text.rstrip().endswith("?"):
                 await message.answer("Напиши один короткий вопрос и поставь «?» именно в самом конце. На него должен быть возможен ответ только «Да» или «Нет».")
@@ -9536,6 +9707,31 @@ async def spy_private_text(message: Message):
                         await message.answer("❌ Неверно. Если останутся попытки других шпионов, они продолжают финальную догадку.")
 
 
+async def _spy_abort_interrupted_starts():
+    """Abort half-dealt games left in STARTING by a previous process."""
+    rows = group_db_op(lambda conn: conn.execute(
+        "SELECT id,chat_id FROM spy_games WHERE status='STARTING' ORDER BY id"
+    ).fetchall())
+    for row in rows:
+        game_id = int(row["id"])
+        def abort(conn):
+            cur = conn.execute(
+                "UPDATE spy_games SET status='ABORTED',phase='FINISHED',expires_at=NULL,current_asker_id=NULL,current_target_id=NULL,updated_at=? "
+                "WHERE id=? AND status='STARTING'",
+                (now(), game_id),
+            )
+            if cur.rowcount:
+                conn.execute("UPDATE spy_players SET active=0 WHERE game_id=?", (game_id,))
+            conn.commit()
+            return cur.rowcount == 1
+        if group_db_op(abort):
+            with suppress(Exception):
+                await bot.send_message(
+                    int(row["chat_id"]),
+                    "◈ Шпион\n\nПартия автоматически отменена: бот перезапустился во время раздачи секретных карточек. Создайте новое лобби командой /spy.",
+                )
+
+
 async def _spy_recovery_worker():
     await asyncio.sleep(5)
     while True:
@@ -9565,25 +9761,23 @@ async def _spy_recovery_worker():
                             continue
                         phase = str(current_game["phase"] or "")
                         if current_game["status"] == "STARTING":
-                            # A process restart can leave a launcher stuck after
-                            # some secret cards were delivered. Never resume a
-                            # half-started game with inconsistent roles. Return it
-                            # to the lobby so the administrator can start cleanly.
-                            _spy_set_state(
-                                gid,
-                                status="WAITING",
-                                phase="LOBBY",
-                                expires_at=None,
-                                current_asker_id=None,
-                                current_target_id=None,
-                            )
-                            group_db_op(lambda conn: (
-                                conn.execute(
-                                    "UPDATE spy_players SET role_name='',is_spy=0,hints_used=0 WHERE game_id=?",
-                                    (gid,),
-                                ),
-                                conn.commit(),
-                            ))
+                            # Some secret cards may already have been delivered.
+                            # Never reopen the lobby and risk distributing new roles.
+                            def abort(conn):
+                                cur = conn.execute(
+                                    "UPDATE spy_games SET status='ABORTED',phase='FINISHED',expires_at=NULL,current_asker_id=NULL,current_target_id=NULL,updated_at=? WHERE id=? AND status='STARTING'",
+                                    (now(), gid),
+                                )
+                                if cur.rowcount:
+                                    conn.execute("UPDATE spy_players SET active=0 WHERE game_id=?", (gid,))
+                                conn.commit()
+                                return cur.rowcount == 1
+                            if group_db_op(abort):
+                                with suppress(Exception):
+                                    await bot.send_message(
+                                        int(current_game["chat_id"]),
+                                        "◈ Шпион\n\nЗапуск прерван по тайм-ауту. Партия отменена, создайте новое лобби командой /spy.",
+                                    )
                             continue
                         if phase in {"QUESTION", "ASKING", "ANSWERING"}:
                             await _spy_start_discussion(gid)
@@ -9733,6 +9927,9 @@ async def main():
     apply_all_settings()
 
     _spy_ensure_schema()
+    # Resolve old STARTING games before polling: partial DM delivery must never
+    # survive a process restart as a lobby that can be started again.
+    await _spy_abort_interrupted_starts()
     asyncio.create_task(_spy_recovery_worker(), name="spy-recovery")
     asyncio.create_task(JF_TIMERS.run_forever(), name="jf-timers")
     asyncio.create_task(role_sync_worker(), name="jf-role-sync")

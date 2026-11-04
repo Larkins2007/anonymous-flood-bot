@@ -24,7 +24,7 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger("justice-faite-console")
-PROJECT_VERSION = "0.7.6"
+PROJECT_VERSION = "0.8.0"
 BACKUP_MARKER = "JF_DB_BACKUP_V1"
 BACKUP_INTERVAL_SECONDS = 300
 CHAT_LOG_RETENTION_DAYS = max(1, min(int(os.getenv("JF_CHAT_LOG_RETENTION_DAYS", "30")), 365))
@@ -910,6 +910,30 @@ class Console:
         lines.append(f"🎭 С распознанной ролью: {assigned_count}")
         lines.append(f"▫️ Пока без распознанной роли: {max(0, active_count - assigned_count)}")
 
+        if "role_catalog" in tables:
+            catalog_count = self._table_count("role_catalog")
+            state_rows = self.store.run(lambda c: c.execute(
+                "SELECT status,COUNT(*) AS c FROM role_state WHERE chat_id=? GROUP BY status", (chat_id,)
+            ).fetchall())
+            role_counts = {str(row["status"] or "free").casefold(): int(row["c"] or 0) for row in state_rows}
+            taken = role_counts.get("taken", 0)
+            wanted = role_counts.get("wanted", 0)
+            reserved = role_counts.get("reserved", 0)
+            free = max(0, catalog_count - taken - wanted - reserved)
+            lines.append(
+                f"\n📚 Каталог: {catalog_count} ролей · 💛 занято: {taken} · "
+                f"💚 свободно: {free} · 🧡 ожидают: {wanted} · 🔒 резерв: {reserved}"
+            )
+        if "role_history" in tables:
+            history_count = self._table_count("role_history", f"WHERE chat_id={chat_id}")
+            lines.append(f"🧾 Записей в истории назначений: {history_count}")
+        if "role_snapshot_state" in tables:
+            last_sync = self.store.run(lambda c: c.execute(
+                "SELECT updated_at FROM role_snapshot_state WHERE chat_id=?", (chat_id,)
+            ).fetchone())
+            if last_sync and last_sync["updated_at"]:
+                lines.append(f"🕒 Последняя синхронизация: {esc(str(last_sync['updated_at']))}")
+
         if "participant_roster" in tables:
             pending_count = self.store.run(lambda c: c.execute(
                 "SELECT COUNT(*) FROM participant_roster WHERE chat_id=? AND user_id IS NULL", (chat_id,)
@@ -1038,13 +1062,32 @@ class Console:
 
     @staticmethod
     def _valid_database(path: str) -> bool:
+        """Reject corrupt *and structurally incomplete* DBs before skipping recovery."""
+        required_columns = {
+            "group_members": {"chat_id", "user_id", "role_key", "role_name", "tag", "active"},
+            "participant_roster": {"chat_id", "username", "user_id"},
+            "role_catalog": {"role_key", "role_name", "english_name", "region"},
+            "role_state": {"chat_id", "role_key", "role_name", "user_id", "status"},
+            "role_history": {"chat_id", "user_id", "role_key", "role_name", "tag", "event", "created_at"},
+            "managed_group": {"group_chat_id"},
+            "jf_project_memory": {"key", "category", "title", "body", "source", "updated_at"},
+            "jf_console_messages": {"section", "chat_id", "message_id", "updated_at"},
+        }
         if not os.path.isfile(path) or os.path.getsize(path) < 100:
             return False
         try:
             with sqlite3.connect(path, timeout=5) as conn:
                 integrity = conn.execute("PRAGMA integrity_check").fetchone()
-                tables = conn.execute("SELECT COUNT(*) FROM sqlite_master WHERE type='table'").fetchone()[0]
-            return bool(integrity and integrity[0] == "ok" and int(tables) > 0)
+                tables = {str(row[0]) for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table'"
+                ).fetchall()}
+                if not integrity or integrity[0] != "ok" or not set(required_columns) <= tables:
+                    return False
+                for table, expected in required_columns.items():
+                    actual = {str(row[1]) for row in conn.execute(f'PRAGMA table_info("{table}")')}
+                    if not expected <= actual:
+                        return False
+            return True
         except sqlite3.Error:
             return False
 
