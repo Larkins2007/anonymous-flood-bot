@@ -24,7 +24,7 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger("justice-faite-console")
-PROJECT_VERSION = "0.8.1"
+PROJECT_VERSION = "0.8.2"
 BACKUP_MARKER = "JF_DB_BACKUP_V1"
 BACKUP_INTERVAL_SECONDS = 300
 CHAT_LOG_RETENTION_DAYS = max(1, min(int(os.getenv("JF_CHAT_LOG_RETENTION_DAYS", "30")), 365))
@@ -1118,6 +1118,7 @@ class Console:
         compressed = os.path.join(temp_dir, "backup.sqlite3.gz")
         restored = os.path.join(temp_dir, "restored.sqlite3")
         restored_ok = False
+        staged_path = None
         try:
             chat = await self.bot.get_chat(self.owner_id)
             pinned = getattr(chat, "pinned_message", None)
@@ -1132,13 +1133,48 @@ class Console:
                 shutil.copyfileobj(source, target)
             if not self._valid_database(restored):
                 raise sqlite3.DatabaseError("Pinned backup failed SQLite integrity validation")
-            os.makedirs(os.path.dirname(os.path.abspath(self.store.path)), exist_ok=True)
+
+            # Render may put /tmp and the project directory on different
+            # filesystems. os.replace() cannot move a file across devices, so
+            # stage a verified copy beside the destination and replace from
+            # that same directory instead.
+            target_path = os.path.abspath(self.store.path)
+            target_dir = os.path.dirname(target_path)
+            os.makedirs(target_dir, exist_ok=True)
+            fd, staged_path = tempfile.mkstemp(
+                prefix=f".{os.path.basename(target_path)}.restore.",
+                suffix=".tmp",
+                dir=target_dir,
+            )
+            with os.fdopen(fd, "wb") as target, open(restored, "rb") as source:
+                shutil.copyfileobj(source, target)
+                target.flush()
+                os.fsync(target.fileno())
+            if not self._valid_database(staged_path):
+                raise sqlite3.DatabaseError("Staged SQLite backup failed integrity validation")
+
+            # Preserve the invalid database for diagnostics. Never overwrite it
+            # if quarantine failed; that would risk silently losing local data.
+            if os.path.exists(target_path):
+                quarantine = self._quarantine_invalid_database()
+                if not quarantine or os.path.exists(target_path):
+                    raise OSError("Could not quarantine the invalid local SQLite database")
+            # A sidecar that could not be moved with the quarantined DB must
+            # never be paired with the restored database.
             for suffix in ("-wal", "-shm"):
                 with suppress(OSError):
-                    os.remove(self.store.path + suffix)
-            if os.path.exists(self.store.path):
-                self._quarantine_invalid_database()
-            os.replace(restored, self.store.path)
+                    os.remove(target_path + suffix)
+
+            os.replace(staged_path, target_path)
+            staged_path = None
+            # Persist the directory entry where supported (best effort).
+            with suppress(OSError):
+                dir_fd = os.open(target_dir, os.O_RDONLY)
+                try:
+                    os.fsync(dir_fd)
+                finally:
+                    os.close(dir_fd)
+
             message_id = int(getattr(pinned, "message_id", 0) or 0)
             if message_id:
                 with suppress(Exception):
@@ -1150,6 +1186,9 @@ class Console:
             logger.exception("Could not restore SQLite DB from Telegram owner-DM backup")
             return False
         finally:
+            if staged_path and os.path.exists(staged_path):
+                with suppress(OSError):
+                    os.remove(staged_path)
             if not restored_ok and os.path.exists(self.store.path) and not self._valid_database(self.store.path):
                 # Do not leave a corrupt file at the configured path: the normal
                 # initializers would otherwise fail before the bot can start.
