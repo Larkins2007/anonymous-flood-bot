@@ -405,9 +405,10 @@ def describe(template: str, *, title: str, age: str, days: int, name: str) -> st
 # --------------------------------------------------------------------------
 
 class Queue:
-    def __init__(self, db_op: Callable, now: Callable[[], str]):
+    def __init__(self, db_op: Callable, now: Callable[[], str], *, initialize: bool = True):
         self.q, self.now = db_op, now
-        self.ensure()
+        if initialize:
+            self.ensure()
 
     def ensure(self) -> None:
         def op(conn):
@@ -981,11 +982,17 @@ async def on_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
 
 
+def initialize_registered_queue() -> None:
+    """Create the award queue schema after the application DB passes recovery."""
+    if CTX.queue is not None:
+        CTX.queue.ensure()
+
+
 def register(dp, *, bot, owner_id: int, chat_id: int, db_op: Callable, now: Callable[[], str],
              active_members: Callable[[], list], lookup_member: Optional[Callable] = None,
-             issue_local_award: Optional[Callable] = None) -> None:
+             issue_local_award: Optional[Callable] = None, initialize: bool = True) -> None:
     CTX.bot, CTX.owner_id, CTX.chat_id = bot, int(owner_id), int(chat_id)
-    CTX.queue = Queue(db_op, now)
+    CTX.queue = Queue(db_op, now, initialize=initialize)
     CTX.active_members = active_members
     CTX.lookup_member = lookup_member
     CTX.issue_local_award = issue_local_award

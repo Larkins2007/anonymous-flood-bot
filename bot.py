@@ -70,6 +70,8 @@ JF_STORAGE_DURABLE = os.getenv("JF_STORAGE_DURABLE", "false").strip().casefold()
 ROLE_SYNC_INTERVAL_SECONDS = max(300, int(os.getenv("ROLE_SYNC_INTERVAL_SECONDS", "300") or "300"))
 
 DB_PATH = os.getenv("DB_PATH", "users.db").strip() or "users.db"
+# Capture the true pre-start state before module registration can touch SQLite.
+DB_EXISTED_AT_PROCESS_START = os.path.isfile(DB_PATH)
 PORT = int(os.getenv("PORT", "10000"))
 
 REPORT_COOLDOWN_SECONDS = 600
@@ -217,6 +219,17 @@ JF_RAFFLES = jf_raffles.register(dp, bot=bot, F=F, db_path=DB_PATH, manager=JF_M
 
 import jf_clean
 JF_CLEAN = jf_clean.register(dp, bot=bot, F=F, db_path=DB_PATH, manager=JF_MANAGER, lock=DB_LOCK)
+
+# Register inline protection before the console archive middleware and the
+# later member-tag/activity observers. The lazy DB callback resolves after the
+# group_db_op function is defined; register() itself performs no DB writes.
+import jf_inline_guard
+JF_INLINE_GUARD = jf_inline_guard.register(
+    dp, bot=bot,
+    db_op=lambda callback, *args: group_db_op(callback, *args),
+    owner_id=ADMIN_ID,
+    primary_chat_id=lambda: int(PRIMARY_CHAT_ID),
+)
 
 import jf_console
 JF_CONSOLE = jf_console.register(dp, bot=bot, F=F, db_path=DB_PATH, lock=DB_LOCK, owner_id=ADMIN_ID, primary_chat_id=PRIMARY_CHAT_ID)
@@ -6956,6 +6969,7 @@ async def setup_commands():
     memory_search_command = BotCommand(command="jf_memory_search", description="🔎 Поиск по памяти, флуду и логам")
     chatlog_command = BotCommand(command="jf_chatlog", description="📚 Состояние архива переписки и логов")
     console_refresh_command = BotCommand(command="jf_console_refresh", description="🔄 Обновить личную консоль")
+    inline_guard_command = BotCommand(command="inline_guard", description="🛡️ Защита от inline-ботов")
     group_extras = (profile_command, reputation_command, reports_command, timers_command,
                     automod_command, fun_command, network_command, raffles_command,
                     clean_command, stats_command, chatconfig_command, community_command,
@@ -6979,7 +6993,7 @@ async def setup_commands():
         with suppress(Exception):
             await bot.set_my_commands([], scope=scope)
 
-    for item in (console_command, console_refresh_command, memory_command, memory_save_command, memory_search_command, chatlog_command):
+    for item in (console_command, console_refresh_command, memory_command, memory_save_command, memory_search_command, chatlog_command, inline_guard_command):
         if all(c.command != item.command for c in owner_private):
             owner_private.insert(0, item)
 
@@ -9549,7 +9563,9 @@ try:
     import cmdcatalog
     extra_command_count = cmdcatalog.load()
     cmdcfg.configure(bot=bot, owner_id=ADMIN_ID, primary_chat_id=PRIMARY_CHAT_ID, manager=JF_MANAGER)
-    cmdcfg.bind_db(group_db_op)
+    # Bind without schema writes: the real database must be validated/restored
+    # before any module creates tables or touches the configured SQLite file.
+    cmdcfg.bind_db(group_db_op, initialize=False)
     cmdcfg.set_menu_refresher(refresh_command_menu)
     # Central, silent command-access gate: covers every command alias in the catalog,
     # including modules that have their own broad text dispatcher.
@@ -9562,6 +9578,7 @@ try:
     from justice_features import (
         register_justice_features,
         init_justice_features_db,
+        seed_birthday_directory,
         feature_maintenance_worker,
     )
     register_justice_features(globals())
@@ -9864,7 +9881,7 @@ async def main():
     # A missing/invalid DB must never silently become a new empty DB. A fresh
     # installation is allowed only when the operator explicitly opts in once.
     os.makedirs(os.path.dirname(os.path.abspath(DB_PATH)), exist_ok=True)
-    database_was_present = os.path.exists(DB_PATH)
+    database_was_present = DB_EXISTED_AT_PROCESS_START
     restored = await JF_CONSOLE.restore_if_missing()
     if restored:
         logger.warning("Persistent SQLite state restored from the owner's pinned DM backup")
@@ -9889,6 +9906,15 @@ async def main():
     init_db()
     migrate_db()
     init_group_db()
+    # The database has now passed recovery checks. Bind/initialize command
+    # settings only after restoration, so a missing/corrupt DB cannot be
+    # accidentally shadowed by import-time CREATE TABLE statements.
+    cmdcfg.bind_db(group_db_op)
+    # New tables are created only after restore, so old backups migrate safely.
+    cmdcfg.STORE.ensure_schema()
+    JF_INLINE_GUARD.ensure_schema()
+    # A restore can replace the SQLite file; invalidate any pre-restore cache.
+    cmdcfg.STORE.reload()
     # Restore/bind resolution must happen after SQLite recovery and group-table
     # initialization, but before any feature seeds, role middleware or workers
     # begin reading PRIMARY_CHAT_ID.
@@ -9920,6 +9946,7 @@ async def main():
     JF_CLEAN.init()
     JF_CONSOLE.init()
     init_justice_features_db()
+    seed_birthday_directory()
     seed_role_catalog()
     seed_default_games()
     migrate_group_state()

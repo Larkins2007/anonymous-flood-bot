@@ -209,6 +209,9 @@ def init_justice_features_db() -> None:
         conn.commit()
 
     _q(op)
+    # awards.register() is called during handler registration with initialize=False.
+    # Its schema is created here, after bot.py has validated/restored SQLite.
+    awards.initialize_registered_queue()
 
 
 # --------------------------------------------------------------------------
@@ -1090,12 +1093,14 @@ def register_justice_features(ns: dict[str, Any]):
     _admin_id = int(ns["ADMIN_ID"])
     _is_primary_chat = ns["is_primary_chat"]
 
-    init_justice_features_db()
-    seed_birthday_directory()
+    # Registration is intentionally side-effect free with respect to SQLite.
+    # bot.py validates/restores the database before calling init_justice_features_db
+    # and seed_birthday_directory during startup.
 
     awards.register(
         _dp, bot=_bot, owner_id=_admin_id, chat_id=_primary_chat_id, db_op=_db_op, now=_now,
         active_members=_active_member_rows, lookup_member=lookup_member, issue_local_award=issue_local_award,
+        initialize=False,
     )
 
     private = F.chat.type == "private"

@@ -241,13 +241,23 @@ class Store:
     def __init__(self):
         self._db_op: Optional[Callable] = None
         self._cache: dict[tuple[str, str], str] = {}
+        self._switch_cache: dict[str, bool] = {}
         self._loaded = False
         self._hooks: list[Callable[[str, str, Any], None]] = []
 
-    def bind(self, db_op: Callable) -> None:
+    def bind(self, db_op: Callable, *, initialize: bool = True) -> None:
         self._db_op = db_op
+        self._cache.clear()
+        self._switch_cache.clear()
         self._loaded = False
-        self.ensure_schema()
+        if initialize:
+            self.ensure_schema()
+
+    def reload(self) -> None:
+        """Invalidate in-memory settings after database restore/replacement."""
+        self._cache.clear()
+        self._switch_cache.clear()
+        self._loaded = False
 
     def ensure_schema(self) -> None:
         if not self._db_op:
@@ -274,6 +284,11 @@ class Store:
                 "updated_at TEXT NOT NULL DEFAULT '')"
             )
             conn.execute("CREATE INDEX IF NOT EXISTS idx_cmd_settings_audit_time ON cmd_settings_audit(updated_at DESC,id DESC)")
+            conn.execute(
+                "CREATE TABLE IF NOT EXISTS cmd_feature_switches ("
+                "scope TEXT PRIMARY KEY, enabled INTEGER NOT NULL CHECK(enabled IN (0,1)), "
+                "updated_by INTEGER NOT NULL DEFAULT 0, updated_at TEXT NOT NULL DEFAULT '')"
+            )
             conn.commit()
 
         self._db_op(op)
@@ -342,6 +357,46 @@ class Store:
             "FROM cmd_settings_audit ORDER BY id DESC LIMIT ?", (limit,)
         ).fetchall())
         return [(int(r[0]), str(r[1]), str(r[2]), r[3], r[4], int(r[5]), str(r[6])) for r in rows]
+
+    def switch_enabled(self, scope: str) -> bool:
+        """Read a persisted feature switch. Missing rows mean enabled (safe default)."""
+        scope = str(scope)
+        if scope in self._switch_cache:
+            return self._switch_cache[scope]
+        if not self._db_op:
+            return True
+        row = self._db_op(lambda conn: conn.execute(
+            "SELECT enabled FROM cmd_feature_switches WHERE scope=?", (scope,)
+        ).fetchone())
+        value = True if row is None else bool(int(row[0]))
+        self._switch_cache[scope] = value
+        return value
+
+    def set_switch(self, scope: str, enabled: bool, *, actor_id: int = 0) -> bool:
+        """Persist a global/category switch and write the common settings audit."""
+        scope = str(scope).strip()
+        if not scope or len(scope) > 80:
+            raise ValueError("invalid switch scope")
+        enabled = bool(enabled)
+        previous = self.switch_enabled(scope)
+        stamp = time.strftime("%Y-%m-%dT%H:%M:%S")
+        if self._db_op:
+            def op(conn):
+                conn.execute(
+                    "INSERT INTO cmd_feature_switches(scope,enabled,updated_by,updated_at) VALUES(?,?,?,?) "
+                    "ON CONFLICT(scope) DO UPDATE SET enabled=excluded.enabled,updated_by=excluded.updated_by,updated_at=excluded.updated_at",
+                    (scope, 1 if enabled else 0, int(actor_id or RT.owner_id or 0), stamp),
+                )
+                if previous != enabled:
+                    conn.execute(
+                        "INSERT INTO cmd_settings_audit(command,key,old_value,new_value,actor_id,updated_at) VALUES(?,?,?,?,?,?)",
+                        ("__switch__", scope, "включено" if previous else "выключено",
+                         "включено" if enabled else "выключено", int(actor_id or RT.owner_id or 0), stamp),
+                    )
+                conn.commit()
+            self._db_op(op)
+        self._switch_cache[scope] = enabled
+        return previous != enabled
 
     def set_user_access(self, command: str, user_id: int, mode: str, *, chat_id: int = 0, actor_id: int = 0) -> None:
         if mode not in ("allow", "deny"):
@@ -422,8 +477,9 @@ class Store:
 STORE = Store()
 
 
-def bind_db(db_op: Callable) -> None:
-    STORE.bind(db_op)
+def bind_db(db_op: Callable, *, initialize: bool = True) -> None:
+    """Bind SQLite operations; defer schema writes during safe-start recovery."""
+    STORE.bind(db_op, initialize=initialize)
 
 
 def get(command: str, key: str):
@@ -496,8 +552,38 @@ def reset(command: str, key: Optional[str] = None, *, actor_id: Optional[int] = 
             _schedule_menu_refresh()
 
 
+def global_enabled() -> bool:
+    return STORE.switch_enabled("global")
+
+
+def category_enabled(category: str) -> bool:
+    if category not in CATEGORIES:
+        return True
+    return STORE.switch_enabled("category:" + str(category))
+
+
+def set_global_enabled(enabled: bool, *, actor_id: int = 0) -> bool:
+    changed = STORE.set_switch("global", enabled, actor_id=actor_id)
+    if changed:
+        _schedule_menu_refresh()
+    return changed
+
+
+def set_category_enabled(category: str, enabled: bool, *, actor_id: int = 0) -> bool:
+    if category not in CATEGORIES:
+        raise ValueError("unknown command category")
+    changed = STORE.set_switch("category:" + str(category), enabled, actor_id=actor_id)
+    if changed:
+        _schedule_menu_refresh()
+    return changed
+
+
 def is_enabled(command: str) -> bool:
-    return get_bool(command, "enabled")
+    """Effective state after global, category and per-command switches."""
+    spec = REGISTRY.get(command)
+    if spec is None:
+        return False
+    return global_enabled() and category_enabled(spec.category) and get_bool(command, "enabled")
 
 
 def changed_from_default(command: str) -> int:
@@ -602,8 +688,11 @@ def decide(command: str, *, chat_type: str, chat_id: int = 0, user_id: int, leve
         return True, "ok", 0
     cfg = settings_for(command)
     is_owner = level == "owner"
-    if not cfg.get("enabled", True) and command != "settings":
-        return False, "disabled", 0
+    # The owner can always reopen this panel; all other commands obey the
+    # persisted global -> category -> command switch hierarchy.
+    if command != "settings":
+        if not global_enabled() or not category_enabled(spec.category) or not cfg.get("enabled", True):
+            return False, "disabled", 0
     where = cfg.get("where", spec.where)
     in_group = chat_type in ("group", "supergroup")
     if where == "private" and chat_type != "private":
@@ -729,8 +818,9 @@ def _preflight_denial(command: str, *, chat_type: str, chat_id: int, user_id: in
     # configuration. This is the intentional recovery-only exception.
     if command == "settings" and chat_type == "private" and int(user_id) == RT.owner_id:
         return None
-    if not get_bool(command, "enabled") and command != "settings":
-        return "disabled"
+    if command != "settings":
+        if not global_enabled() or not category_enabled(spec.category) or not get_bool(command, "enabled"):
+            return "disabled"
 
     in_group = chat_type in ("group", "supergroup")
     where = get_str(command, "where") or spec.where
@@ -872,8 +962,11 @@ def visible(command: str, *, chat_type: str, level: str, rank: Optional[int] = N
     spec = REGISTRY.get(command)
     if spec is None:
         return False
+    # Never hide the owner's recovery/settings entry from the private command menu.
+    if command == "settings" and chat_type == "private" and level == "owner":
+        return True
     cfg = settings_for(command)
-    if not cfg.get("enabled", True):
+    if not is_enabled(command):
         return False
     where = cfg.get("where", spec.where)
     in_group = chat_type in ("group", "supergroup")
