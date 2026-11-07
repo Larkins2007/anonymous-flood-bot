@@ -24,13 +24,43 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger("justice-faite-console")
-PROJECT_VERSION = "0.8.2"
+PROJECT_VERSION = "0.8.4"
 BACKUP_MARKER = "JF_DB_BACKUP_V1"
 BACKUP_INTERVAL_SECONDS = 300
 CHAT_LOG_RETENTION_DAYS = max(1, min(int(os.getenv("JF_CHAT_LOG_RETENTION_DAYS", "30")), 365))
 CHAT_LOG_MAX_ROWS = max(1000, min(int(os.getenv("JF_CHAT_LOG_MAX_ROWS", "25000")), 200000))
 RUNTIME_LOG_MAX_ROWS = max(500, min(int(os.getenv("JF_RUNTIME_LOG_MAX_ROWS", "10000")), 100000))
 CHAT_ARCHIVE_ENABLED = os.getenv("JF_CHAT_ARCHIVE_ENABLED", "true").strip().lower() not in {"0", "false", "no", "off"}
+
+# Owner maintenance commands belong to the private console. If the owner
+# accidentally invokes one in the main flood, delete that public command and
+# execute it against a private-chat message proxy so every result goes to DM.
+OWNER_COMMAND_HANDLERS = {
+    "jf_console": "handle_open",
+    "jf_console_refresh": "handle_refresh",
+    "jf_memory": "handle_memory",
+    "jf_memory_save": "handle_memory_save",
+    "jf_memory_search": "handle_memory_search",
+    "jf_chatlog": "handle_chatlog",
+}
+OWNER_COMMAND_RE = re.compile(r"^\s*/([A-Za-z][A-Za-z0-9_]{0,31})(?:@[A-Za-z0-9_]+)?(?:\s|$)")
+
+
+class _OwnerPrivateMessageProxy:
+    """Minimal private-message facade used for owner commands invoked in the flood."""
+    def __init__(self, console, source_message):
+        from types import SimpleNamespace
+        self._console = console
+        self.from_user = getattr(source_message, "from_user", None)
+        self.chat = SimpleNamespace(id=int(console.owner_id), type="private")
+        self.text = getattr(source_message, "text", None)
+        self.message_id = getattr(source_message, "message_id", 0)
+        self.date = getattr(source_message, "date", None)
+
+    async def answer(self, text, **kwargs):
+        return await self._console.bot.send_message(
+            chat_id=int(self._console.owner_id), text=text, **kwargs
+        )
 
 
 def utcnow() -> str:
@@ -432,12 +462,18 @@ class Console:
         if self.registered:
             return
         private = self.F.chat.type == "private"
-        self.dp.message.register(self.handle_open, private, Command("jf_console"))
-        self.dp.message.register(self.handle_refresh, private, Command("jf_console_refresh"))
-        self.dp.message.register(self.handle_memory, private, Command("jf_memory"))
-        self.dp.message.register(self.handle_memory_save, private, Command("jf_memory_save"))
-        self.dp.message.register(self.handle_memory_search, private, Command("jf_memory_search"))
-        self.dp.message.register(self.handle_chatlog, private, Command("jf_chatlog"))
+        group = self.F.chat.type.in_({"group", "supergroup"})
+        for command, handler_name in OWNER_COMMAND_HANDLERS.items():
+            self.dp.message.register(getattr(self, handler_name), private, Command(command))
+        # A command accidentally sent in the main flood is consumed here and
+        # redirected to the owner's private chat; no console content is posted
+        # to the group. The command is executed only after Telegram confirms
+        # that the public command message was deleted.
+        self.dp.message.register(
+            self.handle_group_owner_command,
+            group,
+            Command(*OWNER_COMMAND_HANDLERS.keys()),
+        )
         # Outer middlewares archive context without consuming or changing messages.
         self.dp.message.outer_middleware(self.owner_message_middleware)
         self.dp.message.outer_middleware(self.group_message_middleware)
@@ -449,6 +485,63 @@ class Console:
         self._install_outgoing_message_archive()
         self.dp.callback_query.register(self.handle_callback, self.F.data.startswith("jfcon:"))
         self.registered = True
+
+    @staticmethod
+    def _owner_command_name(message) -> str | None:
+        raw = str(getattr(message, "text", "") or "")
+        match = OWNER_COMMAND_RE.match(raw)
+        return match.group(1).casefold() if match else None
+
+    def _is_owner_console_command(self, message) -> bool:
+        user = getattr(message, "from_user", None)
+        return bool(
+            self.owner_id
+            and user
+            and int(getattr(user, "id", 0) or 0) == self.owner_id
+            and self._owner_command_name(message) in OWNER_COMMAND_HANDLERS
+        )
+
+    async def handle_group_owner_command(self, message):
+        """Redirect the owner's six private-console commands from the main flood to DM."""
+        if not self._is_owner_console_command(message):
+            return
+        chat = getattr(message, "chat", None)
+        chat_id = int(getattr(chat, "id", 0) or 0)
+        if not chat or chat_id != self._effective_primary_chat_id():
+            return
+
+        command = self._owner_command_name(message)
+        handler_name = OWNER_COMMAND_HANDLERS.get(command)
+        if not handler_name:
+            return
+
+        delete_message = getattr(self.bot, "delete_message", None)
+        try:
+            if not callable(delete_message):
+                raise RuntimeError("Bot API delete_message is unavailable")
+            await delete_message(chat_id=chat_id, message_id=int(getattr(message, "message_id", 0) or 0))
+        except Exception as exc:
+            logger.warning("Owner console command %s was not executed because its group message could not be deleted: %s", command, exc)
+            with suppress(Exception):
+                await self.bot.send_message(
+                    chat_id=self.owner_id,
+                    text=(
+                        "⚠️ Команда консоли не выполнена: бот не смог удалить её сообщение из общего чата. "
+                        "Выдай боту право удалять сообщения или отправляй команды прямо в личку с ботом."
+                    ),
+                )
+            return
+
+        proxy = _OwnerPrivateMessageProxy(self, message)
+        try:
+            await getattr(self, handler_name)(proxy)
+        except Exception:
+            logger.exception("Could not execute redirected owner command %s", command)
+            with suppress(Exception):
+                await self.bot.send_message(
+                    chat_id=self.owner_id,
+                    text=f"⚠️ Не удалось выполнить команду /{command}. Проверь технические логи через /jf_chatlog.",
+                )
 
     def is_owner_private(self, event) -> bool:
         user = getattr(event, "from_user", None)
@@ -494,6 +587,10 @@ class Console:
             return False
         chat_id = int(getattr(chat, "id", 0) or 0)
         if not chat_id or chat_id != self._effective_primary_chat_id():
+            return False
+        # These owner maintenance commands are routed to private chat and must
+        # not be retained in the flood archive, especially /jf_memory_save text.
+        if self._is_owner_console_command(event):
             return False
         user = getattr(event, "from_user", None)
         sender_chat = getattr(event, "sender_chat", None)
@@ -1022,9 +1119,17 @@ class Console:
         return "\n".join(lines)
 
     async def _edit_or_send(self, chat_id: int, section: str, text: str):
+        # The console is a private-only surface. Never trust a caller-supplied
+        # group ID as a destination, even if a future code path passes one by
+        # mistake. The primary group ID is used only to query role data.
+        if not self.owner_id:
+            raise RuntimeError("ADMIN_ID is not configured; private console is disabled")
+        if int(chat_id) != self.owner_id:
+            logger.error("Blocked non-private console destination %s for section %s; owner DM is %s", chat_id, section, self.owner_id)
+        chat_id = int(self.owner_id)
         if section == "roles":
-            chat_id = self._effective_primary_chat_id()
-            total = self._table_count("group_members", f"WHERE chat_id={chat_id} AND active=1 AND role_key IS NOT NULL")
+            primary_chat_id = self._effective_primary_chat_id()
+            total = self._table_count("group_members", f"WHERE chat_id={primary_chat_id} AND active=1 AND role_key IS NOT NULL")
             pages = max(1, (total + self._roles_page_size - 1) // self._roles_page_size)
             keyboard = InlineKeyboardMarkup(inline_keyboard=[
                 [
@@ -1040,6 +1145,18 @@ class Console:
                 InlineKeyboardButton(text="🔄 Обновить блок", callback_data=f"jfcon:{section}:refresh")
             ]])
         old = self.store.get_message(section)
+        if old and int(old["chat_id"]) != int(chat_id) and section == "roles":
+            # Older releases accidentally posted this private-console card to
+            # the public group. Remove that bot-owned stale card when possible.
+            delete_message = getattr(self.bot, "delete_message", None)
+            if callable(delete_message):
+                try:
+                    await delete_message(
+                        chat_id=int(old["chat_id"]),
+                        message_id=int(old["message_id"]),
+                    )
+                except Exception as exc:
+                    logger.info("Could not remove stale misplaced roles card: %s", exc)
         if old and int(old["chat_id"]) == int(chat_id):
             try:
                 await self.bot.edit_message_text(
@@ -1055,10 +1172,17 @@ class Console:
         self.store.set_message(section, chat_id, int(sent.message_id))
 
     async def refresh_all(self, chat_id: int, only: str | None = None):
+        if not self.owner_id:
+            raise RuntimeError("ADMIN_ID is not configured; private console is disabled")
+        # Enforce the destination centrally as well as in _edit_or_send().
+        # This prevents any future handler from publishing a console card in a group.
+        destination = int(self.owner_id)
+        if int(chat_id or 0) != destination:
+            logger.error("Redirected console refresh from destination %s to owner DM %s", chat_id, destination)
         sections = self._sections()
         order = [only] if only in sections else ["system", "games", "modules", "roles", "memory"]
         for key in order:
-            await self._edit_or_send(chat_id, key, sections[key])
+            await self._edit_or_send(destination, key, sections[key])
 
     @staticmethod
     def _valid_database(path: str) -> bool:
