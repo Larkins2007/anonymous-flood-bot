@@ -5,7 +5,7 @@ from contextlib import suppress
 from datetime import datetime,timedelta,timezone
 import cmdcfg
 GROUP_TYPES={"group","supergroup"}
-COMMAND_PATTERN=(r"(?isu)^\s*(?:/jf_clean(?:@[A-Za-z0-9_]+)?(?:\s|$)|[!.\/]{0,4}(?:(?:ирис(?:ка)?|iris)\s+)?(?:-смс(?:\s+\d+)?|!пург(?:\s+\d+)?(?:\s+тихо)?))\s*$")
+COMMAND_PATTERN=(r"(?isu)^\s*(?:/jf_clean(?:@[A-Za-z0-9_]+)?(?:\s|$)|[!.\/]{0,4}(?:(?:ирис(?:ка)?|iris)\s+)?(?:-смс(?:\s+\d+)?|!?пург(?:\s+\d+)?(?:\s+тихо)?))\s*$")
 def now():return datetime.now(timezone.utc)
 class Store:
  def __init__(self,path,lock=None):self.path=str(path);self.lock=lock or threading.RLock()

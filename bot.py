@@ -220,13 +220,13 @@ JF_RAFFLES = jf_raffles.register(dp, bot=bot, F=F, db_path=DB_PATH, manager=JF_M
 import jf_clean
 JF_CLEAN = jf_clean.register(dp, bot=bot, F=F, db_path=DB_PATH, manager=JF_MANAGER, lock=DB_LOCK)
 
-# Persistent, simplified Justice Faite token economy (one-step daily farm).
+# Persistent Justice Faite token economy (one-step four-hour farm).
 import jf_economy
 JF_ECONOMY = jf_economy.register(dp, bot=bot, F=F, db_path=DB_PATH, lock=DB_LOCK)
 
 # Voluntary, non-romantic social pairings. Both participants must consent.
 import jf_social
-JF_SOCIAL = jf_social.register(dp, bot=bot, F=F, db_path=DB_PATH, lock=DB_LOCK, manager=JF_MANAGER)
+JF_SOCIAL = jf_social.register(dp, bot=bot, F=F, db_path=DB_PATH, lock=DB_LOCK, manager=JF_MANAGER, owner_id=ADMIN_ID)
 
 # Optional conversational AI. It only responds when explicitly addressed.
 import jf_pets

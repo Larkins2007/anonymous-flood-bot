@@ -3,7 +3,7 @@ from __future__ import annotations
 import html,re,secrets,sqlite3,threading
 from contextlib import suppress
 GROUP_TYPES={"group","supergroup"}
-COMMAND_PATTERN=(r"(?isu)^\s*(?:/jf_fun(?:@[A-Za-z0-9_]+)?(?:\s|$)|[!.\/]{0,4}(?:(?:ирис(?:ка)?|iris)\s+)?(?:рандом(?:\s+-?\d+(?:\s+-?\d+)?)?|!данет(?:\s+.+)?|!выбери\s+.+|!инфа\s+.+|!кубик|кубик|пинг|кинг|пиу|бот))\s*$")
+COMMAND_PATTERN=(r"(?isu)^\s*(?:/jf_fun(?:@[A-Za-z0-9_]+)?(?:\s|$)|[!.\/]{0,4}(?:(?:ирис(?:ка)?|iris)\s+)?(?:рандом(?:\s+-?\d+(?:\s+-?\d+)?)?|!?данет(?:\s+.+)?|!?выбери\s+.+|!?инфа\s+.+|!?кубик|кубик|пинг|кинг|пиу|бот))\s*$")
 class Fun:
  def __init__(self,dp,bot,F):self.dp,self.bot,self.F=dp,bot,F;self.registered=False
  def register(self):

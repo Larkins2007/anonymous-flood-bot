@@ -1,7 +1,7 @@
 """Simple, persistent Justice Faite token economy.
 
-The farm is intentionally a one-step daily claim: no crops, seeds, wait timers,
-profession gates, betting, debt, interest, taxes or paid random rewards.
+The farm is a one-step four-hour claim inspired by Iris: a free 5–50 token reward,
+without crops, seeds, betting, debt, interest, taxes or paid random rewards.
 Legacy tables from earlier versions are retained for safe upgrades.
 """
 from __future__ import annotations
@@ -12,16 +12,20 @@ import sqlite3
 import threading
 from contextlib import suppress
 from datetime import datetime, timezone, timedelta
+import secrets
 
 import cmdcfg
 
 GROUP_TYPES = {"group", "supergroup"}
 CURRENCY = "жетонов"
 STARTER_BONUS = 30
-FARM_REWARD = 25
+FARM_MIN_REWARD = 5
+FARM_MAX_REWARD = 50
+FARM_COOLDOWN_HOURS = 4
 # Justice Faite's existing schedule is Moscow-based. Keep the economy day aligned
 # with that schedule unless the owner explicitly changes the offset.
 DAY_OFFSET_HOURS = int(__import__("os").getenv("JF_ECONOMY_UTC_OFFSET_HOURS", "3") or "3")
+ECONOMY_CLOCK_LABEL = "MSK" if DAY_OFFSET_HOURS == 3 else f"UTC{DAY_OFFSET_HOURS:+d}"
 SHOP = {
     "значок": {"price": 30, "desc": "Коллекционный значок профиля"},
     "рамка": {"price": 60, "desc": "Декоративная рамка профиля"},
@@ -40,9 +44,15 @@ COMMANDS = (
     "/jf_economy", "баланс", "кошелёк", "кошелек", "топ богатых", "ферма", "фарм", "работа",
     "собрать", "посадить", "профессии", "профессия", "образование", "учиться", "магазин",
     "купить", "инвентарь", "подарить", "задания", "задание", "достижения", "перевести",
-    "отн искры", "отн искры подарок", "отн подарок", "отн подарок витрина", "отн прем", "отн прем подарок", "отн задания", "отн история",
+    "отн искры подарок", "отн подарок", "отн подарок витрина", "отн прем", "отн прем подарок", "отн задания", "отн история",
 )
-COMMAND_PATTERN = r"(?isu)^\s*(?:/jf_economy(?:@[A-Za-z0-9_]+)?(?:\s|$)|[!.\/]{0,4}(?:(?:ирис(?:ка)?|iris)\s+)?(?:" + "|".join(re.escape(x) for x in sorted(COMMANDS[1:], key=len, reverse=True)) + r")(?:\s|$).*$)"
+# `отн история связи` belongs to jf_social; prevent the broad economy-history
+# prefix from capturing it. The remaining aliases retain their argument tails.
+_economy_aliases = [x for x in COMMANDS[1:] if x != "отн история"]
+_economy_aliases.append(r"отн\s+история(?!\s+связи\b)")
+COMMAND_PATTERN = (r"(?isu)^\s*(?:/jf_economy(?:@[A-Za-z0-9_]+)?(?:\s|$)|[!.\/]{0,4}(?:(?:ирис(?:ка)?|iris)\s+)?(?:"
+    + "|".join(x if x.startswith("отн\\s") else re.escape(x) for x in sorted(_economy_aliases, key=len, reverse=True))
+    + r")(?:\s|$).*$)")
 
 
 def utcnow() -> datetime:
@@ -113,6 +123,10 @@ class Store:
                 chat_id INTEGER NOT NULL,user_id INTEGER NOT NULL,day TEXT NOT NULL,
                 worked INTEGER NOT NULL DEFAULT 0,harvested INTEGER NOT NULL DEFAULT 0,
                 PRIMARY KEY(chat_id,user_id,day));
+            CREATE TABLE IF NOT EXISTS jf_economy_farm_state(
+                chat_id INTEGER NOT NULL,user_id INTEGER NOT NULL,last_claim_at TEXT NOT NULL,
+                next_claim_at TEXT NOT NULL,claim_count INTEGER NOT NULL DEFAULT 1,
+                PRIMARY KEY(chat_id,user_id));
             CREATE TABLE IF NOT EXISTS jf_economy_achievements(
                 chat_id INTEGER NOT NULL,user_id INTEGER NOT NULL,achievement TEXT NOT NULL,
                 unlocked_at TEXT NOT NULL,PRIMARY KEY(chat_id,user_id,achievement));
@@ -122,6 +136,15 @@ class Store:
             """)
             # The migration is intentionally additive only. Do not drop or reset any old balance data.
             c.execute("CREATE INDEX IF NOT EXISTS idx_jf_econ_ledger_chat_reason ON jf_economy_ledger(chat_id,reason,id DESC)")
+            # Preserve the previous farm timestamp as a cooldown anchor. Users who
+            # have already farmed in v0.11.1 do not get a free immediate second claim.
+            c.execute("""INSERT OR IGNORE INTO jf_economy_farm_state(chat_id,user_id,last_claim_at,next_claim_at,claim_count)
+                SELECT l.chat_id,l.user_id,l.created_at,
+                       datetime(l.created_at, '+4 hours'),
+                       (SELECT COUNT(*) FROM jf_economy_ledger x WHERE x.chat_id=l.chat_id AND x.user_id=l.user_id AND x.reason='farm_daily')
+                FROM jf_economy_ledger l
+                WHERE l.reason='farm_daily' AND l.id=(SELECT MAX(x.id) FROM jf_economy_ledger x
+                    WHERE x.chat_id=l.chat_id AND x.user_id=l.user_id AND x.reason='farm_daily')""")
         self.run(op)
 
 
@@ -189,20 +212,57 @@ class Economy:
     def _check_achievements(self, c, chat, uid):
         balance = self._wallet(c, chat, uid)
         tx_count = int(c.execute("SELECT COUNT(*) FROM jf_economy_ledger WHERE chat_id=? AND user_id=? AND delta>0", (chat, uid)).fetchone()[0])
-        farm_days = int(c.execute("SELECT COUNT(*) FROM jf_economy_ledger WHERE chat_id=? AND user_id=? AND reason='farm_daily'", (chat, uid)).fetchone()[0])
+        farm_claims = int(c.execute("SELECT COUNT(*) FROM jf_economy_ledger WHERE chat_id=? AND user_id=? AND reason='farm_daily'", (chat, uid)).fetchone()[0])
         if balance >= 100: self._unlock(c, chat, uid, "first_hundred")
         if tx_count >= 10: self._unlock(c, chat, uid, "ten_earnings")
-        if farm_days >= 5: self._unlock(c, chat, uid, "five_farms")
+        if farm_claims >= 5: self._unlock(c, chat, uid, "five_farms")
 
-    def _claim_farm(self, c, chat, uid):
-        day = self._daily(c, chat, uid)
-        if int(day["worked"]):
-            raise ValueError("Сегодня ты уже получил жетоны. Новая награда будет после 00:00 по московскому времени.")
-        key = f"farm_daily:{chat}:{uid}:{day['day']}"
-        balance = self._credit(c, chat, uid, FARM_REWARD, "farm_daily", key)
-        c.execute("UPDATE jf_economy_daily SET worked=1,harvested=1 WHERE chat_id=? AND user_id=? AND day=?", (chat, uid, day["day"]))
+    def _claim_farm(self, c, chat, uid, message_id=0, now=None):
+        current = (now or utcnow()).astimezone(timezone.utc)
+        stamp = iso(current)
+        operation_key = f"farm:{chat}:{uid}:{int(message_id or 0)}"
+        duplicate = c.execute("SELECT balance_after,delta,created_at FROM jf_economy_ledger WHERE operation_key=?", (operation_key,)).fetchone()
+        state = c.execute("SELECT * FROM jf_economy_farm_state WHERE chat_id=? AND user_id=?", (chat, uid)).fetchone()
+        if duplicate:
+            # A Telegram retry replays the original grant, but must not invent
+            # a fresh cooldown relative to the retry time.
+            try:
+                replay_next = datetime.fromisoformat(state["next_claim_at"]) if state else datetime.fromisoformat(duplicate["created_at"]) + timedelta(hours=FARM_COOLDOWN_HOURS)
+                if replay_next.tzinfo is None:
+                    replay_next = replay_next.replace(tzinfo=timezone.utc)
+                replay_next = replay_next.astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                replay_next = current
+            return int(duplicate["balance_after"]), int(duplicate["delta"]), replay_next
+
+        if state:
+            try:
+                next_claim = datetime.fromisoformat(state["next_claim_at"])
+                if next_claim.tzinfo is None:
+                    next_claim = next_claim.replace(tzinfo=timezone.utc)
+                next_claim = next_claim.astimezone(timezone.utc)
+            except (TypeError, ValueError):
+                next_claim = current
+            if current < next_claim:
+                remaining = int((next_claim - current).total_seconds())
+                hours, rem = divmod(remaining, 3600)
+                minutes = max(1, (rem + 59) // 60)
+                wait = f"{hours} ч. {minutes} мин." if hours else f"{minutes} мин."
+                raise ValueError(f"🌱 Следующий сбор будет доступен через {wait}. Фарм обновляется раз в {FARM_COOLDOWN_HOURS} часа.")
+
+        reward = secrets.randbelow(FARM_MAX_REWARD - FARM_MIN_REWARD + 1) + FARM_MIN_REWARD
+        balance = self._credit(c, chat, uid, reward, "farm_daily", operation_key)
+        next_claim = current + timedelta(hours=FARM_COOLDOWN_HOURS)
+        c.execute("""INSERT INTO jf_economy_farm_state(chat_id,user_id,last_claim_at,next_claim_at,claim_count)
+            VALUES(?,?,?,?,1) ON CONFLICT(chat_id,user_id) DO UPDATE SET
+            last_claim_at=excluded.last_claim_at,next_claim_at=excluded.next_claim_at,
+            claim_count=jf_economy_farm_state.claim_count+1""", (chat, uid, stamp, iso(next_claim)))
+        # Keep the legacy day table as a coarse history marker for old reports.
+        day = economy_day(current)
+        c.execute("INSERT OR IGNORE INTO jf_economy_daily(chat_id,user_id,day) VALUES(?,?,?)", (chat, uid, day))
+        c.execute("UPDATE jf_economy_daily SET worked=1,harvested=harvested+1 WHERE chat_id=? AND user_id=? AND day=?", (chat, uid, day))
         self._check_achievements(c, chat, uid)
-        return balance
+        return balance, reward, next_claim
 
     async def handle(self, m):
         if not getattr(m, "from_user", None) or getattr(m.from_user, "is_bot", False):
@@ -216,7 +276,7 @@ class Economy:
         chat, uid = int(m.chat.id), int(m.from_user.id)
         if low.startswith("jf_economy") or low.startswith("/jf_economy"):
             return await self.reply(m, self.help_text())
-        if low in {"баланс", "кошелёк", "кошелек", "отн искры"}:
+        if low in {"баланс", "кошелёк", "кошелек"}:
             bal = self.store.run(lambda c: self._wallet(c, chat, uid), immediate=True)
             return await self.reply(m, f"🪙 Твой баланс: <b>{bal} {CURRENCY}</b>.")
         if low.startswith("топ богатых"):
@@ -228,12 +288,12 @@ class Economy:
             return await self.reply(m, "🏆 <b>Топ по жетонам</b>\n" + (body or "Пока нет участников в рейтинге."))
         if low in {"ферма", "фарм", "собрать", "работа"}:
             try:
-                bal = self.store.run(lambda c: self._claim_farm(c, chat, uid), immediate=True)
+                bal, reward, next_claim = self.store.run(lambda c: self._claim_farm(c, chat, uid, getattr(m, "message_id", 0)), immediate=True)
             except ValueError as e:
                 return await self.reply(m, esc(e))
-            return await self.reply(m, f"🪙 <b>Ежедневный фарм завершён!</b>\nНачислено: <b>+{FARM_REWARD} {CURRENCY}</b>.\nТвой баланс: <b>{bal} {CURRENCY}</b>.\n\nВозвращайся после 00:00 по московскому времени за следующей наградой.")
+            return await self.reply(m, f"🌱 <b>Фарм завершён!</b>\nНачислено: <b>+{reward} {CURRENCY}</b> (от {FARM_MIN_REWARD} до {FARM_MAX_REWARD}).\nТвой баланс: <b>{bal} {CURRENCY}</b>.\nСледующий сбор: <b>{esc((next_claim.astimezone(timezone.utc) + timedelta(hours=DAY_OFFSET_HOURS)).strftime('%H:%M') + ' ' + ECONOMY_CLOCK_LABEL)}</b> — через {FARM_COOLDOWN_HOURS} часа после этого сбора.")
         if low in {"посадить", "учиться"} or low.startswith(("посадить ", "профессия", "профессии", "образование", "учиться ")):
-            return await self.reply(m, "🌿 Мы упростили экономику: посадка растений, семена, курсы и профессии больше не нужны. Напиши <code>Ферма</code>, чтобы сразу получить ежедневные жетоны.")
+            return await self.reply(m, "🌿 Мы упростили экономику: посадка растений, семена, курсы и профессии больше не нужны. Напиши <code>Ферма</code>, чтобы сразу получить жетоны; следующий сбор откроется через 4 часа.")
         if low == "магазин":
             items = "\n".join(f"• <b>{esc(k)}</b> — {v['price']} {CURRENCY}. {esc(v['desc'])}." for k,v in SHOP.items())
             return await self.reply(m, "🛍️ <b>Магазин Justice Faite</b>\n" + items + "\nПокупка: <code>Купить название</code>. Доступно 12 предметов, все только декоративные.")
@@ -254,7 +314,7 @@ class Economy:
                 c.execute("INSERT INTO jf_economy_inventory(chat_id,user_id,item,quantity) VALUES(?,?,?,1) ON CONFLICT(chat_id,user_id,item) DO UPDATE SET quantity=quantity+1", (chat, uid, item))
                 return self._wallet(c, chat, uid)
             try: bal = self.store.run(buy, immediate=True)
-            except ValueError: return await self.reply(m, f"Недостаточно {CURRENCY}. Напиши <code>Ферма</code>, чтобы получить ежедневную награду.")
+            except ValueError: return await self.reply(m, f"Недостаточно {CURRENCY}. Напиши <code>Ферма</code>, чтобы получить следующую награду через четыре часа.")
             return await self.reply(m, f"✅ Куплено: <b>{esc(item)}</b>. Остаток: <b>{bal} {CURRENCY}</b>.")
         if low.startswith("отн прем"):
             return await self.reply(m, "💎 В Justice Faite нет платного VIP и покупаемых привилегий. Декоративные предметы за игровые жетоны находятся в команде <code>Магазин</code>. История уже подаренных предметов: <code>.отн подарок витрина общая</code>. Подарить предмет можно ответом на сообщение: <code>.отн подарок значок</code>.")
@@ -314,10 +374,10 @@ class Economy:
 
         if low in {"задания", "задание", "отн задания"}:
             row = self.store.run(lambda c: self._daily(c, chat, uid))
-            return await self.reply(m, "📜 <b>Ежедневная цель</b>\n" + ("✅" if row["worked"] else "▫️") + f" Получить ежедневную награду через <code>Ферма</code> (+{FARM_REWARD} {CURRENCY}).\nНикаких дополнительных действий не требуется.")
+            return await self.reply(m, "📜 <b>Ежедневная цель</b>\n" + ("✅" if row["worked"] else "▫️") + f" Получить фарм через <code>Ферма</code> (от {FARM_MIN_REWARD} до {FARM_MAX_REWARD} {CURRENCY} раз в 4 часа).\nНикаких дополнительных действий не требуется.")
         if low == "достижения":
             rows = self.store.run(lambda c: c.execute("SELECT achievement,unlocked_at FROM jf_economy_achievements WHERE chat_id=? AND user_id=? ORDER BY unlocked_at", (chat, uid)).fetchall())
-            names = {"first_hundred": f"Первые 100 {CURRENCY}", "ten_earnings": "Десять начислений", "five_farms": "Пять дней фарма", "green_thumb": "Старое достижение: садовод"}
+            names = {"first_hundred": f"Первые 100 {CURRENCY}", "ten_earnings": "Десять начислений", "five_farms": "Пять сборов фермы", "green_thumb": "Старое достижение: садовод"}
             return await self.reply(m, "🏅 <b>Достижения</b>\n" + ("\n".join("• " + esc(names.get(r["achievement"],r["achievement"])) for r in rows) or "Пока нет достижений. Продолжай участвовать в жизни флуда."))
         if low.startswith("перевести ") or low.startswith("отн искры подарок "):
             target_msg = getattr(m, "reply_to_message", None); target_user = getattr(target_msg, "from_user", None) if target_msg else None
@@ -344,12 +404,12 @@ class Economy:
     def help_text():
         return ("<b>Экономика Justice Faite</b>\n"
                 f"Стартовый баланс: <b>{STARTER_BONUS} {CURRENCY}</b>.\n"
-                f"<code>Баланс</code> / <code>.отн искры</code> · <code>Ферма</code> (+{FARM_REWARD} жетонов раз в день) · <code>Топ богатых</code>\n"
+                f"<code>Баланс</code> / <code>Кошелёк</code> · <code>Ферма</code> ({FARM_MIN_REWARD}–{FARM_MAX_REWARD} жетонов раз в 4 часа) · <code>Топ богатых</code>\n"
                 "<code>Магазин</code> · <code>Купить название</code> · <code>Инвентарь</code>\n"
                 "<code>.отн подарок витрина общая</code> — последние подарки чата · <code>.отн подарок витрина моя</code> — твои полученные подарки\n"
                 "<code>Подарить название</code> или <code>.отн подарок название</code> ответом на сообщение · <code>Перевести 10</code> / <code>.отн искры подарок 10</code> ответом на сообщение\n"
                 "<code>Задания</code> / <code>.отн задания</code> · <code>Достижения</code> · <code>.отн история доход</code> / <code>.отн история расход 2</code>\n"
-                "Ферма начисляет награду сразу. Все цены фиксированы; нет ставок, казино, кредитов, налогов, платного шанса или покупки привилегий.")
+                "Ферма начисляет награду сразу раз в 4 часа. Все цены фиксированы; нет ставок, казино, кредитов, налогов, платного шанса или покупки привилегий.")
 
 
 def register(dp, bot, F, db_path, lock=None):
