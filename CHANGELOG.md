@@ -1,5 +1,14 @@
 # Changelog
 
+## 0.15.2 — Provider billing diagnostics (2026-11-09)
+
+- Correctly distinguishes exhausted API credits/billing quota from a temporary HTTP 429 request-rate limit. A `You have no credits remaining` / `insufficient_quota` response now produces a clear, actionable message instead of saying to wait and retry.
+- Provider errors are classified using HTTP status plus safe error `code`/`type` fields. User-facing messages never include the raw provider response, billing URL, API key, or other response payload.
+- Handles JSON and plain-text provider error bodies from OpenAI-compatible endpoints.
+- `/jf_ai` in the owner's actual private chat now shows only the configured endpoint hostname and model, never the API key or endpoint path. This makes Render endpoint overrides visible without exposing secrets in the group.
+- Added regression tests for exhausted credits, temporary rate limits, invalid keys, missing models, upstream failures, and owner-only endpoint diagnostics.
+- The supplied production database was inspected read-only; no DB data or settings were changed. No API key, provider billing action, Git commit, push, or deployment was performed. Live provider connectivity remains unverified.
+
 ## 0.15.1 — Identity-aware Justice AI and natural flood voice (2026-11-08)
 
 - Fixed the core role-recognition defect: role context no longer depends on `sender_tag` being present in every Telegram message. The live `group_members` assignment is authoritative and is validated against `role_catalog`; current roles are now available even when the archive has no `sender_tag` column.

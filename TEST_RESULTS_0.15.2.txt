@@ -1,0 +1,18 @@
+Justice Faite Manager 0.15.2 — test report
+Date: 2026-11-09
+
+Executed successfully:
+- python -m compileall -q .
+- python tests/test_ai.py
+- All 32 test modules passed individually.
+- Modules requiring aiogram test doubles (test_ai_analytics.py and test_justice_core.py) passed with PYTHONPATH=tests/stubs, matching the configured test environment.
+- AI regressions: exhausted credits (HTTP 429) -> quota category and clear credits message; request rate limit (HTTP 429) -> temporary rate-limit category; HTTP 401/403 -> auth; HTTP 404 -> model_or_endpoint; HTTP 5xx -> upstream.
+- Owner-private `/jf_ai` exposes endpoint hostname/model only and does not expose a synthetic API key.
+
+The first combined `python tests/run_all.py` invocation hit the execution time limit after its first 8 modules. The remaining modules, including the startup-safety module, were run independently and passed. Therefore this report records 32/32 individual module passes, not a completed single uninterrupted aggregate run.
+
+The supplied SQLite gzip was decompressed and opened read-only. `jf_runtime_log` contains an AI request failure with HTTP 429 and provider text `You have no credits remaining`, linking to platform.openai.com billing. This is a provider-side credit/billing issue, not a problem with the prompt text. The DB does not contain Render environment variables, so the deployed `JF_AI_BASE_URL` cannot be confirmed from this file alone.
+
+Not tested: a real provider call, Render deployment, or live Telegram update handling. The same runtime log also contains `TelegramConflictError`, indicating that more than one getUpdates poller may have been active.
+
+No production data changed. No commit, push or deployment was performed.
