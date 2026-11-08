@@ -252,6 +252,18 @@ JF_INLINE_GUARD = jf_inline_guard.register(
 
 import jf_console
 JF_CONSOLE = jf_console.register(dp, bot=bot, F=F, db_path=DB_PATH, lock=DB_LOCK, owner_id=ADMIN_ID, primary_chat_id=PRIMARY_CHAT_ID)
+# Give conversational Justice AI read-only access to the same archived main-flood
+# messages. No second listener or duplicate message store is created.
+JF_AI.store = JF_CONSOLE.store
+JF_AI.primary_chat_id = int(PRIMARY_CHAT_ID or 0)
+
+# Owner-only AI analytics reads the existing flood archive; it installs no
+# additional message collector and stores generated reports separately.
+import jf_ai_analytics
+JF_AI_ANALYTICS = jf_ai_analytics.register(
+    dp, bot=bot, F=F, store=JF_CONSOLE.store, owner_id=ADMIN_ID, chat_id=PRIMARY_CHAT_ID
+)
+
 
 DELIVERY_QUEUE = None
 BROADCAST_QUEUE = None
@@ -9947,6 +9959,7 @@ async def main():
     if PRIMARY_CHAT_ID >= 0:
         raise RuntimeError("PRIMARY_CHAT_ID is invalid. The primary group ID must be negative.")
     JF_CONSOLE.primary_chat_id = PRIMARY_CHAT_ID
+    JF_AI_ANALYTICS.chat_id = PRIMARY_CHAT_ID
     cmdcfg.configure(bot=bot, owner_id=ADMIN_ID, primary_chat_id=PRIMARY_CHAT_ID, manager=JF_MANAGER)
     try:
         import justice_features as _justice_features
@@ -9974,6 +9987,7 @@ async def main():
     JF_PETS.init()
     JF_MODVOTE.init()
     JF_CONSOLE.init()
+    JF_AI_ANALYTICS.init()
     init_justice_features_db()
     seed_birthday_directory()
     seed_role_catalog()
@@ -9988,6 +10002,7 @@ async def main():
     await _spy_abort_interrupted_starts()
     asyncio.create_task(_spy_recovery_worker(), name="spy-recovery")
     asyncio.create_task(JF_TIMERS.run_forever(), name="jf-timers")
+    asyncio.create_task(JF_AI_ANALYTICS.run_forever(), name="jf-ai-analytics")
     asyncio.create_task(role_sync_worker(), name="jf-role-sync")
 
     DELIVERY_QUEUE = asyncio.Queue()
