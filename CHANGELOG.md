@@ -1,5 +1,27 @@
 # Changelog
 
+## 0.14.1 — Justice AI context and separated memory (2026-11-08)
+
+- Added a private owner-only Justice AI conversation in the owner's Telegram DM, guarded by both `from_user.id == ADMIN_ID` and `chat.id == ADMIN_ID`; it uses the existing `jf_owner_message_log` and archives assistant replies in the same journal.
+- Added physically separate long-term memories: `jf_ai_owner_memory` for owner preferences/projects and `jf_ai_flood_memory` for broad community topics/events. Natural requests (`Джастис, запомни...`, `Джастис, запомни для флуда...`) and explicit owner-only save/list/search commands route to the correct scope. Group context can never read owner memory; owner context can never read flood memory.
+- Added low-frequency compaction of both memories inside the existing `jf-ai-analytics` worker (one bounded request per scope per configured interval); no extra message collector or background task. Memory retrieval ranks notes locally and always retains the rolling summary.
+- Expanded local context resolution for Telegram replies, `mention` and `text_mention` entities, and `sender_tag`. Telegram identifiers remain local; the provider sees temporary participant aliases, relation labels and only a role matched against the project's role catalog. Raw sender tags are stored locally but never forwarded. Known archived names/usernames are redacted before provider requests.
+- Added additive schema changes: two memory tables; `role` on `jf_owner_message_log`; `entities_json` and `sender_tag` on `jf_chat_message_log`; associated indexes. Existing archives remain the single source of group messages.
+- Added tests for separate memory scopes, natural-language save routing, private owner gating, history isolation, Telegram relationship context, tag/catalog matching and schema compatibility. `tests/run_all.py` now statically audits that test functions are invoked by module entrypoints.
+- No commit, push, production migration or Render deployment. Live Telegram/Groq/Render behavior remains unverified.
+
+## 0.14.0 — Advisor/Watch foundation (2026-11-08)
+
+- Added deterministic local Advisor aggregates from the existing message archive, hourly/daily statistics, complaint tables, game participation tables and Watch signals; aggregates are appended to generated reports without sending them to Groq.
+- Added persistent owner controls `/jf_ai_schedule interval 1..12` and `/jf_ai_schedule daily 0..23`, stored in the existing `jf_ai_analytics_state` key/value table.
+- Added additive delivery metadata to existing report and Watch tables, bounded exponential retries (maximum 5 attempts), durable report retry and a configurable retention cleanup for Watch alerts, defaulting to the message-archive retention policy.
+- Added conservative local formal signals for invitation links/CTA, explicit phone/address patterns, multi-line flows, and exact repeated content after a reply-linked stop request; sensitive strings are masked in stored evidence and sensitive-context messages are excluded from the provider sample.
+- Added local rolling-window reply/mention interaction aggregates and cross-batch accumulation of semantic signals when a target can be grounded through a reply link. Telegram identifiers remain local and are never sent to Groq.
+- Added urgent/digest separation, a maximum of 3 urgent notifications per hour, deduplication by existing alert keys, bounded retry delivery (maximum 5 attempts), and configurable Watch retention with `/jf_ai_schedule retention N`.
+- Added owner-confirmed Watch signal cleanup: `/jf_ai_watch_clear` previews scope; `/jf_ai_watch_clear confirm` removes only `jf_ai_watch_alerts` for the configured chat.
+- SQLite migration is additive: 0 new tables, 14 columns and 3 indexes. No production DB migration, commit, push or deployment was performed.
+- Verification is offline only. Remaining limitations: urgent technical health alerts are not implemented; semantic cross-batch accumulation is possible only when the target is grounded by a reply relationship; event participation is reported only where existing game tables record it. Live Telegram, Groq and Render remain untested.
+
 ## 0.13.2 — 2026-11-08
 
 Решения владельца по аудиту и сопоставление с текстом правил (`RULES_JUSTICE_FAITE.txt`, `RULES_MAPPING_0.13.2.md`). Деплой не выполнялся.

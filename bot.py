@@ -256,6 +256,7 @@ JF_CONSOLE = jf_console.register(dp, bot=bot, F=F, db_path=DB_PATH, lock=DB_LOCK
 # messages. No second listener or duplicate message store is created.
 JF_AI.store = JF_CONSOLE.store
 JF_AI.primary_chat_id = int(PRIMARY_CHAT_ID or 0)
+JF_AI.owner_id = int(ADMIN_ID or 0)
 
 # Owner-only AI analytics reads the existing flood archive; it installs no
 # additional message collector and stores generated reports separately.

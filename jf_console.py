@@ -9,6 +9,7 @@ from __future__ import annotations
 import gzip
 import hashlib
 import html
+import json
 import logging
 import os
 import re
@@ -24,7 +25,7 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger("justice-faite-console")
-PROJECT_VERSION = "0.13.2"
+PROJECT_VERSION = "0.14.1"
 BACKUP_MARKER = "JF_DB_BACKUP_V1"
 BACKUP_INTERVAL_SECONDS = 300
 CHAT_LOG_RETENTION_DAYS = max(1, min(int(os.getenv("JF_CHAT_LOG_RETENTION_DAYS", "30")), 365))
@@ -167,6 +168,7 @@ class Store:
                     message_id INTEGER NOT NULL,
                     body TEXT NOT NULL,
                     created_at TEXT NOT NULL,
+                    role TEXT NOT NULL DEFAULT 'user',
                     UNIQUE(chat_id, message_id)
                 );
                 CREATE INDEX IF NOT EXISTS idx_jf_owner_message_log_created
@@ -183,6 +185,8 @@ class Store:
                     message_type TEXT NOT NULL DEFAULT 'text',
                     body TEXT NOT NULL DEFAULT '',
                     reply_to_message_id INTEGER,
+                    entities_json TEXT NOT NULL DEFAULT '[]',
+                    sender_tag TEXT NOT NULL DEFAULT '',
                     message_at TEXT NOT NULL,
                     edited_at TEXT,
                     stored_at TEXT NOT NULL,
@@ -192,6 +196,28 @@ class Store:
                     ON jf_chat_message_log(chat_id, message_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_jf_chat_message_log_sender
                     ON jf_chat_message_log(chat_id, sender_user_id, message_at DESC);
+                CREATE TABLE IF NOT EXISTS jf_ai_owner_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    memory_key TEXT NOT NULL UNIQUE,
+                    category TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_jf_ai_owner_memory_category
+                    ON jf_ai_owner_memory(category, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS jf_ai_flood_memory (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    memory_key TEXT NOT NULL UNIQUE,
+                    category TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    body TEXT NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE INDEX IF NOT EXISTS idx_jf_ai_flood_memory_category
+                    ON jf_ai_flood_memory(category, updated_at DESC);
                 CREATE TABLE IF NOT EXISTS jf_chat_message_revisions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id INTEGER NOT NULL,
@@ -215,6 +241,15 @@ class Store:
                 CREATE INDEX IF NOT EXISTS idx_jf_runtime_log_date
                     ON jf_runtime_log(created_at DESC);
             """)
+            # Additive compatibility for databases created before AI memory 0.14.1.
+            for table, column, declaration in (
+                ("jf_owner_message_log", "role", "TEXT NOT NULL DEFAULT 'user'"),
+                ("jf_chat_message_log", "entities_json", "TEXT NOT NULL DEFAULT '[]'"),
+                ("jf_chat_message_log", "sender_tag", "TEXT NOT NULL DEFAULT ''"),
+            ):
+                present = {str(row[1]) for row in conn.execute(f"PRAGMA table_info({table})").fetchall()}
+                if column not in present:
+                    conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {declaration}")
             self._prune_archive_conn(conn)
             for category, title, body, source in SEED_MEMORY:
                 conn.execute(
@@ -236,23 +271,83 @@ class Store:
             (category, category, title, body, source, utcnow()),
         ))
 
-    def archive_owner_message(self, chat_id: int, user_id: int, message_id: int, body: str, created_at: str | None = None) -> bool:
+    def archive_owner_message(self, chat_id: int, user_id: int, message_id: int, body: str,
+                              created_at: str | None = None, role: str = "user") -> bool:
         text = (body or "").strip()
-        if not text or text.startswith("/") or len(text) > 8000 or _is_sensitive_message(text):
+        role = role if role in {"user", "assistant"} else "user"
+        if not text or (role == "user" and text.startswith("/")) or len(text) > 8000 or _is_sensitive_message(text):
             return False
         def op(conn):
             cur = conn.execute(
-                "INSERT OR IGNORE INTO jf_owner_message_log(chat_id,user_id,message_id,body,created_at) VALUES(?,?,?,?,?)",
-                (int(chat_id), int(user_id), int(message_id), text, created_at or utcnow()),
+                "INSERT OR IGNORE INTO jf_owner_message_log(chat_id,user_id,message_id,body,created_at,role) VALUES(?,?,?,?,?,?)",
+                (int(chat_id), int(user_id), int(message_id), text, created_at or utcnow(), role),
             )
             return cur.rowcount == 1
         return bool(self.run(op))
 
-    def recent_owner_messages(self, limit: int = 12):
+    def archive_owner_ai_response(self, chat_id: int, owner_id: int, message_id: int, body: str,
+                                  created_at: str | None = None) -> bool:
+        return self.archive_owner_message(chat_id, owner_id, message_id, body, created_at, role="assistant")
+
+    def recent_owner_messages(self, limit: int = 12, exclude_message_id: int = 0,
+                              chat_id: int | None = None, user_id: int | None = None):
+        clauses = ["(?=0 OR message_id!=?)"]
+        params = [int(exclude_message_id or 0), int(exclude_message_id or 0)]
+        if chat_id is not None:
+            clauses.append("chat_id=?")
+            params.append(int(chat_id))
+        if user_id is not None:
+            clauses.append("user_id=?")
+            params.append(int(user_id))
+        params.append(max(1, min(int(limit), 50)))
         return self.run(lambda c: c.execute(
-            "SELECT body,created_at FROM jf_owner_message_log ORDER BY id DESC LIMIT ?",
-            (max(1, min(int(limit), 50)),),
+            "SELECT body,created_at,role FROM jf_owner_message_log WHERE " + " AND ".join(clauses) +
+            " ORDER BY id DESC LIMIT ?", params,
         ).fetchall())
+
+    @staticmethod
+    def _save_ai_memory_conn(conn, table: str, category: str, title: str, body: str):
+        if table not in {"jf_ai_owner_memory", "jf_ai_flood_memory"}:
+            raise ValueError("unsupported memory scope")
+        category = re.sub(r"[^\wА-Яа-яЁё -]", "", str(category or "general")).strip()[:40] or "general"
+        title = re.sub(r"[\r\n\t]", " ", str(title or "")).strip()[:100]
+        body = str(body or "").strip()[:3000]
+        if not title or not body or _is_sensitive_message(body):
+            raise ValueError("memory is empty or contains likely sensitive data")
+        memory_key = hashlib.sha256((category.casefold() + "\0" + title.casefold()).encode("utf-8")).hexdigest()
+        stamp = utcnow()
+        conn.execute(
+            f"INSERT INTO {table}(memory_key,category,title,body,created_at,updated_at) VALUES(?,?,?,?,?,?) "
+            "ON CONFLICT(memory_key) DO UPDATE SET category=excluded.category,title=excluded.title,"
+            "body=excluded.body,updated_at=excluded.updated_at",
+            (memory_key, category, title, body, stamp, stamp),
+        )
+        row = conn.execute(f"SELECT id FROM {table} WHERE memory_key=?", (memory_key,)).fetchone()
+        return int(row[0])
+
+    def save_ai_owner_memory(self, category: str, title: str, body: str) -> int:
+        return self.run(lambda c: self._save_ai_memory_conn(c, "jf_ai_owner_memory", category, title, body))
+
+    def save_ai_flood_memory(self, category: str, title: str, body: str) -> int:
+        return self.run(lambda c: self._save_ai_memory_conn(c, "jf_ai_flood_memory", category, title, body))
+
+    def list_ai_memory(self, scope: str, query: str = "", limit: int = 20):
+        table = {"owner": "jf_ai_owner_memory", "flood": "jf_ai_flood_memory"}.get(scope)
+        if not table:
+            raise ValueError("unknown memory scope")
+        rows = self.run(lambda c: c.execute(
+            f"SELECT id,category,title,body,updated_at FROM {table} ORDER BY updated_at DESC,id DESC LIMIT 500"
+        ).fetchall())
+        needle = str(query or "").strip().casefold()
+        if needle:
+            rows = [r for r in rows if needle in (str(r["category"]) + " " + str(r["title"]) + " " + str(r["body"])).casefold()]
+        return rows[:max(1, min(int(limit), 500))]
+
+    def delete_ai_memory(self, scope: str, memory_id: int) -> bool:
+        table = {"owner": "jf_ai_owner_memory", "flood": "jf_ai_flood_memory"}.get(scope)
+        if not table:
+            raise ValueError("unknown memory scope")
+        return bool(self.run(lambda c: c.execute(f"DELETE FROM {table} WHERE id=?", (int(memory_id),)).rowcount))
 
     def search_owner_messages(self, query: str, limit: int = 20):
         needle = query.strip().casefold()
@@ -307,8 +402,9 @@ class Store:
                              sender_user_id: int = 0, sender_chat_id: int | None = None,
                              sender_username: str = "", sender_name: str = "",
                              message_type: str = "text", body: str = "",
-                             reply_to_message_id: int | None = None,
-                             message_at: str | None = None, edited_at: str | None = None) -> bool:
+                             reply_to_message_id: int | None = None, entities=None,
+                             sender_tag: str = "", message_at: str | None = None,
+                             edited_at: str | None = None) -> bool:
         if not CHAT_ARCHIVE_ENABLED or int(message_id or 0) <= 0:
             return False
         text = str(body or "").strip()
@@ -316,6 +412,21 @@ class Store:
             text = "[сообщение скрыто: похоже на секрет или учётные данные]"
         if len(text) > 4000:
             text = text[:3980] + "… [обрезано]"
+        safe_entities = []
+        for entity in (entities or [])[:100]:
+            kind = str(entity.get("type", ""))[:30] if isinstance(entity, dict) else str(getattr(entity, "type", ""))[:30]
+            offset = entity.get("offset", 0) if isinstance(entity, dict) else getattr(entity, "offset", 0)
+            length = entity.get("length", 0) if isinstance(entity, dict) else getattr(entity, "length", 0)
+            target = entity.get("target_user_id", 0) if isinstance(entity, dict) else getattr(getattr(entity, "user", None), "id", 0)
+            try:
+                item = {"type": kind, "offset": max(0, int(offset)), "length": max(0, int(length))}
+                if kind == "text_mention" and int(target or 0) > 0:
+                    item["target_user_id"] = int(target)
+                if kind:
+                    safe_entities.append(item)
+            except (TypeError, ValueError):
+                continue
+        entities_json = json.dumps(safe_entities, ensure_ascii=False, separators=(",", ":"))
         try:
             def op(conn):
                 if edited_at is not None:
@@ -340,19 +451,20 @@ class Store:
                 cur = conn.execute(
                     "INSERT INTO jf_chat_message_log "
                     "(chat_id,message_id,direction,sender_user_id,sender_chat_id,sender_username,sender_name,"
-                    "message_type,body,reply_to_message_id,message_at,edited_at,stored_at) "
-                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                    "message_type,body,reply_to_message_id,entities_json,sender_tag,message_at,edited_at,stored_at) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
                     "ON CONFLICT(chat_id,message_id) DO UPDATE SET "
                     "direction=excluded.direction,sender_user_id=excluded.sender_user_id,"
                     "sender_chat_id=excluded.sender_chat_id,sender_username=excluded.sender_username,"
                     "sender_name=excluded.sender_name,message_type=excluded.message_type,body=excluded.body,"
-                    "reply_to_message_id=excluded.reply_to_message_id,"
+                    "reply_to_message_id=excluded.reply_to_message_id,entities_json=excluded.entities_json,"
+                    "sender_tag=excluded.sender_tag,"
                     "edited_at=COALESCE(excluded.edited_at,jf_chat_message_log.edited_at),stored_at=excluded.stored_at",
                     (int(chat_id), int(message_id), direction if direction in {"in", "out"} else "in",
                      int(sender_user_id or 0), int(sender_chat_id) if sender_chat_id is not None else None,
                      str(sender_username or "")[:128], str(sender_name or "")[:256],
                      str(message_type or "unknown")[:40], text, int(reply_to_message_id) if reply_to_message_id else None,
-                     message_at or utcnow(), edited_at, utcnow()),
+                     entities_json, str(sender_tag or "")[:64], message_at or utcnow(), edited_at, utcnow()),
                 )
                 self._prune_archive_conn(conn)
                 return cur.rowcount > 0
@@ -652,6 +764,8 @@ class Console:
             message_type=message_type,
             body=str(body),
             reply_to_message_id=int(getattr(reply, "message_id", 0) or 0) or None,
+            entities=getattr(event, "entities", None) or getattr(event, "caption_entities", None) or [],
+            sender_tag=str(getattr(event, "sender_tag", "") or ""),
             message_at=message_date,
             edited_at=edited_date,
         )
