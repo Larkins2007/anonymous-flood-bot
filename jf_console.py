@@ -24,7 +24,7 @@ from aiogram.filters import Command
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup
 
 logger = logging.getLogger("justice-faite-console")
-PROJECT_VERSION = "0.12.0"
+PROJECT_VERSION = "0.13.2"
 BACKUP_MARKER = "JF_DB_BACKUP_V1"
 BACKUP_INTERVAL_SECONDS = 300
 CHAT_LOG_RETENTION_DAYS = max(1, min(int(os.getenv("JF_CHAT_LOG_RETENTION_DAYS", "30")), 365))
@@ -192,6 +192,19 @@ class Store:
                     ON jf_chat_message_log(chat_id, message_at DESC);
                 CREATE INDEX IF NOT EXISTS idx_jf_chat_message_log_sender
                     ON jf_chat_message_log(chat_id, sender_user_id, message_at DESC);
+                CREATE TABLE IF NOT EXISTS jf_chat_message_revisions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    chat_id INTEGER NOT NULL,
+                    message_id INTEGER NOT NULL,
+                    revision_no INTEGER NOT NULL,
+                    message_type TEXT NOT NULL DEFAULT 'text',
+                    body TEXT NOT NULL DEFAULT '',
+                    version_at TEXT NOT NULL,
+                    captured_at TEXT NOT NULL,
+                    UNIQUE(chat_id, message_id, revision_no)
+                );
+                CREATE INDEX IF NOT EXISTS idx_jf_chat_revisions_captured
+                    ON jf_chat_message_revisions(captured_at);
                 CREATE TABLE IF NOT EXISTS jf_runtime_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     created_at TEXT NOT NULL,
@@ -282,6 +295,13 @@ class Store:
             "(SELECT id FROM jf_runtime_log ORDER BY id DESC LIMIT ?)",
             (RUNTIME_LOG_MAX_ROWS,),
         )
+        # Earlier versions of an edited message follow the retention of the
+        # message itself: no revision outlives its archived message.
+        conn.execute(
+            "DELETE FROM jf_chat_message_revisions WHERE NOT EXISTS ("
+            "SELECT 1 FROM jf_chat_message_log l WHERE l.chat_id=jf_chat_message_revisions.chat_id "
+            "AND l.message_id=jf_chat_message_revisions.message_id)"
+        )
 
     def archive_chat_message(self, *, chat_id: int, message_id: int, direction: str,
                              sender_user_id: int = 0, sender_chat_id: int | None = None,
@@ -298,6 +318,25 @@ class Store:
             text = text[:3980] + "… [обрезано]"
         try:
             def op(conn):
+                if edited_at is not None:
+                    # Preserve the version being replaced. Without this an edit
+                    # silently destroys the original text (evidence trail).
+                    old = conn.execute(
+                        "SELECT message_type,body,message_at,edited_at FROM jf_chat_message_log "
+                        "WHERE chat_id=? AND message_id=?", (int(chat_id), int(message_id))
+                    ).fetchone()
+                    if old is not None and str(old[1] or "") != text:
+                        nxt = conn.execute(
+                            "SELECT COALESCE(MAX(revision_no),0)+1 FROM jf_chat_message_revisions "
+                            "WHERE chat_id=? AND message_id=?", (int(chat_id), int(message_id))
+                        ).fetchone()[0]
+                        conn.execute(
+                            "INSERT OR IGNORE INTO jf_chat_message_revisions"
+                            "(chat_id,message_id,revision_no,message_type,body,version_at,captured_at) "
+                            "VALUES(?,?,?,?,?,?,?)",
+                            (int(chat_id), int(message_id), int(nxt), str(old[0] or "text"),
+                             str(old[1] or ""), str(old[3] or old[2] or ""), utcnow()),
+                        )
                 cur = conn.execute(
                     "INSERT INTO jf_chat_message_log "
                     "(chat_id,message_id,direction,sender_user_id,sender_chat_id,sender_username,sender_name,"
@@ -601,7 +640,7 @@ class Console:
             body = f"[{message_type}]"
         reply = getattr(event, "reply_to_message", None)
         message_date = self._date_iso(getattr(event, "date", None)) or utcnow()
-        edited_date = self._date_iso(getattr(event, "edit_date", None)) if edited else None
+        edited_date = (self._date_iso(getattr(event, "edit_date", None)) or utcnow()) if edited else None
         return self.store.archive_chat_message(
             chat_id=chat_id,
             message_id=int(getattr(event, "message_id", 0) or 0),

@@ -10000,10 +10000,14 @@ async def main():
     # Resolve old STARTING games before polling: partial DM delivery must never
     # survive a process restart as a lobby that can be started again.
     await _spy_abort_interrupted_starts()
-    asyncio.create_task(_spy_recovery_worker(), name="spy-recovery")
-    asyncio.create_task(JF_TIMERS.run_forever(), name="jf-timers")
-    asyncio.create_task(JF_AI_ANALYTICS.run_forever(), name="jf-ai-analytics")
-    asyncio.create_task(role_sync_worker(), name="jf-role-sync")
+    # Keep references so these long-running workers are not garbage-collected
+    # and can be cancelled cleanly on shutdown (Render restarts).
+    background_tasks = [
+        asyncio.create_task(_spy_recovery_worker(), name="spy-recovery"),
+        asyncio.create_task(JF_TIMERS.run_forever(), name="jf-timers"),
+        asyncio.create_task(JF_AI_ANALYTICS.run_forever(), name="jf-ai-analytics"),
+        asyncio.create_task(role_sync_worker(), name="jf-role-sync"),
+    ]
 
     DELIVERY_QUEUE = asyncio.Queue()
     BROADCAST_QUEUE = asyncio.Queue()
@@ -10086,6 +10090,11 @@ async def main():
             if exc:
                 raise exc
     finally:
+        for task in background_tasks:
+            task.cancel()
+        for task in background_tasks:
+            with suppress(asyncio.CancelledError, Exception):
+                await task
         feature_maintenance_task.cancel()
         with suppress(asyncio.CancelledError, Exception):
             await feature_maintenance_task

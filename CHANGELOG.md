@@ -1,5 +1,42 @@
 # Changelog
 
+## 0.13.2 — 2026-11-08
+
+Решения владельца по аудиту и сопоставление с текстом правил (`RULES_JUSTICE_FAITE.txt`, `RULES_MAPPING_0.13.2.md`). Деплой не выполнялся.
+
+- **4.5:** сигнал при *любом* четвёртом медиа после трёх медиа от трёх разных участников (раньше — только от нового участника).
+- **4.3:** подтверждено — одинаковые действия считаются независимо от участников; прежнее условие для медиа 0.13.1 убрано.
+- Служебные события Telegram (вход/выход, закрепление и т.п.) больше не считаются медиа и повторяющимися действиями.
+- Контекстный анализ Watch дополнен пунктами 5.3 и 9.2.
+- Тесты: решения R-1/R-2, служебные события. 32/32 модулей.
+
+## 0.13.1 — 2026-11-08
+
+Аудит и безопасные аддитивные исправления Justice AI / Watch. Деплой и GitHub не выполнялись. Подробности: `AUDIT_0.13.1.md`, `UPGRADE_0.13.1.md`.
+
+- **Журнал правок сообщений.** Редактирование сообщения больше не уничтожает первоначальный текст: прежняя версия сохраняется в новой таблице `jf_chat_message_revisions` (аддитивная миграция `CREATE TABLE IF NOT EXISTS`). Версии удаляются вместе с сообщением по сроку хранения архива. Секреты по-прежнему маскируются до записи.
+- **Новые owner-only команды (только личный чат владельца, проверка по Telegram ID):** `/jf_ai_evidence ID` — сообщение, все прежние версии и связанные сигналы; `/jf_ai_cmd КЛЮЧ` — диагностика команды из реестра (глобальный/категорийный/собственный переключатель, доступ, итог).
+- **Самопроверка `/jf_ai_audit`** расширена: целостность SQLite, все таблицы Justice AI, пульс фонового цикла, отставание Watch от архива, недоставленные сигналы; статусы ok/warn/fail. Работает локально, без токенов.
+- **Исправлено:** при включённом AI цикл Justice Watch всегда спал 60 секунд и игнорировал `JF_AI_WATCH_POLL_SECONDS`; теперь `min(60, настройка)`.
+- **Исправлено правило 4.3:** одинаковые медиа от нескольких участников больше не считаются 4.3 (для них есть 4.5). Поведение для одинакового текста не менялось (вопрос R-1 в аудите).
+- **Системный промпт Justice AI:** отвечать на конкретный вопрос вместо общего приветствия, учитывать адресата, различать шутку/спор/конфликт, не выдумывать команды и функции, признавать отсутствие информации, в играх разделять «Подтверждённо» и «Предположение».
+- **Фоновые задачи** (`jf-ai-analytics`, `jf-timers`, `jf-role-sync`, `spy-recovery`) теперь удерживаются по ссылке и корректно отменяются при остановке.
+- **Тесты:** 7 тестов в `test_ai_analytics.py` и `test_settings_panel.py` фактически не запускались из-за блока запуска посреди файла — исправлено; добавлен `test_justice_core.py`; `run_all.py` подключает офлайн-заглушки. 32/32 модулей. Живой Telegram, Groq и Render не проверялись.
+- `render.yaml`: `ADMIN_ID=1682289834`.
+- В `CHANGELOG` восстановлены пропущенные записи 0.11.5–0.13.0 (краткие, по `UPGRADE_*.md`).
+
+## 0.13.0 — Justice Watch: контекстный анализ
+
+Контекстная проверка текста пакетами через Groq (по умолчанию раз в 10 минут, от 12 сообщений, до 80 за запрос); сигналы только владельцу, без наказаний; Telegram ID и имена провайдеру не передаются. Подробности: `UPGRADE_0.13.0.md`.
+
+## 0.12.0 — Justice AI: контекст основного чата
+
+Контекст из существующего архива `jf_chat_message_log`: до 100 последних сообщений, до 15 релевантных старых, ответы на найденные; маскирование секретов; поиск с Unicode casefold. Подробности: `UPGRADE_0.12.0.md`.
+
+## 0.11.5 — Justice Watch (локальный)
+
+Локальные проверки правил 4.3 и 4.5 без токенов, архив сигналов `jf_ai_watch_alerts`, owner-only уведомления, самопроверка `/jf_ai_audit`, просмотр `/jf_ai_watch`. Подробности: `UPGRADE_0.11.5.md`.
+
 ## 0.11.4 — 2026-11-08
 
 - Добавлен отдельный модуль аналитики Justice AI: периодические отчёты за последние 3 часа и ежедневные отчёты за 24 часа (по умолчанию 21:00 UTC+3).
@@ -302,3 +339,13 @@
 - Includes recent messages, relevant older snippets, participant display names and direct reply relationships.
 - Added Unicode-aware Russian text matching and context redaction for common secrets.
 - Reuses the existing archive; no second collector or duplicate raw-message store.
+
+
+## 0.13.0 — Justice Watch contextual review
+
+- Added bounded semantic review of newly archived chat messages for contextual signals involving harassment, repeated provocation, public conflicts, discrimination, privacy, advertising, punishment-baiting, and administration-related conduct.
+- Groq receives anonymized participant aliases and local message labels only; Telegram user IDs and message IDs remain local and are attached only to owner-facing evidence.
+- Semantic checks run in batches (default: every 10 minutes, at least 12 messages, up to 80 messages per request), not on every message.
+- Deterministic rules 4.3 and 4.5 remain local and do not consume AI tokens.
+- All semantic signals are review requests, not verdicts or automatic moderation. Ambiguous/discretionary cases remain for the owner/administration.
+- Added separate semantic scan cursor and retry backoff so provider failures do not discard the pending batch or cause rapid retry loops.
