@@ -79,12 +79,19 @@ class JusticeAIAnalytics:
         self.api_key = os.getenv("JF_AI_API_KEY", "").strip()
         self.model = os.getenv("JF_AI_MODEL", "openai/gpt-oss-20b").strip()
         self.watch_enabled = os.getenv("JF_AI_WATCH_ENABLED", "true").strip().casefold() in {"1", "true", "yes", "on"}
-        self.watch_poll_seconds = max(15, min(300, int(os.getenv("JF_AI_WATCH_POLL_SECONDS", "30") or "30")))
-        # Semantic review is deliberately batched: deterministic checks remain
-        # local/free, while Groq is called only for a bounded batch every few minutes.
+        self.watch_poll_seconds = max(30, min(300, int(os.getenv("JF_AI_WATCH_POLL_SECONDS", "120") or "120")))
+        # Detection remains frequent and cheap; owner notifications are separately
+        # throttled into a digest so a busy chat cannot flood the owner's DM.
+        self.watch_digest_interval_hours = max(1, min(24, int(os.getenv("JF_AI_WATCH_DIGEST_INTERVAL_HOURS", "24") or "24")))
+        self.watch_urgent_cooldown_hours = max(1, min(48, int(os.getenv("JF_AI_WATCH_URGENT_COOLDOWN_HOURS", "12") or "12")))
+        self.watch_max_digest_items = max(1, min(12, int(os.getenv("JF_AI_WATCH_MAX_DIGEST_ITEMS", "8") or "8")))
+        self.self_audit_enabled = os.getenv("JF_AI_SELF_AUDIT_ENABLED", "true").strip().casefold() in {"1", "true", "yes", "on"}
+        self.self_audit_interval_hours = max(12, min(168, int(os.getenv("JF_AI_SELF_AUDIT_INTERVAL_HOURS", "24") or "24")))
+        # Semantic review is deliberately slower and requires a meaningful batch.
+        # A low-confidence model guess is retained silently, never pushed to DM.
         self.semantic_enabled = os.getenv("JF_AI_WATCH_SEMANTIC_ENABLED", "true").strip().casefold() in {"1", "true", "yes", "on"}
-        self.semantic_interval_seconds = max(300, min(3600, int(os.getenv("JF_AI_WATCH_SEMANTIC_INTERVAL_SECONDS", "600") or "600")))
-        self.semantic_min_messages = max(5, min(40, int(os.getenv("JF_AI_WATCH_SEMANTIC_MIN_MESSAGES", "12") or "12")))
+        self.semantic_interval_seconds = max(900, min(7200, int(os.getenv("JF_AI_WATCH_SEMANTIC_INTERVAL_SECONDS", "1800") or "1800")))
+        self.semantic_min_messages = max(20, min(60, int(os.getenv("JF_AI_WATCH_SEMANTIC_MIN_MESSAGES", "20") or "20")))
         self.semantic_batch_size = max(20, min(100, int(os.getenv("JF_AI_WATCH_SEMANTIC_BATCH_SIZE", "80") or "80")))
         self.flood_memory_enabled = os.getenv("JF_AI_FLOOD_MEMORY_ENABLED", "true").strip().casefold() in {"1", "true", "yes", "on"}
         self.flood_memory_interval_hours = max(12, min(168, int(os.getenv("JF_AI_FLOOD_MEMORY_INTERVAL_HOURS", "24") or "24")))
@@ -157,6 +164,14 @@ class JusticeAIAnalytics:
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jf_ai_watch_alerts_delivery ON jf_ai_watch_alerts(delivered_at,next_delivery_at,id)")
             conn.execute("CREATE INDEX IF NOT EXISTS idx_jf_ai_watch_alerts_target ON jf_ai_watch_alerts(chat_id,category,target_user_id,last_seen_at)")
             now = datetime.now(timezone.utc)
+            # One-time notification-policy tightening for legacy pending signals:
+            # preserve all historical evidence, but do not replay stale alerts in
+            # a fresh release. New signals are evaluated under the stricter policy.
+            policy = conn.execute("SELECT value FROM jf_ai_analytics_state WHERE key='watch_notification_policy_version'").fetchone()
+            if not policy or str(policy[0]) != "2":
+                conn.execute("UPDATE jf_ai_watch_alerts SET notification_level='silent' WHERE delivered_at IS NULL")
+                conn.execute("INSERT INTO jf_ai_analytics_state(key,value) VALUES('watch_notification_policy_version','2') "
+                             "ON CONFLICT(key) DO UPDATE SET value=excluded.value")
             zone = timezone(timedelta(hours=self.utc_offset))
             periodic = now + timedelta(hours=self.periodic_hours)
             daily = self._next_daily_fixed(now, zone)
@@ -164,6 +179,10 @@ class JusticeAIAnalytics:
             conn.execute("INSERT OR IGNORE INTO jf_ai_analytics_state(key,value) VALUES('next_daily',?)", (daily.isoformat(),))
             archive_retention = max(1, min(365, int(os.getenv("JF_CHAT_LOG_RETENTION_DAYS", "30") or "30")))
             conn.execute("INSERT OR IGNORE INTO jf_ai_analytics_state(key,value) VALUES('watch_retention_days',?)", (str(archive_retention),))
+            conn.execute("INSERT OR IGNORE INTO jf_ai_analytics_state(key,value) VALUES('watch_next_digest_at',?)", ((now + timedelta(hours=self.watch_digest_interval_hours)).isoformat(),))
+            conn.execute("INSERT OR IGNORE INTO jf_ai_analytics_state(key,value) VALUES('watch_urgent_next_allowed_at',?)", (now.isoformat(),))
+            conn.execute("INSERT OR IGNORE INTO jf_ai_analytics_state(key,value) VALUES('self_audit_next_at',?)", ((now + timedelta(hours=self.self_audit_interval_hours)).isoformat(),))
+            conn.execute("INSERT OR IGNORE INTO jf_ai_analytics_state(key,value) VALUES('self_audit_last_failure_signature','')")
             # Start watching from the current archive tail. A new deployment must
             # never replay old chat history as fresh violations.
             archive_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='jf_chat_message_log'").fetchone()
@@ -177,7 +196,7 @@ class JusticeAIAnalytics:
             conn.execute("INSERT OR IGNORE INTO jf_ai_analytics_state(key,value) VALUES('flood_memory_next_at',?)", (now.isoformat(),))
             conn.execute("INSERT OR IGNORE INTO jf_ai_analytics_state(key,value) VALUES('owner_memory_cursor','0')")
             conn.execute("INSERT OR IGNORE INTO jf_ai_analytics_state(key,value) VALUES('owner_memory_next_at',?)", (now.isoformat(),))
-            for key, attr, low, high in (("periodic_hours","periodic_hours",1,12),("daily_hour","daily_hour",0,23)):
+            for key, attr, low, high in (("periodic_hours","periodic_hours",1,12),("daily_hour","daily_hour",0,23),("watch_digest_hours","watch_digest_interval_hours",1,24)):
                 saved = conn.execute("SELECT value FROM jf_ai_analytics_state WHERE key=?", (key,)).fetchone()
                 if saved:
                     try: setattr(self, attr, max(low, min(high, int(saved[0]))))
@@ -221,11 +240,55 @@ class JusticeAIAnalytics:
             legacy_reports = conn.execute("SELECT COUNT(*) FROM reports WHERE created_at BETWEEN ? AND ?", (start_s,end_s)).fetchone()[0] if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='reports'").fetchone() else 0
             alerts = conn.execute("SELECT category,COUNT(*) n FROM jf_ai_watch_alerts WHERE chat_id=? AND created_at BETWEEN ? AND ? GROUP BY category ORDER BY n DESC LIMIT 5", (self.chat_id,start_s,end_s)).fetchall()
             games = {}
+            game_sessions = {}
             for table in ("spy_players", "mafia_players"):
-                if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone():
-                    games[table] = int(conn.execute(f"SELECT COUNT(*) FROM {table} p JOIN {table.replace('_players','_games')} g ON g.id=p.game_id WHERE g.chat_id=? AND p.joined_at BETWEEN ? AND ?", (self.chat_id,start_s,end_s)).fetchone()[0])
-            return archive,by_hour,by_day,quiet,daily,reports,legacy_reports,alerts,games
-        archive, by_hour, by_day, quiet, daily, reports, legacy_reports, alerts, games = self.store.run(read)
+                game_table = table.replace("_players", "_games")
+                players_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(table,)).fetchone()
+                games_exists = conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",(game_table,)).fetchone()
+                if not (players_exists and games_exists):
+                    continue
+                games[table] = int(conn.execute(
+                    f"SELECT COUNT(*) FROM {table} p JOIN {game_table} g ON g.id=p.game_id "
+                    "WHERE g.chat_id=? AND p.joined_at BETWEEN ? AND ?", (self.chat_id,start_s,end_s)
+                ).fetchone()[0])
+                game_columns = {str(r[1]) for r in conn.execute(f"PRAGMA table_info({game_table})").fetchall()}
+                created_column = "created_at" if "created_at" in game_columns else None
+                started_column = "started_at" if "started_at" in game_columns else None
+                status_column = "status" if "status" in game_columns else None
+                if created_column:
+                    total = int(conn.execute(
+                        f"SELECT COUNT(*) FROM {game_table} WHERE chat_id=? AND {created_column} BETWEEN ? AND ?",
+                        (self.chat_id,start_s,end_s)
+                    ).fetchone()[0])
+                else:
+                    total = 0
+                if started_column:
+                    started = int(conn.execute(
+                        f"SELECT COUNT(*) FROM {game_table} WHERE chat_id=? AND {created_column} BETWEEN ? AND ? AND {started_column} IS NOT NULL AND {started_column}!=''",
+                        (self.chat_id,start_s,end_s)
+                    ).fetchone()[0]) if created_column else int(conn.execute(
+                        f"SELECT COUNT(*) FROM {game_table} WHERE chat_id=? AND {started_column} IS NOT NULL AND {started_column}!=''",
+                        (self.chat_id,)
+                    ).fetchone()[0])
+                else:
+                    started = 0
+                terminal = 0
+                if status_column:
+                    terminal_statuses = ("FINISHED", "TRANSFERRED") if game_table == "mafia_games" else ("FINISHED", "ABORTED")
+                    marks = ",".join("?" for _ in terminal_statuses)
+                    if created_column:
+                        terminal = int(conn.execute(
+                            f"SELECT COUNT(*) FROM {game_table} WHERE chat_id=? AND {created_column} BETWEEN ? AND ? AND UPPER(status) IN ({marks})",
+                            (self.chat_id,start_s,end_s,*terminal_statuses)
+                        ).fetchone()[0])
+                    else:
+                        terminal = int(conn.execute(
+                            f"SELECT COUNT(*) FROM {game_table} WHERE chat_id=? AND UPPER(status) IN ({marks})",
+                            (self.chat_id,*terminal_statuses)
+                        ).fetchone()[0])
+                game_sessions[game_table] = {"created":total,"started":started,"terminal":terminal}
+            return archive,by_hour,by_day,quiet,daily,reports,legacy_reports,alerts,games,game_sessions
+        archive,by_hour,by_day,quiet,daily,reports,legacy_reports,alerts,games,game_sessions = self.store.run(read)
         day_names = ['вс','пн','вт','ср','чт','пт','сб']
         hour_text = ', '.join(f"{int(r['h']):02d}:00 ({r['n']})" for r in by_hour) or 'нет данных'
         day_text = ', '.join(f"{day_names[int(r['d'])]} ({r['n']})" for r in by_day) or 'нет данных'
@@ -242,11 +305,22 @@ class JusticeAIAnalytics:
             trend += f"; активные авторы: {'рост' if people_pct is not None and people_pct > 0 else 'снижение' if people_pct is not None and people_pct < 0 else 'без изменения'} примерно на {abs(people_pct):.0f}%" if people_pct is not None else '; активные авторы: нет базы для сравнения'
         alert_text = ', '.join(f"{r['category']}: {r['n']}" for r in alerts) or 'нет зарегистрированных сигналов'
         game_text = ', '.join(f"{k.replace('_players','')}: {v} участий" for k,v in games.items()) or 'нет доступных игровых данных'
+        game_session_text = []
+        for game_name, stats in game_sessions.items():
+            total = int(stats.get("created", 0))
+            started = int(stats.get("started", 0))
+            terminal = int(stats.get("terminal", 0))
+            conversion = f"{(started / total * 100):.0f}%" if total else "нет базы"
+            game_session_text.append(
+                f"{game_name.replace('_games','')}: создано {total}, запущено {started} ({conversion}), завершено/остановлено {terminal}"
+            )
+        game_session_summary = "; ".join(game_session_text) or "нет доступных данных о сессиях"
         return (f"ЛОКАЛЬНАЯ СТАТИСТИКА (последние {hours} ч., без ИИ):\n"
                 f"Сообщений: {int(archive[0] or 0)}; авторов: {int(archive[1] or 0)}.\n"
                 f"Самые активные часы: {hour_text}.\nАктивные дни недели: {day_text}.\n"
                 f"Периоды с минимальной активностью: {quiet_text}.\nДинамика по дням: {trend}.\n"
-                f"Игровое участие: {game_text}.\nОбращения/жалобы: {int(reports or 0) + int(legacy_reports or 0)}.\n"
+                f"Игровое участие: {game_text}.\nСессии игр: {game_session_summary}.\n"
+                f"Обращения/жалобы: {int(reports or 0) + int(legacy_reports or 0)}.\n"
                 f"Сигналы Watch по категориям: {alert_text}.\n"
                 "Примечание: агрегаты описывают активность, не личность и не причины поведения.")
 
@@ -630,23 +704,18 @@ class JusticeAIAnalytics:
         return kind, body
 
     STOP_REQUEST_RE = re.compile(r"(?i)\b(?:перестань|прекрати|хватит|не надо|мне неприятно|не шути|не называй)\b")
-    PHONE_EXPLICIT_RE = re.compile(r"(?<!\w)(?:\+\d{1,3}[ -]?)?(?:\(?\d{3,4}\)?[ -]?)\d{3}[ -]?\d{2}[ -]?\d{2}(?!\w)")
-    ADDRESS_EXPLICIT_RE = re.compile(r"(?i)\b(?:ул\.?|улица|проспект|пр-т|переулок|пер\.?|дом|д\.)\s*[А-ЯЁA-Z0-9][А-ЯЁа-яёA-Z0-9 .-]{1,45}")
-    INVITE_RE = re.compile(r"(?i)(?:https?://)?t\.me/(?:\+|joinchat/)[A-Za-z0-9_-]+")
-    INVITE_CTA_RE = re.compile(r"(?i)\b(?:вступайте|присоединяйтесь|заходите|подписывайтесь|приглашаю|приглашаем)\b")
-
     @classmethod
     def local_detectors(cls, body: str):
-        """Return conservative (category, rule, confidence) formal signals."""
-        value = str(body or "")
-        out = []
-        if cls.INVITE_RE.search(value) or (re.search(r"(?i)(?:https?://)?t\.me/[A-Za-z0-9_]{4,}", value) and cls.INVITE_CTA_RE.search(value)):
-            out.append(("advertising_invite_10_1", "10.1", "medium"))
-        if cls.PHONE_EXPLICIT_RE.search(value) or cls.ADDRESS_EXPLICIT_RE.search(value):
-            out.append(("personal_data_9_1", "9.1", "medium"))
-        if len(value.splitlines()) >= 8 and sum(bool(x.strip()) for x in value.splitlines()) >= 8:
-            out.append(("multiline_flow_4_4", "4.4", "low"))
-        return out
+        """Return only deterministic local violations, not weak text heuristics.
+
+        A bare invite URL does not prove unapproved advertising; a phone number
+        does not prove disclosure of another person's data; and a long formatted
+        message does not prove a 4.4 flood. Those cases need context and must not
+        produce owner notifications merely because a regex matched.
+        High-precision structural checks (2.6, 4.3 and 4.5) are handled in
+        scan_watch_once(), where the surrounding messages are available.
+        """
+        return []
 
     def _pair_interaction_summary(self, limit_hours=72):
         """Resolve reply/mention edges locally and send only temporary aliases + counts."""
@@ -801,8 +870,8 @@ class JusticeAIAnalytics:
                 payload = "\n".join(lines)
                 def save(conn, key=alert_key, cat=category, msg=row, ev=payload):
                     cur = conn.execute(
-                        "INSERT OR IGNORE INTO jf_ai_watch_alerts(alert_key,category,chat_id,message_id,sender_user_id,evidence,created_at) VALUES(?,?,?,?,?,?,?)",
-                        (key, cat, self.chat_id, int(msg["message_id"]), int(msg["sender_user_id"] or 0), ev, datetime.now(timezone.utc).isoformat()),
+                        "INSERT OR IGNORE INTO jf_ai_watch_alerts(alert_key,category,chat_id,message_id,sender_user_id,evidence,created_at,severity,confidence,notification_level) VALUES(?,?,?,?,?,?,?,?,?,'digest')",
+                        (key, cat, self.chat_id, int(msg["message_id"]), int(msg["sender_user_id"] or 0), ev, datetime.now(timezone.utc).isoformat(), "medium", "high"),
                     )
                     return cur.rowcount > 0
                 if self.store.run(save):
@@ -817,60 +886,97 @@ class JusticeAIAnalytics:
             # Keep the semantic cursor unchanged on provider/parse failure so the
             # same batch can be retried at the next bounded interval.
             logger.exception("Justice Watch semantic review failed")
+        now_dt = datetime.now(timezone.utc)
         pending = self.store.run(lambda c: c.execute(
-            "SELECT alert_key,category,message_id,evidence,delivery_attempts,notification_level FROM jf_ai_watch_alerts "
-            "WHERE delivered_at IS NULL AND notification_level!='failed' AND delivery_attempts<5 "
-            "AND (next_delivery_at IS NULL OR next_delivery_at<=?) ORDER BY id ASC LIMIT 20",
-            (datetime.now(timezone.utc).isoformat(),)
+            "SELECT alert_key,category,message_id,evidence,delivery_attempts,notification_level,severity,confidence "
+            "FROM jf_ai_watch_alerts WHERE delivered_at IS NULL AND notification_level IN ('digest','urgent') "
+            "AND delivery_attempts<5 AND (next_delivery_at IS NULL OR next_delivery_at<=?) "
+            "ORDER BY id ASC LIMIT 100", (now_dt.isoformat(),)
         ).fetchall())
         delivered = 0
+
+        # Urgent DM is reserved for a narrow, corroborated set: high confidence,
+        # high severity, at least three source messages and a locally resolved
+        # target. At most one urgent DM is sent per configured cooldown window.
         urgent = [r for r in pending if r["notification_level"] == "urgent"]
-        digest = [r for r in pending if r["notification_level"] != "urgent"]
-        bucket = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H")
-        state = self.store.run(lambda c: dict(c.execute("SELECT key,value FROM jf_ai_analytics_state WHERE key IN ('urgent_hour_bucket','urgent_hour_count')").fetchall()))
-        used = int(state.get("urgent_hour_count", "0")) if state.get("urgent_hour_bucket") == bucket else 0
-        allowed_urgent = urgent[:max(0, 3-used)]
-        digest.extend(urgent[len(allowed_urgent):])
-        for alert in allowed_urgent:
-            category = str(alert["category"]); message_id = int(alert["message_id"])
-            text = (f"Justice Watch · срочный сигнал\n{category}\nЧат: {self.chat_id} · сообщение: {message_id}\n"
-                    "Это сигнал для проверки владельцем, не установленное нарушение.\n\n" + str(alert["evidence"]))
+        urgent_next = self._state_value("watch_urgent_next_allowed_at", now_dt.isoformat())
+        try:
+            urgent_allowed = datetime.fromisoformat(urgent_next) <= now_dt
+        except (TypeError, ValueError):
+            urgent_allowed = True
+        sent_urgent_key = None
+        failed_urgent_key = None
+        if urgent and urgent_allowed:
+            alert = urgent[0]
+            text = (f"Justice Watch · срочный сигнал для проверки\n{alert['category']}\n"
+                    f"Чат: {self.chat_id} · сообщение: {int(alert['message_id'])}\n"
+                    "Это не установленное нарушение и не автоматическая санкция.\n\n"
+                    + str(alert["evidence"]))
             try:
                 await self.bot.send_message(self.owner_id, text[:3900], disable_web_page_preview=True)
-                self.store.run(lambda c, key=str(alert["alert_key"]), a=int(alert["delivery_attempts"] or 0)+1: c.execute(
-                    "UPDATE jf_ai_watch_alerts SET delivered_at=?,delivery_attempts=?,last_delivery_error='' WHERE alert_key=? AND delivered_at IS NULL",
-                    (datetime.now(timezone.utc).isoformat(),a,key)))
-                delivered += 1; used += 1
+                stamp = now_dt.isoformat()
+                self.store.run(lambda c, key=str(alert["alert_key"]), ts=stamp: c.execute(
+                    "UPDATE jf_ai_watch_alerts SET delivered_at=?,delivery_attempts=delivery_attempts+1,last_delivery_error='' WHERE alert_key=? AND delivered_at IS NULL",
+                    (ts, key)))
+                self._set_state_value("watch_urgent_next_allowed_at", (now_dt + timedelta(hours=self.watch_urgent_cooldown_hours)).isoformat())
+                sent_urgent_key = str(alert["alert_key"])
+                delivered += 1
             except Exception as exc:
-                attempts = int(alert["delivery_attempts"] or 0)+1
-                delay = min(3600,60*(2**min(attempts-1,6)))
-                self.store.run(lambda c, key=str(alert["alert_key"]), a=attempts, d=delay, e=type(exc).__name__: c.execute(
+                failed_urgent_key = str(alert["alert_key"])
+                attempts = int(alert["delivery_attempts"] or 0) + 1
+                delay = min(3600, 60 * (2 ** min(attempts - 1, 6)))
+                self.store.run(lambda c, key=failed_urgent_key, a=attempts, d=delay, e=type(exc).__name__: c.execute(
                     "UPDATE jf_ai_watch_alerts SET delivery_attempts=?,next_delivery_at=?,last_delivery_error=?,notification_level=? WHERE alert_key=?",
-                    (a,(datetime.now(timezone.utc)+timedelta(seconds=d)).isoformat(),e[:80],"failed" if a>=5 else "urgent",key)))
-                logger.exception("Justice Watch urgent delivery failed | category=%s message=%s",category,message_id)
-        if allowed_urgent:
-            self.store.run(lambda c, b=bucket, n=used: (c.execute("INSERT INTO jf_ai_analytics_state(key,value) VALUES('urgent_hour_bucket',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(b,)),c.execute("INSERT INTO jf_ai_analytics_state(key,value) VALUES('urgent_hour_count',?) ON CONFLICT(key) DO UPDATE SET value=excluded.value",(str(n),))))
-        if digest:
+                    (a, (datetime.now(timezone.utc) + timedelta(seconds=d)).isoformat(), e[:80], "failed" if a >= 5 else "urgent", key)))
+                logger.exception("Justice Watch urgent delivery failed")
+
+        # Everything else is delivered in one scheduled digest. No immediate
+        # one-alert DM, no 30-second notification loop and no low-confidence pings.
+        digest_due_raw = self._state_value(
+            "watch_next_digest_at",
+            (now_dt + timedelta(hours=self.watch_digest_interval_hours)).isoformat(),
+        )
+        try:
+            digest_due = datetime.fromisoformat(digest_due_raw)
+            if digest_due.tzinfo is None:
+                digest_due = digest_due.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            digest_due = now_dt
+        nonurgent = [r for r in pending if r["notification_level"] == "digest" or
+                     (r["notification_level"] == "urgent" and
+                      str(r["alert_key"]) not in {sent_urgent_key, failed_urgent_key})]
+        if nonurgent and digest_due <= now_dt:
+            digest = nonurgent[:self.watch_max_digest_items]
             lines = ["Justice Watch · сводка сигналов для проверки владельцем"]
             for alert in digest:
                 cat = str(alert["category"])
-                label = {"repeated_action_4_3":"повторяющиеся действия (правило 4.3)", "media_chain_4_5":"медиа-цепочка (правило 4.5)", "repeat_after_stop_2_6":"повтор после просьбы остановиться (правило 2.6)", "advertising_invite_10_1":"приглашение/реклама (правило 10.1)", "personal_data_9_1":"возможные личные данные (правило 9.1)", "multiline_flow_4_4":"многострочный поток (правило 4.4)"}.get(cat,cat)
-                lines.append(f"\n• {label} · сообщение {alert['message_id']}\n{str(alert['evidence'])[:450]}")
+                label = {
+                    "repeated_action_4_3": "повторяющиеся действия (правило 4.3)",
+                    "media_chain_4_5": "медиа-цепочка (правило 4.5)",
+                    "repeat_after_stop_2_6": "повтор после просьбы остановиться (правило 2.6)",
+                    "advertising_invite_10_1": "возможное продвижение (правило 10.1)",
+                    "personal_data_9_1": "возможное раскрытие данных (правило 9.1)",
+                    "multiline_flow_4_4": "возможный многострочный поток (правило 4.4)",
+                }.get(cat, cat)
+                lines.append(f"\n• {label} · сообщение {int(alert['message_id'])}\n{str(alert['evidence'])[:380]}")
+            if len(nonurgent) > len(digest):
+                lines.append(f"\nВ очереди осталось ещё {len(nonurgent) - len(digest)} сигналов; они попадут в следующие сводки.")
             try:
                 await self.bot.send_message(self.owner_id, "\n".join(lines)[:3900], disable_web_page_preview=True)
-                stamp = datetime.now(timezone.utc).isoformat()
+                stamp = now_dt.isoformat()
                 keys = [str(r["alert_key"]) for r in digest]
                 self.store.run(lambda c, ks=keys, ts=stamp: c.executemany(
                     "UPDATE jf_ai_watch_alerts SET delivered_at=?,delivery_attempts=delivery_attempts+1,last_delivery_error='' WHERE alert_key=? AND delivered_at IS NULL",
-                    [(ts,k) for k in ks]))
+                    [(ts, k) for k in ks]))
+                self._set_state_value("watch_next_digest_at", (now_dt + timedelta(hours=self.watch_digest_interval_hours)).isoformat())
                 delivered += len(digest)
             except Exception as exc:
                 for alert in digest:
-                    attempts = int(alert["delivery_attempts"] or 0)+1
-                    delay = min(3600,60*(2**min(attempts-1,6)))
+                    attempts = int(alert["delivery_attempts"] or 0) + 1
+                    delay = min(3600, 60 * (2 ** min(attempts - 1, 6)))
                     self.store.run(lambda c, key=str(alert["alert_key"]), a=attempts, d=delay, e=type(exc).__name__: c.execute(
                         "UPDATE jf_ai_watch_alerts SET delivery_attempts=?,next_delivery_at=?,last_delivery_error=?,notification_level=? WHERE alert_key=?",
-                        (a,(datetime.now(timezone.utc)+timedelta(seconds=d)).isoformat(),e[:80],"failed" if a>=5 else "digest",key)))
+                        (a, (datetime.now(timezone.utc) + timedelta(seconds=d)).isoformat(), e[:80], "failed" if a >= 5 else "digest", key)))
                 logger.exception("Justice Watch digest delivery failed")
         # Retention follows the existing archive retention policy (30 days by default).
         retention = max(1, min(365, int(self._state_value("watch_retention_days", 30))))
@@ -1135,7 +1241,7 @@ class JusticeAIAnalytics:
             evidence = "\n".join(evidence_lines)[:3500]
             category = f"semantic_rule_{rule.replace('.', '_')}"
             alert_key = f"semantic:{rule}:{self.chat_id}:{int(anchor['message_id'])}"
-            notify_level = "urgent" if rule in {"2.1", "2.2", "2.5"} and severity == "high" and confidence == "high" else "digest"
+            notify_level = "silent" if severity == "low" or confidence == "low" else "digest"
             # Resolve a target locally from reply relationships. Never send these
             # Telegram identifiers to the provider. Only a grounded target allows
             # cross-batch accumulation; ambiguous signals remain separate.
@@ -1169,6 +1275,12 @@ class JusticeAIAnalytics:
                             break
                 if target_user_id:
                     break
+            # Urgent delivery requires corroboration across at least three source
+            # messages and a recipient resolved from an actual Telegram relation.
+            if (notify_level != "silent" and rule in {"2.1", "2.2", "2.5", "2.6"}
+                    and severity == "high" and confidence == "high"
+                    and len(selected) >= 3 and target_user_id > 0):
+                notify_level = "urgent"
             def persist_semantic(conn):
                 now_s = datetime.now(timezone.utc).isoformat()
                 if target_user_id:
@@ -1252,11 +1364,60 @@ class JusticeAIAnalytics:
         except Exception as exc:
             add("Отставание Watch от архива", "fail", type(exc).__name__)
         try:
-            pending = int(self.store.run(lambda c: c.execute("SELECT COUNT(*) FROM jf_ai_watch_alerts WHERE delivered_at IS NULL").fetchone()[0]))
-            add("Недоставленные сигналы владельцу", "ok" if pending == 0 else "warn", f"{pending}")
+            pending = int(self.store.run(lambda c: c.execute(
+                "SELECT COUNT(*) FROM jf_ai_watch_alerts WHERE delivered_at IS NULL AND notification_level IN ('digest','urgent')"
+            ).fetchone()[0]))
+            silent = int(self.store.run(lambda c: c.execute(
+                "SELECT COUNT(*) FROM jf_ai_watch_alerts WHERE delivered_at IS NULL AND notification_level='silent'"
+            ).fetchone()[0]))
+            add("Очередь уведомлений Watch", "ok" if pending == 0 else "warn", f"{pending}; тихих наблюдений без ЛС: {silent}")
         except Exception as exc:
             add("Недоставленные сигналы владельцу", "fail", type(exc).__name__)
         return checks
+
+    async def run_scheduled_self_audit_once(self):
+        """Run a local daily audit; DM only when a new critical failure appears.
+
+        Warnings are retained in the manual /jf_ai_audit view and do not generate
+        routine private messages. Identical failures are notified only once until
+        the failure set changes. No provider/API call or automatic repair occurs.
+        """
+        if not self.self_audit_enabled or not self.owner_id:
+            return False
+        now = datetime.now(timezone.utc)
+        due_raw = self._state_value(
+            "self_audit_next_at", (now + timedelta(hours=self.self_audit_interval_hours)).isoformat()
+        )
+        try:
+            due = datetime.fromisoformat(due_raw)
+            if due.tzinfo is None:
+                due = due.replace(tzinfo=timezone.utc)
+        except (TypeError, ValueError):
+            due = now
+        if now < due:
+            return False
+        self._set_state_value("self_audit_next_at", (now + timedelta(hours=self.self_audit_interval_hours)).isoformat())
+        checks = self.audit_checks()
+        failures = [(name, detail) for name, status, detail in checks if status == "fail"]
+        signature = json.dumps(failures, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+        previous = self._state_value("self_audit_last_failure_signature", "")
+        if not failures:
+            if previous:
+                self._set_state_value("self_audit_last_failure_signature", "")
+            return False
+        if signature == previous:
+            return False
+        lines = ["Justice AI · обнаружена новая критическая проблема", "Проверка локальная; автоматических изменений не выполнялось.", ""]
+        for name, detail in failures[:8]:
+            lines.append(f"🔴 {name}" + (f" — {detail}" if detail else ""))
+        lines.append("\nПодробный отчёт: /jf_ai_audit")
+        try:
+            await self.bot.send_message(self.owner_id, "\n".join(lines)[:3500], disable_web_page_preview=True)
+        except Exception:
+            logger.exception("Scheduled Justice AI self-audit notification failed")
+            return False
+        self._set_state_value("self_audit_last_failure_signature", signature)
+        return True
 
     def self_audit(self):
         checks = self.audit_checks()
@@ -1266,7 +1427,10 @@ class JusticeAIAnalytics:
             lines.append(f"{icon[status]} {name}" + (f" — {detail}" if detail else ""))
         alerts = int(self.store.run(lambda c: c.execute("SELECT COUNT(*) FROM jf_ai_watch_alerts").fetchone()[0]))
         semantic_cursor = self.store.run(lambda c: c.execute("SELECT value FROM jf_ai_analytics_state WHERE key='semantic_cursor'").fetchone())
+        audit_next = self._state_value("self_audit_next_at", "—")
         lines += ["", f"Сигналов Watch в журнале: {alerts}",
+                  f"Личные сводки Watch: раз в {self.watch_digest_interval_hours} ч.; срочные уведомления не чаще раза в {self.watch_urgent_cooldown_hours} ч.",
+                  f"Плановый Self-Audit: {'включён' if self.self_audit_enabled else 'отключён'}; интервал {self.self_audit_interval_hours} ч.; следующий запуск {audit_next[:16]}",
                   f"Контекстный анализ: интервал {self.semantic_interval_seconds // 60} мин., пакет до {self.semantic_batch_size}, минимум {self.semantic_min_messages}",
                   f"Позиция семантического анализа: {semantic_cursor[0] if semantic_cursor else '—'}"]
         if any(st == "fail" for _, st, _ in checks):
@@ -1344,12 +1508,23 @@ class JusticeAIAnalytics:
         if command == "/jf_ai_schedule":
             if not arg:
                 retention = self._state_value("watch_retention_days", 30)
-                return await message.answer(f"Расписание Advisor\nИнтервал: {self.periodic_hours} ч.\nЕжедневный отчёт: {self.daily_hour:02d}:00 МСК\nХранение Watch: {retention} дней\nИзменить: /jf_ai_schedule interval 1..12, daily 0..23 или retention 1..365")
+                return await message.answer(
+                    f"Расписание Advisor / Watch\nИнтервал Advisor: {self.periodic_hours} ч.\n"
+                    f"Ежедневный отчёт: {self.daily_hour:02d}:00 МСК\n"
+                    f"Сводка Watch владельцу: раз в {self.watch_digest_interval_hours} ч.\n"
+                    f"Срочный сигнал: не чаще раза в {self.watch_urgent_cooldown_hours} ч.\n"
+                    f"Хранение Watch: {retention} дней\n"
+                    "Изменить: /jf_ai_schedule interval 1..12, daily 0..23, watch 1..24 или retention 1..365"
+                )
             parts = arg.split()
             if len(parts) != 2 or not parts[1].isdigit():
-                return await message.answer("Формат: /jf_ai_schedule interval 1..12 или /jf_ai_schedule daily 0..23")
+                return await message.answer("Формат: /jf_ai_schedule interval 1..12, daily 0..23, watch 1..24 или retention 1..365")
             value = int(parts[1])
-            if parts[0] == "interval" and 1 <= value <= 12:
+            if parts[0] == "watch" and 1 <= value <= 24:
+                self.watch_digest_interval_hours = value
+                self._set_state_value("watch_digest_hours", value)
+                self._set_state_value("watch_next_digest_at", (datetime.now(timezone.utc) + timedelta(hours=value)).isoformat())
+            elif parts[0] == "interval" and 1 <= value <= 12:
                 self.periodic_hours = value
                 self._set_state_value("periodic_hours", value)
                 self._set_state_value("next_periodic", (datetime.now(timezone.utc)+timedelta(hours=value)).isoformat())
@@ -1360,7 +1535,7 @@ class JusticeAIAnalytics:
             elif parts[0] == "retention" and 1 <= value <= 365:
                 self._set_state_value("watch_retention_days", value)
             else:
-                return await message.answer("Недопустимое значение. Интервал: 1–12; час: 0–23; хранение: 1–365 дней.")
+                return await message.answer("Недопустимое значение. Advisor: 1–12 ч.; час: 0–23; Watch: 1–24 ч.; хранение: 1–365 дней.")
             return await message.answer("Настройка сохранена в БД и переживёт перезапуск.")
         if command == "/jf_ai_watch_clear":
             if arg.casefold() != "confirm":
@@ -1381,13 +1556,13 @@ class JusticeAIAnalytics:
             return await message.answer(self.self_audit())
         if command == "/jf_ai_watch":
             rows = self.store.run(lambda c: c.execute(
-                "SELECT category,message_id,created_at,delivered_at FROM jf_ai_watch_alerts ORDER BY id DESC LIMIT 10"
+                "SELECT category,message_id,created_at,delivered_at,notification_level FROM jf_ai_watch_alerts ORDER BY id DESC LIMIT 10"
             ).fetchall())
             if not rows:
                 return await message.answer("Justice Watch пока не зафиксировал автоматических сигналов.")
             lines = ["Justice Watch · последние сигналы:"]
             for row in rows:
-                status = "доставлен" if row["delivered_at"] else "ожидает доставки"
+                status = "доставлен" if row["delivered_at"] else ("сохранён без ЛС" if row["notification_level"] == "silent" else "в очереди сводки")
                 lines.append(f"{row['created_at'][:16]} · {row['category']} · msg {row['message_id']} · {status}")
             return await message.answer("\n".join(lines))
         if command == "/jf_ai_report":
@@ -1435,6 +1610,11 @@ class JusticeAIAnalytics:
                     except Exception as exc:
                         self._last_error = type(exc).__name__
                         logger.exception("Justice Watch scan failed")
+                try:
+                    await self.run_scheduled_self_audit_once()
+                except Exception as exc:
+                    self._last_error = type(exc).__name__
+                    logger.exception("Scheduled Justice AI self-audit failed")
                 if not self.enabled:
                     await asyncio.sleep(self.watch_poll_seconds)
                     continue
@@ -1473,7 +1653,7 @@ class JusticeAIAnalytics:
                 logger.exception("Justice AI analytics scheduler failed")
             # Local watch checks cost no tokens, so honour the configured poll
             # interval (previously a fixed 60 s whenever AI was enabled).
-            await asyncio.sleep(min(60, self.watch_poll_seconds))
+            await asyncio.sleep(self.watch_poll_seconds)
 
 
 def register(dp, bot, F, store, owner_id: int, chat_id: int):

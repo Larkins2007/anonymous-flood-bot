@@ -1,5 +1,20 @@
 # Changelog
 
+## 0.15.0 — Low-noise Watch, scheduled Self-Audit and event statistics (2026-11-08)
+
+- Reworked Watch notifications: regular signals are merged into a single owner-only digest, default once every 24 hours; configurable through `/jf_ai_schedule watch 1..24` or `JF_AI_WATCH_DIGEST_INTERVAL_HOURS`.
+- Strictly limited urgent notifications to corroborated high-severity/high-confidence semantic signals with at least three source messages and a target resolved from a real reply/mention relationship; urgent messages are rate-limited by a 12-hour cooldown. The bot still never applies sanctions.
+- Low-confidence/low-severity semantic observations remain in the local journal without owner DMs. Bare links, phone numbers/addresses, and long formatted text are no longer treated as proof of advertising, doxxing, or flooding by regex alone.
+- On first upgrade to 0.15.0, previously pending Watch alerts are marked silent but preserved with their evidence; the new policy does not replay a backlog of stale alerts to the owner's private chat.
+- Reduced defaults: Watch archive polling from 30 to 120 seconds; semantic review from 10 to 30 minutes with a minimum batch of 20 messages. Settings remain configurable within safe bounds.
+- Added scheduled local Self-Audit (default once per 24 hours). It sends an owner DM only when a new critical failure appears; recurring identical failures and ordinary warnings do not create message spam. Audit is local/token-free and does not repair or modify the project.
+- Expanded deterministic game/event analytics with actual session counts, started sessions, terminal statuses and lobby-to-start conversion for existing Spyfall/Mafia tables. No inferred outcomes or participant rankings are produced.
+- Expanded callback UI regression coverage: every generated `/settings` screen is checked for duplicate callback IDs within the keyboard and Telegram's 64-byte callback limit; replay/idempotency tests remain in place.
+- Preserved split private-owner memory and flood memory from 0.14.1. Private owner memory remains restricted to the owner's actual private chat; it is not exposed to group prompts.
+- Existing SQLite schema is unchanged by 0.15.0's main Watch/Self-Audit/statistics changes: the policy uses existing `jf_ai_analytics_state` keys and existing alert rows. No commit, push, production migration or deployment.
+- Render durability remains an operator choice: persistent disks require a paid Render service; the default free blueprint is not silently upgraded or billed. See `RENDER_PERSISTENCE_0.15.0.md`.
+- Offline tests only; live Telegram/Groq/Render behavior remains unverified.
+
 ## 0.14.1 — Justice AI context and separated memory (2026-11-08)
 
 - Added a private owner-only Justice AI conversation in the owner's Telegram DM, guarded by both `from_user.id == ADMIN_ID` and `chat.id == ADMIN_ID`; it uses the existing `jf_owner_message_log` and archives assistant replies in the same journal.
