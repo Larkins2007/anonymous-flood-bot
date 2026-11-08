@@ -168,7 +168,7 @@ def _to_str(value, kind: str) -> str:
 def _from_str(raw: str, param: Param):
     try:
         if param.kind == "bool":
-            return raw in ("1", "true", "True", "yes")
+            return str(raw).strip().casefold() in {"1", "true", "yes", "on", "да", "вкл", "enabled"}
         if param.kind in ("int", "hour"):
             return int(raw)
         if param.kind == "choice":
@@ -578,12 +578,28 @@ def set_category_enabled(category: str, enabled: bool, *, actor_id: int = 0) -> 
     return changed
 
 
-def is_enabled(command: str) -> bool:
-    """Effective state after global, category and per-command switches."""
+def command_state(command: str) -> dict[str, Any]:
+    """Return every switch separately, so UI never confuses local and inherited state."""
     spec = REGISTRY.get(command)
     if spec is None:
-        return False
-    return global_enabled() and category_enabled(spec.category) and get_bool(command, "enabled")
+        return {"known": False, "global": False, "category": False,
+                "local": False, "enabled": False, "reason": "unknown"}
+    global_on = global_enabled()
+    category_on = category_enabled(spec.category)
+    local_on = get_bool(command, "enabled")
+    enabled = global_on and category_on and local_on
+    # Prefer the most specific cause: a locally disabled command stays black
+    # even while a parent switch is also off.
+    reason = ("command" if not local_on else
+             "global" if not global_on else
+             "category" if not category_on else "enabled")
+    return {"known": True, "global": global_on, "category": category_on,
+            "local": local_on, "enabled": enabled, "reason": reason}
+
+
+def is_enabled(command: str) -> bool:
+    """Effective state after global, category and per-command switches."""
+    return bool(command_state(command)["enabled"])
 
 
 def changed_from_default(command: str) -> int:
@@ -683,7 +699,7 @@ def decide(command: str, *, chat_type: str, chat_id: int = 0, user_id: int, leve
     """Чистое решение: (разрешено, причина, секунд до конца паузы)."""
     spec = REGISTRY.get(command)
     if spec is None:
-        return True, "ok", 0
+        return False, "unknown", 0
     if command == "settings" and chat_type == "private" and int(user_id) == RT.owner_id:
         return True, "ok", 0
     cfg = settings_for(command)

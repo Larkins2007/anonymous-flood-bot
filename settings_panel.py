@@ -70,25 +70,31 @@ def home_view() -> tuple[str, InlineKeyboardMarkup]:
     total = len([s for s in REGISTRY.values() if not s.feature])
     features = len([s for s in REGISTRY.values() if s.feature])
     changed = sum(1 for k in REGISTRY if cmdcfg.changed_from_default(k))
-    disabled = sum(1 for k in REGISTRY if not cmdcfg.is_enabled(k))
+    states = [cmdcfg.command_state(k) for k in REGISTRY]
+    disabled = sum(1 for state in states if not state["enabled"])
+    locally_disabled = sum(1 for state in states if not state["local"])
+    paused_by_parent = sum(1 for state in states if state["local"] and not state["enabled"])
     global_on = cmdcfg.global_enabled()
     text = ui.card(
         "Настройки команд",
         ui.lines(
             ui.bullet(f"Команд: {total} · функций: {features}"),
-            ui.bullet(f"Недоступно сейчас: {disabled} · настроено вручную: {changed}"),
+            ui.bullet(f"Недоступно сейчас: {disabled} · выключено в карточках: {locally_disabled}"),
+            ui.bullet(f"Временно приостановлено разделом/глобально: {paused_by_parent} · изменено параметров: {changed}"),
             ui.bullet("Глобальный режим: " + ("🟢 включён" if global_on else "⚫ выключен")),
         ),
         ui.note("Управление в три уровня: все команды → раздел → отдельная команда. Выключение не стирает индивидуальные настройки."),
+        ui.note("🟢 активно · ⚫ выключено на этом уровне · 🟡 уровень включён, но приостановлен общим переключателем."),
     )
     buttons = []
     for cat, (emoji, label) in CATEGORIES.items():
         n = len(cmdcfg.specs_in(cat))
-        section_mark = "🟢" if cmdcfg.category_enabled(cat) else "⚫"
+        section_on = cmdcfg.category_enabled(cat)
+        section_mark = ("🟢" if section_on else "⚫") if global_on else ("🟡" if section_on else "⚫")
         buttons.append(_b(f"{section_mark} {emoji} {label} · {n}", f"cs:cat:{cat}:0"))
     rows = [[_b(
         "⏸ Отключить все команды" if global_on else "▶️ Включить все команды",
-        "cs:global",
+        f"cs:global_set:{0 if global_on else 1}",
     )]]
     rows.extend(_chunk(buttons, 2))
     rows.append([_b("🔎 Найти команду", "cs:search"), _b("ℹ️ Как устроен доступ", "cs:guide")])
@@ -197,12 +203,15 @@ def cat_view(cat: str, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     pages = max(1, -(-len(specs) // PAGE_SIZE_COMMANDS))
     page = max(0, min(page, pages - 1))
     chunk = specs[page * PAGE_SIZE_COMMANDS:(page + 1) * PAGE_SIZE_COMMANDS]
+    section_on = cmdcfg.category_enabled(cat)
     rows = [[_b(
-        "⏸ Выключить весь раздел" if cmdcfg.category_enabled(cat) else "▶️ Включить весь раздел",
-        f"cs:category:{cat}",
+        "⏸ Выключить весь раздел" if section_on else "▶️ Включить весь раздел",
+        f"cs:category_set:{cat}:{0 if section_on else 1}",
     )]]
     for spec in chunk:
-        mark = ui.onoff(cmdcfg.is_enabled(spec.key))
+        state = cmdcfg.command_state(spec.key)
+        mark = ("🟢" if state["enabled"] else
+                "⚫" if state["reason"] == "command" else "🟡")
         star = " ✎" if cmdcfg.changed_from_default(spec.key) else ""
         rows.append([_b(f"{mark} {spec.emoji} {spec.title}{star}", f"cs:cmd:{spec.key}:0")])
     if pages > 1:
@@ -217,7 +226,7 @@ def cat_view(cat: str, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
         rows.append([_b("➕ Новая команда", "cs:ccnew")])
     rows.append([_b("‹ Разделы", "cs:home")])
     if specs:
-        notes = [ui.note("🟢 доступна · ⚫ недоступна · ✎ есть свои настройки")]
+        notes = [ui.note("🟢 работает · ⚫ выключена отдельно · 🟡 приостановлена общим переключателем · ✎ есть свои настройки")]
         if not cmdcfg.global_enabled():
             notes.append(ui.note("Глобальный переключатель выключен: команды этого раздела тоже временно недоступны."))
         elif not cmdcfg.category_enabled(cat):
@@ -239,7 +248,8 @@ def cmd_view(key: str, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     spec = REGISTRY.get(key)
     if spec is None:
         return ui.card("Команда не найдена", ui.note("Возможно, она была удалена.")), _kb([[_b("‹ Разделы", "cs:home")]])
-    params = list(all_params(spec))
+    # enabled уже вынесен в отдельную верхнюю кнопку — не дублируем его в параметрах.
+    params = [p for p in all_params(spec) if p.key != "enabled"]
     pages = max(1, -(-len(params) // PAGE_SIZE_PARAMS))
     page = max(0, min(page, pages - 1))
     chunk = params[page * PAGE_SIZE_PARAMS:(page + 1) * PAGE_SIZE_PARAMS]
@@ -253,14 +263,21 @@ def cmd_view(key: str, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
         if extras:
             blocks.append(ui.note("Другие варианты: " + ", ".join(extras[:8])))
     changed = cmdcfg.changed_from_default(key)
-    own_enabled = cmdcfg.get_bool(key, "enabled")
-    effective_enabled = cmdcfg.is_enabled(key)
-    state_line = f"{ui.onoff(effective_enabled)} {'доступна' if effective_enabled else 'недоступна'}"
+    state = cmdcfg.command_state(key)
+    own_enabled = state["local"]
+    state_labels = {
+        "enabled": "🟢 Команда работает",
+        "command": "⚫ Команда выключена своим переключателем",
+        "category": "🟡 Команда приостановлена: выключен раздел",
+        "global": "🟡 Команда приостановлена: выключен общий режим",
+        "unknown": "⚫ Неизвестная команда",
+    }
+    state_line = state_labels[state["reason"]]
     inherited = []
-    if not cmdcfg.global_enabled():
-        inherited.append("глобально выключены все команды")
-    if not cmdcfg.category_enabled(spec.category):
-        inherited.append("выключен весь раздел")
+    if not state["global"]:
+        inherited.append("глобальный переключатель выключен")
+    if not state["category"]:
+        inherited.append("переключатель раздела выключен")
     access_value = cmdcfg.get_str(key, "access")
     where_value = cmdcfg.get_str(key, "where")
     policy_lines = [
@@ -282,10 +299,14 @@ def cmd_view(key: str, page: int = 0) -> tuple[str, InlineKeyboardMarkup]:
     rows = []
     rows.append([_b(
         "⏸ Выключить команду" if own_enabled else "▶️ Включить команду",
-        f"cs:t:{key}:enabled",
+        f"cs:set:{key}:enabled:{0 if own_enabled else 1}",
     )])
     for p in chunk:
-        data = f"cs:t:{key}:{p.key}" if p.kind == "bool" else f"cs:p:{key}:{p.key}"
+        if p.kind == "bool":
+            target = 0 if bool(cmdcfg.get(key, p.key)) else 1
+            data = f"cs:set:{key}:{p.key}:{target}"
+        else:
+            data = f"cs:p:{key}:{p.key}"
         rows.append([_b(_param_label(spec, p), data)])
     if pages > 1:
         nav = []
@@ -432,8 +453,13 @@ async def on_callback(callback: CallbackQuery, state: FSMContext):
     if action == "noop":
         await callback.answer()
         return
-    if action == "global":
-        if cmdcfg.global_enabled():
+    if action == "global_set":
+        target = parts[2] if len(parts) > 2 else ""
+        if target not in ("0", "1"):
+            await callback.answer("Кнопка устарела. Откройте /settings заново.", show_alert=True)
+            return
+        enabled = target == "1"
+        if not enabled and cmdcfg.global_enabled():
             text = ui.card(
                 "Отключить все пользовательские команды?",
                 ui.bullet(f"Будут затронуты {len(REGISTRY)} зарегистрированных команд и функций."),
@@ -442,47 +468,61 @@ async def on_callback(callback: CallbackQuery, state: FSMContext):
                 ui.note("Подтверди действие. Его можно будет отменить здесь же."),
             )
             await callback.message.edit_text(text, reply_markup=_kb([
-                [_b("⏸ Да, отключить всё", "cs:global_apply"), _b("Отмена", "cs:home")]
+                [_b("⏸ Да, отключить всё", "cs:global_apply:0"), _b("Отмена", "cs:home")]
             ]))
             await callback.answer()
             return
-        cmdcfg.set_global_enabled(True, actor_id=callback.from_user.id)
+        cmdcfg.set_global_enabled(enabled, actor_id=callback.from_user.id)
         await _show(callback, home_view())
-        await callback.answer("Все команды снова включены.")
+        await callback.answer("Все команды снова включены." if enabled else "Все команды отключены.")
+        return
+    if action == "global":  # старые карточки без целевого значения не должны менять настройки
+        await callback.answer("Эта кнопка устарела. Откройте /settings заново.", show_alert=True)
         return
     if action == "global_apply":
-        cmdcfg.set_global_enabled(False, actor_id=callback.from_user.id)
-        await _show(callback, home_view())
-        await callback.answer("Все пользовательские команды выключены.")
-        return
-    if action == "category":
-        category = parts[2] if len(parts) > 2 else ""
-        if category not in CATEGORIES:
-            await callback.answer("Раздел не найден.", show_alert=True)
+        target = parts[2] if len(parts) > 2 else "0"  # старое подтверждение всегда означало выключение
+        if target not in ("0", "1"):
+            await callback.answer("Некорректное состояние.", show_alert=True)
             return
-        if cmdcfg.category_enabled(category):
+        enabled = target == "1"
+        cmdcfg.set_global_enabled(enabled, actor_id=callback.from_user.id)
+        await _show(callback, home_view())
+        await callback.answer("Общее состояние сохранено.")
+        return
+    if action == "category_set":
+        category = parts[2] if len(parts) > 2 else ""
+        target = parts[3] if len(parts) > 3 else ""
+        if category not in CATEGORIES or target not in ("0", "1"):
+            await callback.answer("Раздел не найден или кнопка устарела.", show_alert=True)
+            return
+        enabled = target == "1"
+        if not enabled and cmdcfg.category_enabled(category):
             label = CATEGORIES[category][1]
             await callback.message.edit_text(
                 ui.card("Выключить раздел?", ui.bullet(f"Раздел: {label}"),
                         ui.bullet("Все команды и функции раздела станут недоступны."),
                         ui.bullet("Индивидуальные настройки сохранятся.")),
-                reply_markup=_kb([[_b("⏸ Да, выключить", f"cs:category_apply:{category}"),
+                reply_markup=_kb([[_b("⏸ Да, выключить", f"cs:category_apply:{category}:0"),
                                    _b("Отмена", f"cs:cat:{category}:0")]]),
             )
             await callback.answer()
             return
-        cmdcfg.set_category_enabled(category, True, actor_id=callback.from_user.id)
+        cmdcfg.set_category_enabled(category, enabled, actor_id=callback.from_user.id)
         await _show(callback, cat_view(category, 0))
-        await callback.answer("Раздел включён.")
+        await callback.answer("Раздел включён." if enabled else "Раздел уже выключен.")
+        return
+    if action == "category":  # старые карточки не должны инвертировать актуальное значение
+        await callback.answer("Эта кнопка устарела. Откройте /settings заново.", show_alert=True)
         return
     if action == "category_apply":
         category = parts[2] if len(parts) > 2 else ""
-        if category not in CATEGORIES:
+        target = parts[3] if len(parts) > 3 else "0"  # старое подтверждение всегда означало выключение
+        if category not in CATEGORIES or target not in ("0", "1"):
             await callback.answer("Раздел не найден.", show_alert=True)
             return
-        cmdcfg.set_category_enabled(category, False, actor_id=callback.from_user.id)
+        cmdcfg.set_category_enabled(category, target == "1", actor_id=callback.from_user.id)
         await _show(callback, cat_view(category, 0))
-        await callback.answer("Раздел выключен.")
+        await callback.answer("Состояние раздела сохранено.")
         return
     if action == "search":
         await state.set_state(PanelState.waiting_search)
@@ -553,16 +593,23 @@ async def on_callback(callback: CallbackQuery, state: FSMContext):
         await _show(callback, param_view(key, pkey))
         await callback.answer()
         return
-    if action == "t":                                   # переключатель
+    if action == "set":                                # идемпотентная установка bool
         spec = REGISTRY.get(key)
         param = find_param(spec, pkey) if spec else None
-        if param is None:
-            await callback.answer("Настройка не найдена.", show_alert=True)
+        if param is None or param.kind != "bool" or extra not in ("0", "1"):
+            await callback.answer("Настройка не найдена или значение некорректно.", show_alert=True)
             return
-        cmdcfg.set_value(key, pkey, not cmdcfg.get_bool(key, pkey), actor_id=callback.from_user.id)
+        target = extra == "1"
+        ok, result = cmdcfg.set_value(key, pkey, target, actor_id=callback.from_user.id)
+        if not ok:
+            await callback.answer(str(result), show_alert=True)
+            return
         _after_change(key, pkey)
         await _show(callback, cmd_view(key, _page_of(spec, pkey)))
-        await callback.answer("Сохранено.")
+        await callback.answer("Состояние сохранено.")
+        return
+    if action == "t":  # старые кнопки не содержат целевого состояния
+        await callback.answer("Кнопка устарела. Откройте /settings и нажмите новую кнопку.", show_alert=True)
         return
     if action == "v":                                   # готовое значение
         ok, result = cmdcfg.set_value(key, pkey, extra if extra != "" else "", actor_id=callback.from_user.id)
@@ -649,7 +696,7 @@ async def on_callback(callback: CallbackQuery, state: FSMContext):
 
 
 def _page_of(spec: Spec, pkey: str) -> int:
-    keys = [p.key for p in all_params(spec)]
+    keys = [p.key for p in all_params(spec) if p.key != "enabled"]
     return keys.index(pkey) // PAGE_SIZE_PARAMS if pkey in keys else 0
 
 
