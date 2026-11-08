@@ -17,6 +17,20 @@ from typing import Deque
 import aiohttp
 
 logger = logging.getLogger(__name__)
+DEFAULT_BASE_URL = "https://api.groq.com/openai/v1/chat/completions"
+DEFAULT_MODEL = "openai/gpt-oss-20b"
+TELEGRAM_HTML_TAG_RE = re.compile(
+    r"</?(?:b|strong|i|em|u|ins|s|strike|del|code|pre|blockquote|tg-spoiler|tg-emoji|a)(?:\s+[^<>]*)?\s*/?>",
+    re.IGNORECASE,
+)
+
+
+class AIProviderError(RuntimeError):
+    def __init__(self, status: int, detail: str):
+        super().__init__(detail)
+        self.status = status
+
+
 GROUP_TYPES = {"group", "supergroup"}
 PATTERN = r"(?isu)^\s*(?:/jf_ai(?:@[A-Za-z0-9_]+)?(?:\s|$)|/jf_ai_reset(?:@[A-Za-z0-9_]+)?(?:\s|$)|(?:джастис|помощник)\s*,\s*\S.*)$"
 
@@ -33,8 +47,8 @@ class JusticeAI:
     def __init__(self, dp, bot, F):
         self.dp, self.bot, self.F = dp, bot, F
         self.api_key = os.getenv("JF_AI_API_KEY", "").strip()
-        self.base_url = os.getenv("JF_AI_BASE_URL", "https://api.openai.com/v1/chat/completions").strip()
-        self.model = os.getenv("JF_AI_MODEL", "").strip()
+        self.base_url = os.getenv("JF_AI_BASE_URL", DEFAULT_BASE_URL).strip()
+        self.model = os.getenv("JF_AI_MODEL", DEFAULT_MODEL).strip()
         self.enabled = os.getenv("JF_AI_ENABLED", "false").strip().casefold() in {"1", "true", "yes", "on"}
         self.timeout = max(10, min(90, int(os.getenv("JF_AI_TIMEOUT", "45") or "45")))
         self.histories: dict[tuple[int, int], Deque[dict]] = defaultdict(lambda: deque(maxlen=12))
@@ -52,8 +66,11 @@ class JusticeAI:
             self.registered = True
 
     async def reply(self, m, text):
-        try: await m.reply(text, disable_web_page_preview=True)
-        except TypeError: await m.reply(text)
+        # AI output and helper messages are sent as plain text (no parse_mode).
+        # Strip common Telegram HTML wrappers so raw tags never appear in chat.
+        clean_text = TELEGRAM_HTML_TAG_RE.sub("", str(text))
+        try: await m.reply(clean_text, disable_web_page_preview=True)
+        except TypeError: await m.reply(clean_text)
 
     def _history(self, key):
         return list(self.histories[key])
@@ -68,7 +85,6 @@ class JusticeAI:
             "model": self.model,
             "messages": messages,
             "max_completion_tokens": 650,
-            "store": False,
             "stream": False,
         }
         async with aiohttp.ClientSession(timeout=timeout) as session:
@@ -76,13 +92,19 @@ class JusticeAI:
                 if response.status >= 400:
                     try: data = await response.json()
                     except Exception: data = {}
-                    detail = ((data.get("error") or {}).get("message") or "ошибка провайдера") if isinstance(data, dict) else "ошибка провайдера"
-                    raise RuntimeError(f"AI provider {response.status}: {str(detail)[:220]}")
+                    error_data = data.get("error") if isinstance(data, dict) else None
+                    if isinstance(error_data, dict):
+                        detail = error_data.get("message") or "ошибка провайдера"
+                    elif isinstance(error_data, str):
+                        detail = error_data
+                    else:
+                        detail = "ошибка провайдера"
+                    raise AIProviderError(response.status, str(detail)[:220])
                 data = await response.json()
         answer = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
         if not answer:
             raise RuntimeError("Провайдер вернул пустой ответ.")
-        return answer[:3800]
+        return TELEGRAM_HTML_TAG_RE.sub("", answer[:3800])
 
     async def handle(self, m):
         user = getattr(m, "from_user", None)
@@ -97,17 +119,17 @@ class JusticeAI:
             return await self.reply(m, "🧠 Контекст твоего диалога с Justice очищен.")
         if low.startswith("/jf_ai"):
             status = "🟢 подключён" if self.ready else "⚪ пока не настроен"
-            return await self.reply(m, "<b>Justice AI</b>\n"
+            return await self.reply(m, "Justice AI\n"
                 f"Статус: {status}.\n"
-                "Вызов: <code>Джастис, помоги придумать тему для флуда</code>.\n"
-                "Очистить контекст: <code>/jf_ai_reset</code>.\n"
+                "Вызов: Джастис, помоги придумать тему для флуда.\n"
+                "Очистить контекст: /jf_ai_reset.\n"
                 "AI отвечает только по прямому обращению. Он не читает весь чат и не выполняет команды. "
                 "Сообщение и короткий контекст передаются внешнему AI-провайдеру; не отправляй секреты или личные документы. "
                 "Короткий контекст хранится в оперативной памяти и исчезает при перезапуске.")
         match = re.match(r"(?isu)^\s*(?:джастис|помощник)\s*,\s*(.+)$", raw)
         if not match: return
         prompt = match.group(1).strip()
-        if not prompt: return await self.reply(m, "Напиши вопрос после обращения: <code>Джастис, ...</code>.")
+        if not prompt: return await self.reply(m, "Напиши вопрос после обращения: Джастис, ... .")
         if len(prompt) > 2000: return await self.reply(m, "Сообщение слишком длинное. Раздели его на несколько вопросов (до 2000 символов).")
         if not self.ready:
             return await self.reply(m, "🧠 Justice AI пока не подключён. Для живых ответов владельцу нужно включить JF_AI_ENABLED и добавить JF_AI_API_KEY и JF_AI_MODEL в переменные окружения. Ключ не отправляй в чат.")
@@ -124,6 +146,15 @@ class JusticeAI:
             answer = await self._generate(key, prompt)
         except asyncio.TimeoutError:
             return await self.reply(m, "Ответ занял слишком много времени. Попробуй ещё раз чуть позже.")
+        except AIProviderError as exc:
+            logger.warning("Justice AI provider rejected request | chat=%s user=%s status=%s", chat_id, user_id, exc.status)
+            if exc.status == 429:
+                return await self.reply(m, "Groq временно ограничил запросы из-за лимита тарифа. Подожди немного и попробуй снова.")
+            if exc.status in {401, 403}:
+                return await self.reply(m, "Groq не принял API-ключ. Администрации нужно проверить JF_AI_API_KEY в Render.")
+            if exc.status == 404:
+                return await self.reply(m, "Groq не нашёл указанную модель или endpoint. Администрации нужно проверить настройки Justice AI.")
+            return await self.reply(m, "Groq отклонил запрос. Администрации стоит проверить настройки и журнал сервиса.")
         except Exception:
             # Log a traceback for the owner, but never expose provider bodies or secrets in the group.
             logger.exception("Justice AI request failed | chat=%s user=%s", chat_id, user_id)
