@@ -88,6 +88,7 @@ CATEGORIES = {
     "reputation": ("✨", "Репутация"),
     "automation": ("🧩", "Автоматизация и жалобы"),
     "fun": ("🎲", "Развлечения"),
+    "ai": ("🧠", "Искусственный интеллект"),
     "network": ("🌐", "Сетка чатов"),
     "events": ("🎉", "События"),
     "cleanup": ("🧹", "Чистка чата"),
@@ -1023,8 +1024,13 @@ def resolve_command_key(value: str) -> Optional[str]:
 
 
 def normalize_command_candidates(text: str) -> tuple[str, ...]:
-    """Варианты первой строки для распознавания slash- и текстовых команд."""
-    line = (text or "").splitlines()[0].strip().casefold()
+    """Варианты первой строки для распознавания slash- и текстовых команд.
+
+    Telegram delivers updates that do not have text (stickers, media without a
+    caption, service messages). Treat a missing/blank text as no command rather
+    than indexing an empty splitlines() result.
+    """
+    line = next(iter((text or "").splitlines()), "").strip().casefold()
     if not line:
         return ()
     candidates = [line]

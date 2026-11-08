@@ -188,3 +188,17 @@
 ## Реализация следующего этапа — версия 0.9.0
 
 В 0.9.0 реализованы первая рабочая версия экономики «Искры» (кошелёк, ledger, профессии, образование, работа, ферма, магазин, инвентарь, подарки, задания и достижения), рекомендательные голосования модерации и локальный каталог кланов/кружков. Подробный статус и оставшиеся внешние интеграции указаны в `IMPLEMENTATION_STATUS_0.9.0.md`.
+
+
+## Дополнение: актуальное состояние версии 0.10.0
+
+Описание экономики с профессиями и выращиванием культур выше является исторической архитектурой 0.8.5 и больше не соответствует текущему пользовательскому сценарию. В 0.10.0 её заменяет ежедневное моментальное начисление через `Ферма` с валютой «Жетоны». Текущее состояние см. в `IMPLEMENTATION_STATUS_0.10.0.md`.
+
+
+## Addendum — v0.11.0
+
+- `jf_social.py` now contains the Celestiana-safe friendship layer and neutral action catalog; all actions are reply-based and rate-limited. Relationship status requires explicit acceptance and can be terminated by either participant.
+- `jf_pets.py` provides persistent virtual companions and a decorative personal den. Room and upgrade purchases use the same `jf_economy` transaction/ledger, preventing split-brain balances.
+- `jf_economy.py` exposes Celestiana-compatible aliases for token balance/transfers, gifts, showcases and paginated personal ledger history.
+- All new command aliases are in `cmdcatalog.py`, so per-command enable/access/location/cooldown/autodelete settings remain available.
+- Sexual/adult roleplay, pregnancy and biological child simulation are excluded; external Iris services remain partial/integration work.

@@ -1,8 +1,8 @@
-"""Persistent, transaction-safe Justice Faite community economy.
+"""Simple, persistent Justice Faite token economy.
 
-The module deliberately has no betting, casino, paid random rewards, debt,
-interest, taxes, or moderation immunity. All balances and item ownership are
-stored in the shared SQLite database and every balance mutation is journaled.
+The farm is intentionally a one-step daily claim: no crops, seeds, wait timers,
+profession gates, betting, debt, interest, taxes or paid random rewards.
+Legacy tables from earlier versions are retained for safe upgrades.
 """
 from __future__ import annotations
 
@@ -11,34 +11,36 @@ import re
 import sqlite3
 import threading
 from contextlib import suppress
-from datetime import datetime, timedelta, timezone
+from datetime import datetime, timezone, timedelta
 
 import cmdcfg
 
 GROUP_TYPES = {"group", "supergroup"}
-CURRENCY = "Искры"
-JOBS = {
-    "садовник": {"course": "ботаника", "pay": 28},
-    "редактор": {"course": "письмо", "pay": 32},
-    "исследователь": {"course": "наука", "pay": 36},
-    "дизайнер": {"course": "дизайн", "pay": 30},
-}
-COURSES = {"ботаника": "садовник", "письмо": "редактор", "наука": "исследователь", "дизайн": "дизайнер"}
-CROPS = {
-    "мята": {"seed": 5, "seconds": 3600, "yield": 13},
-    "ромашка": {"seed": 8, "seconds": 7200, "yield": 20},
-    "тыква": {"seed": 14, "seconds": 14400, "yield": 36},
-}
+CURRENCY = "жетонов"
+STARTER_BONUS = 30
+FARM_REWARD = 25
+# Justice Faite's existing schedule is Moscow-based. Keep the economy day aligned
+# with that schedule unless the owner explicitly changes the offset.
+DAY_OFFSET_HOURS = int(__import__("os").getenv("JF_ECONOMY_UTC_OFFSET_HOURS", "3") or "3")
 SHOP = {
-    "значок": {"price": 40, "desc": "Коллекционный значок профиля"},
-    "рамка": {"price": 90, "desc": "Декоративная рамка профиля"},
-    "плюш": {"price": 65, "desc": "Коллекционная мягкая игрушка"},
-    "фон": {"price": 120, "desc": "Тематический фон профиля"},
+    "значок": {"price": 30, "desc": "Коллекционный значок профиля"},
+    "рамка": {"price": 60, "desc": "Декоративная рамка профиля"},
+    "плюш": {"price": 45, "desc": "Коллекционная мягкая игрушка"},
+    "фон": {"price": 80, "desc": "Тематический фон профиля"},
+    "открытка": {"price": 15, "desc": "Коллекционная открытка"},
+    "книга": {"price": 35, "desc": "Декоративная книга для витрины"},
+    "брелок": {"price": 25, "desc": "Коллекционный брелок"},
+    "чашка": {"price": 30, "desc": "Чашка с символикой Justice Faite"},
+    "медаль": {"price": 70, "desc": "Декоративная медаль достижения"},
+    "постер": {"price": 55, "desc": "Тематический постер"},
+    "шарф": {"price": 40, "desc": "Декоративный шарф"},
+    "значок-клуба": {"price": 50, "desc": "Значок дружеской команды"},
 }
 COMMANDS = (
-    "/jf_economy", "баланс", "кошелёк", "кошелек", "топ богатых", "работа", "профессии",
-    "профессия", "образование", "учиться", "ферма", "посадить", "собрать", "магазин",
+    "/jf_economy", "баланс", "кошелёк", "кошелек", "топ богатых", "ферма", "фарм", "работа",
+    "собрать", "посадить", "профессии", "профессия", "образование", "учиться", "магазин",
     "купить", "инвентарь", "подарить", "задания", "задание", "достижения", "перевести",
+    "отн искры", "отн искры подарок", "отн подарок", "отн подарок витрина", "отн прем", "отн прем подарок", "отн задания", "отн история",
 )
 COMMAND_PATTERN = r"(?isu)^\s*(?:/jf_economy(?:@[A-Za-z0-9_]+)?(?:\s|$)|[!.\/]{0,4}(?:(?:ирис(?:ка)?|iris)\s+)?(?:" + "|".join(re.escape(x) for x in sorted(COMMANDS[1:], key=len, reverse=True)) + r")(?:\s|$).*$)"
 
@@ -49,6 +51,10 @@ def utcnow() -> datetime:
 
 def iso(dt: datetime | None = None) -> str:
     return (dt or utcnow()).astimezone(timezone.utc).isoformat()
+
+
+def economy_day(now: datetime | None = None) -> str:
+    return ((now or utcnow()).astimezone(timezone.utc) + timedelta(hours=DAY_OFFSET_HOURS)).date().isoformat()
 
 
 def esc(value) -> str:
@@ -67,10 +73,7 @@ class Store:
             conn.execute("PRAGMA busy_timeout=30000")
             conn.execute("PRAGMA foreign_keys=ON")
             try:
-                if immediate:
-                    conn.execute("BEGIN IMMEDIATE")
-                else:
-                    conn.execute("BEGIN")
+                conn.execute("BEGIN IMMEDIATE" if immediate else "BEGIN")
                 result = fn(conn)
                 conn.commit()
                 return result
@@ -102,6 +105,7 @@ class Store:
             CREATE TABLE IF NOT EXISTS jf_economy_inventory(
                 chat_id INTEGER NOT NULL,user_id INTEGER NOT NULL,item TEXT NOT NULL,quantity INTEGER NOT NULL DEFAULT 0 CHECK(quantity>=0),
                 PRIMARY KEY(chat_id,user_id,item));
+            -- Retained only to preserve old farms from previous versions during upgrades.
             CREATE TABLE IF NOT EXISTS jf_economy_farms(
                 chat_id INTEGER NOT NULL,user_id INTEGER NOT NULL,crop TEXT NOT NULL,planted_at TEXT NOT NULL,
                 ready_at TEXT NOT NULL,PRIMARY KEY(chat_id,user_id));
@@ -116,6 +120,8 @@ class Store:
                 id INTEGER PRIMARY KEY AUTOINCREMENT,chat_id INTEGER NOT NULL,from_id INTEGER NOT NULL,
                 to_id INTEGER NOT NULL,item TEXT NOT NULL,quantity INTEGER NOT NULL,operation_key TEXT NOT NULL UNIQUE,created_at TEXT NOT NULL);
             """)
+            # The migration is intentionally additive only. Do not drop or reset any old balance data.
+            c.execute("CREATE INDEX IF NOT EXISTS idx_jf_econ_ledger_chat_reason ON jf_economy_ledger(chat_id,reason,id DESC)")
         self.run(op)
 
 
@@ -141,17 +147,22 @@ class Economy:
 
     def _wallet(self, c, chat, uid):
         c.execute("INSERT OR IGNORE INTO jf_wallets(chat_id,user_id,balance,updated_at) VALUES(?,?,0,?)", (chat, uid, iso()))
+        welcome_key = f"welcome:{chat}:{uid}"
+        if not c.execute("SELECT 1 FROM jf_economy_ledger WHERE operation_key=?", (welcome_key,)).fetchone():
+            before = int(c.execute("SELECT balance FROM jf_wallets WHERE chat_id=? AND user_id=?", (chat, uid)).fetchone()[0])
+            after = before + STARTER_BONUS
+            c.execute("UPDATE jf_wallets SET balance=?,updated_at=? WHERE chat_id=? AND user_id=?", (after, iso(), chat, uid))
+            c.execute("INSERT INTO jf_economy_ledger(chat_id,user_id,delta,balance_before,balance_after,reason,actor_id,operation_key,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                      (chat, uid, STARTER_BONUS, before, after, "starter_bonus", 0, welcome_key, iso()))
         return int(c.execute("SELECT balance FROM jf_wallets WHERE chat_id=? AND user_id=?", (chat, uid)).fetchone()[0])
 
     def _credit(self, c, chat, uid, amount, reason, key, actor=0):
-        if not amount:
-            return self._wallet(c, chat, uid)
         if c.execute("SELECT 1 FROM jf_economy_ledger WHERE operation_key=?", (key,)).fetchone():
             return self._wallet(c, chat, uid)
         before = self._wallet(c, chat, uid)
         after = before + int(amount)
         if after < 0:
-            raise ValueError("Недостаточно средств.")
+            raise ValueError("Недостаточно жетонов.")
         c.execute("UPDATE jf_wallets SET balance=?,updated_at=? WHERE chat_id=? AND user_id=?", (after, iso(), chat, uid))
         c.execute("INSERT INTO jf_economy_ledger(chat_id,user_id,delta,balance_before,balance_after,reason,actor_id,operation_key,created_at) VALUES(?,?,?,?,?,?,?,?,?)",
                   (chat, uid, int(amount), before, after, reason, actor, key, iso()))
@@ -161,7 +172,7 @@ class Economy:
         return self._credit(c, chat, uid, -int(amount), reason, key, actor)
 
     def _daily(self, c, chat, uid):
-        day = utcnow().date().isoformat()
+        day = economy_day()
         c.execute("INSERT OR IGNORE INTO jf_economy_daily(chat_id,user_id,day) VALUES(?,?,?)", (chat, uid, day))
         return c.execute("SELECT * FROM jf_economy_daily WHERE chat_id=? AND user_id=? AND day=?", (chat, uid, day)).fetchone()
 
@@ -178,10 +189,20 @@ class Economy:
     def _check_achievements(self, c, chat, uid):
         balance = self._wallet(c, chat, uid)
         tx_count = int(c.execute("SELECT COUNT(*) FROM jf_economy_ledger WHERE chat_id=? AND user_id=? AND delta>0", (chat, uid)).fetchone()[0])
-        harvests = int(c.execute("SELECT COUNT(*) FROM jf_economy_ledger WHERE chat_id=? AND user_id=? AND reason='harvest'", (chat, uid)).fetchone()[0])
+        farm_days = int(c.execute("SELECT COUNT(*) FROM jf_economy_ledger WHERE chat_id=? AND user_id=? AND reason='farm_daily'", (chat, uid)).fetchone()[0])
         if balance >= 100: self._unlock(c, chat, uid, "first_hundred")
         if tx_count >= 10: self._unlock(c, chat, uid, "ten_earnings")
-        if harvests >= 5: self._unlock(c, chat, uid, "green_thumb")
+        if farm_days >= 5: self._unlock(c, chat, uid, "five_farms")
+
+    def _claim_farm(self, c, chat, uid):
+        day = self._daily(c, chat, uid)
+        if int(day["worked"]):
+            raise ValueError("Сегодня ты уже получил жетоны. Новая награда будет после 00:00 по московскому времени.")
+        key = f"farm_daily:{chat}:{uid}:{day['day']}"
+        balance = self._credit(c, chat, uid, FARM_REWARD, "farm_daily", key)
+        c.execute("UPDATE jf_economy_daily SET worked=1,harvested=1 WHERE chat_id=? AND user_id=? AND day=?", (chat, uid, day["day"]))
+        self._check_achievements(c, chat, uid)
+        return balance
 
     async def handle(self, m):
         if not getattr(m, "from_user", None) or getattr(m.from_user, "is_bot", False):
@@ -195,128 +216,64 @@ class Economy:
         chat, uid = int(m.chat.id), int(m.from_user.id)
         if low.startswith("jf_economy") or low.startswith("/jf_economy"):
             return await self.reply(m, self.help_text())
-        if low in {"баланс", "кошелёк", "кошелек"}:
-            bal = self.store.run(lambda c: self._wallet(c, chat, uid))
-            return await self.reply(m, f"💠 Твой баланс: <b>{bal} {CURRENCY}</b>.")
+        if low in {"баланс", "кошелёк", "кошелек", "отн искры"}:
+            bal = self.store.run(lambda c: self._wallet(c, chat, uid), immediate=True)
+            return await self.reply(m, f"🪙 Твой баланс: <b>{bal} {CURRENCY}</b>.")
         if low.startswith("топ богатых"):
             limit = 10
             mt = re.search(r"\b(\d{1,2})\b", low)
             if mt: limit = max(1, min(20, int(mt.group(1))))
             rows = self.store.run(lambda c: c.execute("SELECT user_id,balance FROM jf_wallets WHERE chat_id=? ORDER BY balance DESC,user_id LIMIT ?", (chat, limit)).fetchall())
-            body = "\n".join(f"{i}. {esc(self._name(chat, int(r['user_id'])))} — <b>{r['balance']}</b>" for i, r in enumerate(rows, 1))
-            return await self.reply(m, "🏆 <b>Топ по Искрам</b>\n" + (body or "Пока нет балансов."))
-        if low == "профессии":
-            lines_out = [f"• {esc(k.title())} — {v['pay']} Искр/день · курс: {esc(v['course'])}" for k, v in JOBS.items()]
-            return await self.reply(m, "🧰 <b>Профессии</b>\n" + "\n".join(lines_out) + "\n\nВыбор: <code>Профессия садовник</code>. Сначала можно пройти курс через <code>Учиться ботаника</code>.")
-        if low.startswith("профессия"):
-            choice = first[len("профессия"):].strip().casefold()
-            if not choice:
-                row = self.store.run(lambda c: c.execute("SELECT job FROM jf_economy_profiles WHERE chat_id=? AND user_id=?", (chat, uid)).fetchone())
-                return await self.reply(m, f"Твоя профессия: <b>{esc(row['job'] or 'не выбрана') if row else 'не выбрана'}</b>.")
-            if choice not in JOBS:
-                return await self.reply(m, "Такой профессии нет. Напиши <code>Профессии</code>.")
-            def choose(c):
-                c.execute("INSERT OR IGNORE INTO jf_economy_profiles(chat_id,user_id) VALUES(?,?)", (chat, uid))
-                row = c.execute("SELECT education FROM jf_economy_profiles WHERE chat_id=? AND user_id=?", (chat, uid)).fetchone()
-                if row[0] != JOBS[choice]['course']:
-                    raise ValueError(f"Для профессии нужен курс «{JOBS[choice]['course']}». Напиши Учиться {JOBS[choice]['course']}.")
-                c.execute("UPDATE jf_economy_profiles SET job=? WHERE chat_id=? AND user_id=?", (choice, chat, uid))
-            try: self.store.run(choose, immediate=True)
-            except ValueError as e: return await self.reply(m, esc(e))
-            return await self.reply(m, f"✅ Теперь твоя профессия — <b>{esc(choice)}</b>.")
-        if low == "образование":
-            row = self.store.run(lambda c: c.execute("SELECT education FROM jf_economy_profiles WHERE chat_id=? AND user_id=?", (chat, uid)).fetchone())
-            return await self.reply(m, "🎓 <b>Образование</b>\nДоступные курсы: " + ", ".join(COURSES) + f"\nТвой курс: <b>{esc(row['education'] or 'не пройден') if row else 'не пройден'}</b>.\nПройти: <code>Учиться ботаника</code>.")
-        if low.startswith("учиться "):
-            course = first[len("учиться "):].strip().casefold()
-            if course not in COURSES:
-                return await self.reply(m, "Неизвестный курс. Доступно: " + ", ".join(COURSES) + ".")
-            def study(c):
-                c.execute("INSERT OR IGNORE INTO jf_economy_profiles(chat_id,user_id) VALUES(?,?)", (chat, uid))
-                c.execute("UPDATE jf_economy_profiles SET education=? WHERE chat_id=? AND user_id=?", (course, chat, uid))
-            self.store.run(study, immediate=True)
-            return await self.reply(m, f"🎓 Курс «{esc(course)}» завершён. Теперь доступна профессия «{esc(COURSES[course])}».")
-        if low == "работа":
-            def work(c):
-                c.execute("INSERT OR IGNORE INTO jf_economy_profiles(chat_id,user_id) VALUES(?,?)", (chat, uid))
-                profile = c.execute("SELECT job,last_work_at FROM jf_economy_profiles WHERE chat_id=? AND user_id=?", (chat, uid)).fetchone()
-                if not profile['job']:
-                    raise ValueError("Сначала выбери профессию: Учиться ботаника → Профессия садовник.")
-                day = self._daily(c, chat, uid)
-                if int(day['worked']): raise ValueError("Сегодня ты уже получил оплату. Новая смена будет после 00:00 UTC.")
-                pay = int(JOBS[profile['job']]['pay'])
-                key = f"work:{chat}:{uid}:{utcnow().date().isoformat()}"
-                bal = self._credit(c, chat, uid, pay, "work", key)
-                c.execute("UPDATE jf_economy_daily SET worked=1 WHERE chat_id=? AND user_id=? AND day=?", (chat, uid, day['day']))
-                c.execute("UPDATE jf_economy_profiles SET last_work_at=? WHERE chat_id=? AND user_id=?", (iso(), chat, uid))
-                self._check_achievements(c, chat, uid)
-                return pay, bal
-            try: pay, bal = self.store.run(work, immediate=True)
-            except ValueError as e: return await self.reply(m, esc(e))
-            return await self.reply(m, f"🧰 Смена завершена! Начислено <b>{pay} {CURRENCY}</b>. Баланс: <b>{bal}</b>.")
-        if low == "ферма":
-            row = self.store.run(lambda c: c.execute("SELECT * FROM jf_economy_farms WHERE chat_id=? AND user_id=?", (chat, uid)).fetchone())
-            crops = "\n".join(f"• {k}: семена {v['seed']}, сбор через {v['seconds']//3600} ч., награда {v['yield']}" for k, v in CROPS.items())
-            if row:
-                ready = datetime.fromisoformat(row['ready_at']) <= utcnow()
-                status = "🌾 Урожай готов — напиши <code>Собрать</code>." if ready else f"🌱 Растёт до {esc(row['ready_at'][:16].replace('T',' '))} UTC."
-            else: status = "У тебя пока нет посаженной культуры."
-            return await self.reply(m, f"🌿 <b>Твоя ферма</b>\n{status}\n\n<b>Культуры</b>\n{crops}\nПосадка: <code>Посадить мята</code>.")
-        if low.startswith("посадить "):
-            crop = first[len("посадить "):].strip().casefold()
-            if crop not in CROPS: return await self.reply(m, "Неизвестная культура. Напиши <code>Ферма</code>.")
-            def plant(c):
-                if c.execute("SELECT 1 FROM jf_economy_farms WHERE chat_id=? AND user_id=?", (chat, uid)).fetchone(): raise ValueError("Сначала собери текущий урожай.")
-                cost = CROPS[crop]['seed']; self._debit(c, chat, uid, cost, "seed", f"seed:{chat}:{uid}:{iso()}")
-                start = utcnow(); ready = start + timedelta(seconds=CROPS[crop]['seconds'])
-                c.execute("INSERT INTO jf_economy_farms(chat_id,user_id,crop,planted_at,ready_at) VALUES(?,?,?,?,?)", (chat, uid, crop, iso(start), iso(ready)))
-            try: self.store.run(plant, immediate=True)
-            except ValueError as e: return await self.reply(m, esc(e))
-            except sqlite3.IntegrityError: return await self.reply(m, "Не удалось посадить. Проверь баланс и статус фермы.")
-            return await self.reply(m, f"🌱 Посажена культура «{esc(crop)}». Срок сбора: {CROPS[crop]['seconds']//3600} ч.")
-        if low == "собрать":
-            def harvest(c):
-                row = c.execute("SELECT * FROM jf_economy_farms WHERE chat_id=? AND user_id=?", (chat, uid)).fetchone()
-                if not row: raise ValueError("На ферме пока ничего не растёт.")
-                if datetime.fromisoformat(row['ready_at']) > utcnow(): raise ValueError("Урожай ещё не созрел. Проверь командой «Ферма».")
-                crop = row['crop']; amount = int(CROPS[crop]['yield'])
-                key = f"harvest:{chat}:{uid}:{row['planted_at']}"
-                bal = self._credit(c, chat, uid, amount, "harvest", key)
-                c.execute("DELETE FROM jf_economy_farms WHERE chat_id=? AND user_id=?", (chat, uid))
-                day = self._daily(c, chat, uid)
-                c.execute("UPDATE jf_economy_daily SET harvested=1 WHERE chat_id=? AND user_id=? AND day=?", (chat, uid, day['day']))
-                self._check_achievements(c, chat, uid)
-                return crop, amount, bal
-            try: crop, amount, bal = self.store.run(harvest, immediate=True)
-            except ValueError as e: return await self.reply(m, esc(e))
-            return await self.reply(m, f"🌾 Собран урожай: {esc(crop)}. Получено <b>{amount} {CURRENCY}</b>. Баланс: <b>{bal}</b>.")
+            body = "\n".join(f"{i}. {esc(self._name(chat, int(r['user_id'])))} — <b>{r['balance']} {CURRENCY}</b>" for i, r in enumerate(rows, 1))
+            return await self.reply(m, "🏆 <b>Топ по жетонам</b>\n" + (body or "Пока нет участников в рейтинге."))
+        if low in {"ферма", "фарм", "собрать", "работа"}:
+            try:
+                bal = self.store.run(lambda c: self._claim_farm(c, chat, uid), immediate=True)
+            except ValueError as e:
+                return await self.reply(m, esc(e))
+            return await self.reply(m, f"🪙 <b>Ежедневный фарм завершён!</b>\nНачислено: <b>+{FARM_REWARD} {CURRENCY}</b>.\nТвой баланс: <b>{bal} {CURRENCY}</b>.\n\nВозвращайся после 00:00 по московскому времени за следующей наградой.")
+        if low in {"посадить", "учиться"} or low.startswith(("посадить ", "профессия", "профессии", "образование", "учиться ")):
+            return await self.reply(m, "🌿 Мы упростили экономику: посадка растений, семена, курсы и профессии больше не нужны. Напиши <code>Ферма</code>, чтобы сразу получить ежедневные жетоны.")
         if low == "магазин":
             items = "\n".join(f"• <b>{esc(k)}</b> — {v['price']} {CURRENCY}. {esc(v['desc'])}." for k,v in SHOP.items())
-            return await self.reply(m, "🛍️ <b>Магазин</b>\n" + items + "\nПокупка: <code>Купить значок</code>.")
+            return await self.reply(m, "🛍️ <b>Магазин Justice Faite</b>\n" + items + "\nПокупка: <code>Купить название</code>. Доступно 12 предметов, все только декоративные.")
+        if low in {"отн подарок витрина", "отн подарок витрина общая"}:
+            rows = self.store.run(lambda c: c.execute(
+                "SELECT from_id,to_id,item,created_at FROM jf_economy_gifts WHERE chat_id=? ORDER BY id DESC LIMIT 10",
+                (chat,)).fetchall())
+            lines = [f"• {esc(self._name(chat, int(r['from_id'])))} → {esc(self._name(chat, int(r['to_id'])))}: <b>{esc(r['item'])}</b> · {esc(r['created_at'][:10])}" for r in rows]
+            return await self.reply(m, "🎁 <b>Общая витрина подарков</b>\n" + ("\n".join(lines) if lines else "Подарков пока нет. Их можно отправить командой <code>Подарить название</code> ответом на сообщение."))
         if low.startswith("купить "):
             item = first[len("купить "):].strip().casefold()
             if item not in SHOP: return await self.reply(m, "Такого предмета нет. Напиши <code>Магазин</code>.")
             def buy(c):
                 op_key = f"shop:{chat}:{uid}:{item}:{m.message_id}"
-                # A replayed Telegram update must not duplicate inventory after
-                # the debit has already been committed.
                 if c.execute("SELECT 1 FROM jf_economy_ledger WHERE operation_key=?", (op_key,)).fetchone():
                     return self._wallet(c, chat, uid)
-                price = int(SHOP[item]['price']); self._debit(c, chat, uid, price, "shop", op_key)
+                price = int(SHOP[item]["price"]); self._debit(c, chat, uid, price, "shop", op_key)
                 c.execute("INSERT INTO jf_economy_inventory(chat_id,user_id,item,quantity) VALUES(?,?,?,1) ON CONFLICT(chat_id,user_id,item) DO UPDATE SET quantity=quantity+1", (chat, uid, item))
                 return self._wallet(c, chat, uid)
             try: bal = self.store.run(buy, immediate=True)
-            except ValueError: return await self.reply(m, "Недостаточно Искр для покупки.")
-            return await self.reply(m, f"✅ Куплено: <b>{esc(item)}</b>. Остаток: <b>{bal}</b> {CURRENCY}.")
+            except ValueError: return await self.reply(m, f"Недостаточно {CURRENCY}. Напиши <code>Ферма</code>, чтобы получить ежедневную награду.")
+            return await self.reply(m, f"✅ Куплено: <b>{esc(item)}</b>. Остаток: <b>{bal} {CURRENCY}</b>.")
+        if low.startswith("отн прем"):
+            return await self.reply(m, "💎 В Justice Faite нет платного VIP и покупаемых привилегий. Декоративные предметы за игровые жетоны находятся в команде <code>Магазин</code>. История уже подаренных предметов: <code>.отн подарок витрина общая</code>. Подарить предмет можно ответом на сообщение: <code>.отн подарок значок</code>.")
         if low == "инвентарь":
             rows = self.store.run(lambda c: c.execute("SELECT item,quantity FROM jf_economy_inventory WHERE chat_id=? AND user_id=? AND quantity>0 ORDER BY item", (chat, uid)).fetchall())
             body = "\n".join(f"• {esc(r['item'])} × {r['quantity']}" for r in rows)
             return await self.reply(m, "🎒 <b>Инвентарь</b>\n" + (body or "Пока пусто."))
-        if low.startswith("подарить "):
+        if low == "отн подарок витрина моя":
+            rows = self.store.run(lambda c: c.execute(
+                "SELECT from_id,item,created_at FROM jf_economy_gifts WHERE chat_id=? AND to_id=? ORDER BY id DESC LIMIT 15",
+                (chat, uid)).fetchall())
+            lines = [f"• От {esc(self._name(chat, int(r['from_id'])))}: <b>{esc(r['item'])}</b> · {esc(r['created_at'][:10])}" for r in rows]
+            return await self.reply(m, "🎁 <b>Твоя витрина подарков</b>\n" + ("\n".join(lines) if lines else "Тебе пока не дарили предметы."))
+        if low.startswith("подарить ") or (low.startswith("отн подарок ") and not low.startswith("отн подарок витрина")):
             target_msg = getattr(m, "reply_to_message", None)
             target_user = getattr(target_msg, "from_user", None) if target_msg else None
             if not target_user: return await self.reply(m, "Ответь командой на сообщение участника: <code>Подарить значок</code>.")
-            target = int(target_user.id); item = first[len("подарить "):].strip().casefold()
+            target = int(target_user.id)
+            item = (first[len("отн подарок "):] if low.startswith("отн подарок ") else first[len("подарить "):]).strip().casefold()
             if target == uid or getattr(target_user, "is_bot", False): return await self.reply(m, "Подарить можно другому участнику.")
             if item not in SHOP: return await self.reply(m, "Можно подарить предмет из магазина. Напиши <code>Магазин</code>.")
             def gift(c):
@@ -331,37 +288,68 @@ class Economy:
             try: self.store.run(gift, immediate=True)
             except ValueError as e: return await self.reply(m, esc(e))
             return await self.reply(m, f"🎁 Подарок отправлен: <b>{esc(item)}</b> → {esc(self._name(chat,target))}.")
-        if low in {"задания", "задание"}:
-            day = utcnow().date().isoformat()
+        if low.startswith("отн история"):
+            parts = low.split()
+            mode = parts[2] if len(parts) > 2 else "всё"
+            page = 1
+            if len(parts) > 3:
+                try: page = max(1, min(50, int(parts[3])))
+                except ValueError: return await self.reply(m, "Формат: <code>.отн история [доход|расход] [страница]</code>.")
+            if mode not in {"всё", "все", "доход", "расход", "связи"}:
+                return await self.reply(m, "Формат: <code>.отн история</code>, <code>.отн история доход</code> или <code>.отн история расход 2</code>.")
+            if mode in {"связи", "связей"}:
+                rows = self.store.run(lambda c: c.execute("SELECT from_name,to_name,status,created_at FROM jf_social_invites WHERE chat_id=? AND (from_id=? OR to_id=?) ORDER BY id DESC LIMIT 10", (chat,uid,uid)).fetchall())
+                lines = [f"• {esc(r['from_name'])} → {esc(r['to_name'])}: {esc(r['status'])} · {esc(r['created_at'][:10])}" for r in rows]
+                return await self.reply(m, "<b>История приглашений</b>\n" + ("\n".join(lines) or "История пока пуста."))
+            where = ""
+            params = [chat,uid]
+            if mode == "доход": where = " AND delta>0"
+            elif mode == "расход": where = " AND delta<0"
+            total = int(self.store.run(lambda c: c.execute("SELECT COUNT(*) FROM jf_economy_ledger WHERE chat_id=? AND user_id=?"+where, params).fetchone()[0]))
+            rows = self.store.run(lambda c: c.execute("SELECT delta,reason,balance_after,created_at FROM jf_economy_ledger WHERE chat_id=? AND user_id=?"+where+" ORDER BY id DESC LIMIT 10 OFFSET ?", params+[ (page-1)*10 ]).fetchall())
+            labels = {"starter_bonus":"Стартовый бонус", "farm_daily":"Ежедневный фарм", "shop":"Покупка в магазине", "transfer_out":"Перевод участнику", "transfer_in":"Получен перевод", "pet_room":"Открытие комнаты", "pet_home_upgrade":"Улучшение дома"}
+            lines = [f"• {'+' if int(r['delta'])>0 else ''}{int(r['delta'])} {CURRENCY} · {esc(labels.get(r['reason'],r['reason']))} · баланс {int(r['balance_after'])} · {esc(r['created_at'][:10])}" for r in rows]
+            pages = max(1,(total+9)//10)
+            return await self.reply(m, f"<b>История жетонов · {esc(mode)}</b>\nСтраница {page}/{pages} · операций: {total}\n" + ("\n".join(lines) if lines else "Операций пока нет."))
+
+        if low in {"задания", "задание", "отн задания"}:
             row = self.store.run(lambda c: self._daily(c, chat, uid))
-            return await self.reply(m, "📜 <b>Ежедневные задания</b>\n" + ("✅" if row['worked'] else "▫️") + " Завершить рабочую смену и получить оплату\n" + ("✅" if row['harvested'] else "▫️") + " Собрать урожай\nПрогресс отмечается автоматически; отдельная выплата за повторные команды не начисляется.")
+            return await self.reply(m, "📜 <b>Ежедневная цель</b>\n" + ("✅" if row["worked"] else "▫️") + f" Получить ежедневную награду через <code>Ферма</code> (+{FARM_REWARD} {CURRENCY}).\nНикаких дополнительных действий не требуется.")
         if low == "достижения":
             rows = self.store.run(lambda c: c.execute("SELECT achievement,unlocked_at FROM jf_economy_achievements WHERE chat_id=? AND user_id=? ORDER BY unlocked_at", (chat, uid)).fetchall())
-            names = {"first_hundred": "Первые 100 Искр", "ten_earnings": "Десять начислений", "green_thumb": "Зелёный палец — 5 сборов"}
-            return await self.reply(m, "🏅 <b>Достижения</b>\n" + ("\n".join("• " + esc(names.get(r['achievement'],r['achievement'])) for r in rows) or "Пока нет достижений. Продолжай играть и выполнять задания."))
-        if low.startswith("перевести "):
+            names = {"first_hundred": f"Первые 100 {CURRENCY}", "ten_earnings": "Десять начислений", "five_farms": "Пять дней фарма", "green_thumb": "Старое достижение: садовод"}
+            return await self.reply(m, "🏅 <b>Достижения</b>\n" + ("\n".join("• " + esc(names.get(r["achievement"],r["achievement"])) for r in rows) or "Пока нет достижений. Продолжай участвовать в жизни флуда."))
+        if low.startswith("перевести ") or low.startswith("отн искры подарок "):
             target_msg = getattr(m, "reply_to_message", None); target_user = getattr(target_msg, "from_user", None) if target_msg else None
-            if not target_user: return await self.reply(m, "Ответь на сообщение получателя: <code>Перевести 10</code>.")
+            if not target_user: return await self.reply(m, "Ответь на сообщение получателя: <code>Перевести 10</code> или <code>.отн искры подарок 10</code>.")
             target = int(target_user.id)
-            try: amount = int(first.split(maxsplit=1)[1])
-            except (ValueError, IndexError): return await self.reply(m, "Укажи целое число Искр.")
-            if target == uid or getattr(target_user, "is_bot", False) or not 1 <= amount <= 500: return await self.reply(m, "Можно перевести от 1 до 500 Искр другому участнику.")
-            day = utcnow().date().isoformat(); key = f"transfer:{chat}:{uid}:{target}:{day}:{m.message_id}"
+            try: amount = int(first.split()[-1])
+            except (ValueError, IndexError): return await self.reply(m, "Укажи целое число жетонов.")
+            if target == uid or getattr(target_user, "is_bot", False) or not 1 <= amount <= 500: return await self.reply(m, "Можно перевести от 1 до 500 жетонов другому участнику.")
+            key = f"transfer:{chat}:{uid}:{target}:{m.message_id}"
             def transfer(c):
+                # Daily transfer cap is 500 tokens total, not 500 per message.
+                local_now = utcnow() + timedelta(hours=DAY_OFFSET_HOURS)
+                local_midnight = datetime.combine(local_now.date(), datetime.min.time(), tzinfo=timezone.utc) - timedelta(hours=DAY_OFFSET_HOURS)
+                sent_today = int(c.execute("SELECT COALESCE(-SUM(delta),0) FROM jf_economy_ledger WHERE chat_id=? AND user_id=? AND reason='transfer_out' AND created_at>=?", (chat, uid, iso(local_midnight))).fetchone()[0])
+                if sent_today + amount > 500: raise ValueError("Дневной лимит переводов — 500 жетонов.")
                 bal = self._debit(c, chat, uid, amount, "transfer_out", key, uid)
                 self._credit(c, chat, target, amount, "transfer_in", key + ":in", uid)
                 return bal
             try: bal = self.store.run(transfer, immediate=True)
-            except ValueError: return await self.reply(m, "Недостаточно Искр.")
-            return await self.reply(m, f"💸 Переведено {amount} {CURRENCY}. Твой баланс: <b>{bal}</b>.")
+            except ValueError as e: return await self.reply(m, esc(e))
+            return await self.reply(m, f"💸 Переведено {amount} {CURRENCY}. Твой баланс: <b>{bal} {CURRENCY}</b>.")
 
     @staticmethod
     def help_text():
         return ("<b>Экономика Justice Faite</b>\n"
-                "<code>Баланс</code> · <code>Топ богатых</code> · <code>Профессии</code> · <code>Учиться ботаника</code> · <code>Профессия садовник</code> · <code>Работа</code>\n"
-                "<code>Ферма</code> · <code>Посадить мята</code> · <code>Собрать</code> · <code>Магазин</code> · <code>Купить значок</code> · <code>Инвентарь</code>\n"
-                "<code>Подарить значок</code> ответом на сообщение · <code>Задания</code> · <code>Достижения</code> · <code>Перевести 10</code> ответом на сообщение.\n"
-                "Баланс хранится в SQLite и каждая операция записывается в журнал. Нет ставок, казино, кредитов, налогов или платного шанса.")
+                f"Стартовый баланс: <b>{STARTER_BONUS} {CURRENCY}</b>.\n"
+                f"<code>Баланс</code> / <code>.отн искры</code> · <code>Ферма</code> (+{FARM_REWARD} жетонов раз в день) · <code>Топ богатых</code>\n"
+                "<code>Магазин</code> · <code>Купить название</code> · <code>Инвентарь</code>\n"
+                "<code>.отн подарок витрина общая</code> — последние подарки чата · <code>.отн подарок витрина моя</code> — твои полученные подарки\n"
+                "<code>Подарить название</code> или <code>.отн подарок название</code> ответом на сообщение · <code>Перевести 10</code> / <code>.отн искры подарок 10</code> ответом на сообщение\n"
+                "<code>Задания</code> / <code>.отн задания</code> · <code>Достижения</code> · <code>.отн история доход</code> / <code>.отн история расход 2</code>\n"
+                "Ферма начисляет награду сразу. Все цены фиксированы; нет ставок, казино, кредитов, налогов, платного шанса или покупки привилегий.")
 
 
 def register(dp, bot, F, db_path, lock=None):

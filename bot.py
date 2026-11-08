@@ -220,10 +220,20 @@ JF_RAFFLES = jf_raffles.register(dp, bot=bot, F=F, db_path=DB_PATH, manager=JF_M
 import jf_clean
 JF_CLEAN = jf_clean.register(dp, bot=bot, F=F, db_path=DB_PATH, manager=JF_MANAGER, lock=DB_LOCK)
 
-# Persistent community economy: one SQLite source of truth for wallets,
-# inventory, jobs, education, farm timers, achievements and ledger entries.
+# Persistent, simplified Justice Faite token economy (one-step daily farm).
 import jf_economy
 JF_ECONOMY = jf_economy.register(dp, bot=bot, F=F, db_path=DB_PATH, lock=DB_LOCK)
+
+# Voluntary, non-romantic social pairings. Both participants must consent.
+import jf_social
+JF_SOCIAL = jf_social.register(dp, bot=bot, F=F, db_path=DB_PATH, lock=DB_LOCK, manager=JF_MANAGER)
+
+# Optional conversational AI. It only responds when explicitly addressed.
+import jf_pets
+JF_PETS = jf_pets.register(dp, bot=bot, F=F, db_path=DB_PATH, lock=DB_LOCK, economy=JF_ECONOMY)
+
+import jf_ai
+JF_AI = jf_ai.register(dp, bot=bot, F=F)
 
 # Advisory moderation votes: a poll can never issue a ban automatically.
 import jf_modvote
@@ -6972,7 +6982,11 @@ async def setup_commands():
     network_command = BotCommand(command="jf_network", description="🌐 Сетка чатов")
     raffles_command = BotCommand(command="jf_raffles", description="🎉 Бесплатные розыгрыши")
     clean_command = BotCommand(command="jf_clean", description="🧹 Чистка сообщений")
-    economy_command = BotCommand(command="jf_economy", description="💠 Экономика, профессии и ферма")
+    economy_command = BotCommand(command="jf_economy", description="🪙 Жетоны, ежедневный фарм и магазин")
+    social_command = BotCommand(command="jf_social", description="🤝 Добровольные социальные связи")
+    pets_command = BotCommand(command="jf_pets", description="🐾 Питомец и личный дом")
+    ai_command = BotCommand(command="jf_ai", description="🧠 Разговорный помощник Justice")
+    ai_reset_command = BotCommand(command="jf_ai_reset", description="🧹 Очистить контекст Justice AI")
     modvote_command = BotCommand(command="jf_modvote", description="🗳 Рекомендательные голосования модерации")
     console_command = BotCommand(command="jf_console", description="🧠 Личная консоль владельца")
     memory_command = BotCommand(command="jf_memory", description="🗂️ Память и требования проекта")
@@ -6983,7 +6997,7 @@ async def setup_commands():
     inline_guard_command = BotCommand(command="inline_guard", description="🛡️ Защита от inline-ботов")
     group_extras = (profile_command, reputation_command, reports_command, timers_command,
                     automod_command, fun_command, network_command, raffles_command,
-                    clean_command, economy_command, modvote_command, stats_command, chatconfig_command, community_command,
+                    clean_command, economy_command, social_command, pets_command, ai_command, ai_reset_command, modvote_command, stats_command, chatconfig_command, community_command,
                     manager_command)
     for item in group_extras:
         _append_menu_if_allowed(group_user, item, level="members", chat_type="supergroup")
@@ -9956,6 +9970,8 @@ async def main():
     JF_RAFFLES.init()
     JF_CLEAN.init()
     JF_ECONOMY.init()
+    JF_SOCIAL.init()
+    JF_PETS.init()
     JF_MODVOTE.init()
     JF_CONSOLE.init()
     init_justice_features_db()
