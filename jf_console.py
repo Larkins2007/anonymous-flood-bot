@@ -218,6 +218,16 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS idx_jf_ai_flood_memory_category
                     ON jf_ai_flood_memory(category, updated_at DESC);
+                CREATE TABLE IF NOT EXISTS jf_ai_identity_aliases (
+                    chat_id INTEGER NOT NULL,
+                    user_id INTEGER NOT NULL,
+                    alias_no INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    PRIMARY KEY(chat_id,user_id),
+                    UNIQUE(chat_id,alias_no)
+                );
+                CREATE INDEX IF NOT EXISTS idx_jf_ai_identity_aliases_chat
+                    ON jf_ai_identity_aliases(chat_id,alias_no);
                 CREATE TABLE IF NOT EXISTS jf_chat_message_revisions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     chat_id INTEGER NOT NULL,

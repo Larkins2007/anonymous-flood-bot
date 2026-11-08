@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.15.1 — Identity-aware Justice AI and natural flood voice (2026-11-08)
+
+- Fixed the core role-recognition defect: role context no longer depends on `sender_tag` being present in every Telegram message. The live `group_members` assignment is authoritative and is validated against `role_catalog`; current roles are now available even when the archive has no `sender_tag` column.
+- Added persistent, chat-scoped pseudonyms in `jf_ai_identity_aliases`. The same person now keeps the same local alias across separate messages, allowing the model to follow who is speaking and preserve continuity. The Telegram user ID ↔ alias mapping remains in SQLite and is never sent to Groq.
+- Added separate trusted identity facts: assigned flood/character role, owner status, and internal Justice Faite moderation rank. Character role and moderation authority are explicitly distinct; Telegram IDs, usernames, display names, raw tags and role keys remain local.
+- Reworked the Justice voice: concise by default (normally 1–3 sentences), friendly and informal without forced slang, warm but responsible as an admin-assistant, and less likely to moralize during normal banter. Detailed answers are reserved for explicit requests.
+- Added adaptive completion budgets: 260 tokens for routine replies, 650 for clearly detailed requests.
+- Added tests for recognition without `sender_tag`, persistent aliases across calls, rank/character-role separation, concise style and adaptive response budgets.
+- Added one additive SQLite table and one index. No existing participant rows, roles, warnings, message history or memories are modified or deleted. No commit, push, production migration or deployment.
+- Offline regression checks passed. Live Telegram/Groq behavior and qualitative model output remain unverified.
+
 ## 0.15.0 — Low-noise Watch, scheduled Self-Audit and event statistics (2026-11-08)
 
 - Reworked Watch notifications: regular signals are merged into a single owner-only digest, default once every 24 hours; configurable through `/jf_ai_schedule watch 1..24` or `JF_AI_WATCH_DIGEST_INTERVAL_HOURS`.

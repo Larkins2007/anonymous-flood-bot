@@ -1,0 +1,36 @@
+Justice Faite Manager 0.15.1 — test results
+Date: 2026-11-08
+
+Compilation
+----------
+- `python -m compileall -q .`: PASS.
+
+Changed-area tests
+------------------
+- `tests/test_ai.py`: PASS, including role recognition without message-level sender_tag, persistent aliases across requests, internal-rank / character-role separation, concise voice and adaptive token budget.
+- `tests/test_console.py`: PASS, including additive store initialization.
+- `tests/test_manager.py`: PASS.
+- `tests/test_startup_safety.py`: PASS.
+- `tests/test_ai_analytics.py`: PASS (run with `PYTHONPATH=tests/stubs`; expected negative-path simulated Telegram delivery failure is logged).
+- `tests/test_justice_core.py`: PASS.
+
+Full offline module coverage
+----------------------------
+- The runner's static entrypoint audit found every test_* function connected in all 32 modules.
+- All 32 modules passed in split offline runs (the initial 26 modules through `test_economy.py`, followed by the remaining 6 modules).
+- A single uninterrupted `python tests/run_all.py` execution hit the outer 120-second command limit after `test_economy.py`; it did not print its final aggregate line. The remaining modules were executed and passed separately. Do not interpret this as one uninterrupted 32/32 runner completion.
+
+Local database validation
+-------------------------
+- Checked the supplied compressed SQLite backup without changing it.
+- 32 active `group_members` records had assigned roles; all 32 matched the local `role_catalog`.
+- The old `jf_chat_message_log` table had no `sender_tag` column. This confirms why the earlier message-level tag gate prevented role context from resolving.
+- The 0.15.1 context builder resolved the selected active participant's assigned role and a stable local alias. Its provider context did not contain the participant's raw Telegram user ID.
+- No production database was migrated or modified; validation used a disposable copy.
+
+Not tested
+----------
+- Live Groq response quality, provider latency or token billing.
+- Live Telegram delivery, group traffic, member-role synchronization after live changes.
+- Render deployment, persistent disk durability or long-running concurrency/load.
+- No commit, push, production migration or deployment was performed.
