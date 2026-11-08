@@ -11,7 +11,7 @@ from typing import Optional
 GROUP_TYPES = {"group", "supergroup"}
 MAX_TITLE, MAX_BODY = 40, 3500
 COMMANDS = (
-    "создать клан", "клан вступить", "выйти из клана", "клан изменить", "мой клан", "удалить клан", "кланы", "участники клана",
+    "создать клан", "клан вступить", "выйти из клана", "клан изменить", "мой клан", "удалить клан", "кланы", "каталог сообществ", "участники клана",
     "создать кружок", "кружок вступить", "выйти из кружка", "кружок основа", "кружок изменить",
     "участники кружка", "мои кружки", "удалить кружок", "кружки", "+клан", "-клан", "+кружок", "-кружок",
     "+заметка", "~заметка", "~название заметки", "-заметка", "текст заметки", "заметки", "заметка",
@@ -172,9 +172,12 @@ class Community:
             r = self.store.run(lambda c: c.execute("""SELECT cl.*,COUNT(allm.user_id) AS n FROM jf_community_clan_members mine JOIN jf_community_clans cl ON cl.id=mine.clan_id LEFT JOIN jf_community_clan_members allm ON allm.clan_id=cl.id AND allm.chat_id=cl.chat_id WHERE mine.chat_id=? AND mine.user_id=? GROUP BY cl.id""", (chat_id,uid)).fetchone())
             if not r: return await self.reply(m, "Ты пока не состоишь в клане.")
             return await self.reply(m, f"<b>{esc(r['name'])}</b> · №{r['id']}\nУчастников: {r['n']}\nСоздатель: <code>{r['owner_id']}</code>\n{esc(r['description'])}")
-        if cmd == "кланы":
+        if cmd in {"кланы", "каталог сообществ"}:
             rows = self.store.run(lambda c: c.execute("""SELECT cl.id,cl.name,COUNT(mem.user_id) AS n FROM jf_community_clans cl LEFT JOIN jf_community_clan_members mem ON mem.chat_id=cl.chat_id AND mem.clan_id=cl.id WHERE cl.chat_id=? GROUP BY cl.id ORDER BY cl.id DESC LIMIT 50""", (chat_id,)).fetchall())
-            return await self.reply(m, "<b>Кланы</b>\n" + ("\n".join(f"<code>{r['id']}</code> · <b>{esc(r['name'])}</b> · {r['n']} уч." for r in rows) or "Кланов пока нет."))
+            circles = self.store.run(lambda c: c.execute("""SELECT cr.id,cr.name,COUNT(mem.user_id) AS n FROM jf_community_circles cr LEFT JOIN jf_community_circle_members mem ON mem.chat_id=cr.chat_id AND mem.circle_id=cr.id WHERE cr.chat_id=? GROUP BY cr.id ORDER BY cr.id DESC LIMIT 50""", (chat_id,)).fetchall())
+            clans_text = "\n".join(f"Клан <code>{r['id']}</code> · <b>{esc(r['name'])}</b> · {r['n']} уч." for r in rows) or "Кланов пока нет."
+            circles_text = "\n".join(f"Кружок <code>{r['id']}</code> · <b>{esc(r['name'])}</b> · {r['n']} уч." for r in circles) or "Кружков пока нет."
+            return await self.reply(m, "<b>Каталог сообществ этого чата</b>\n\n<b>Кланы</b>\n" + clans_text + "\n\n<b>Кружки</b>\n" + circles_text)
         if cmd == "участники клана":
             try: cid=int(args.split()[0])
             except Exception: return await self.reply(m,"Формат: <code>Участники клана 12</code>")

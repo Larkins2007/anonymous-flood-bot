@@ -220,6 +220,15 @@ JF_RAFFLES = jf_raffles.register(dp, bot=bot, F=F, db_path=DB_PATH, manager=JF_M
 import jf_clean
 JF_CLEAN = jf_clean.register(dp, bot=bot, F=F, db_path=DB_PATH, manager=JF_MANAGER, lock=DB_LOCK)
 
+# Persistent community economy: one SQLite source of truth for wallets,
+# inventory, jobs, education, farm timers, achievements and ledger entries.
+import jf_economy
+JF_ECONOMY = jf_economy.register(dp, bot=bot, F=F, db_path=DB_PATH, lock=DB_LOCK)
+
+# Advisory moderation votes: a poll can never issue a ban automatically.
+import jf_modvote
+JF_MODVOTE = jf_modvote.register(dp, bot=bot, F=F, db_path=DB_PATH, manager=JF_MANAGER, lock=DB_LOCK)
+
 # Register inline protection before the console archive middleware and the
 # later member-tag/activity observers. The lazy DB callback resolves after the
 # group_db_op function is defined; register() itself performs no DB writes.
@@ -6963,6 +6972,8 @@ async def setup_commands():
     network_command = BotCommand(command="jf_network", description="🌐 Сетка чатов")
     raffles_command = BotCommand(command="jf_raffles", description="🎉 Бесплатные розыгрыши")
     clean_command = BotCommand(command="jf_clean", description="🧹 Чистка сообщений")
+    economy_command = BotCommand(command="jf_economy", description="💠 Экономика, профессии и ферма")
+    modvote_command = BotCommand(command="jf_modvote", description="🗳 Рекомендательные голосования модерации")
     console_command = BotCommand(command="jf_console", description="🧠 Личная консоль владельца")
     memory_command = BotCommand(command="jf_memory", description="🗂️ Память и требования проекта")
     memory_save_command = BotCommand(command="jf_memory_save", description="📝 Сохранить блок памяти проекта")
@@ -6972,7 +6983,7 @@ async def setup_commands():
     inline_guard_command = BotCommand(command="inline_guard", description="🛡️ Защита от inline-ботов")
     group_extras = (profile_command, reputation_command, reports_command, timers_command,
                     automod_command, fun_command, network_command, raffles_command,
-                    clean_command, stats_command, chatconfig_command, community_command,
+                    clean_command, economy_command, modvote_command, stats_command, chatconfig_command, community_command,
                     manager_command)
     for item in group_extras:
         _append_menu_if_allowed(group_user, item, level="members", chat_type="supergroup")
@@ -9944,6 +9955,8 @@ async def main():
     JF_NETWORK.init()
     JF_RAFFLES.init()
     JF_CLEAN.init()
+    JF_ECONOMY.init()
+    JF_MODVOTE.init()
     JF_CONSOLE.init()
     init_justice_features_db()
     seed_birthday_directory()
