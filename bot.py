@@ -261,9 +261,28 @@ JF_AI.owner_id = int(ADMIN_ID or 0)
 # Owner-only AI analytics reads the existing flood archive; it installs no
 # additional message collector and stores generated reports separately.
 import jf_ai_analytics
+import jf_registry_audit
 JF_AI_ANALYTICS = jf_ai_analytics.register(
     dp, bot=bot, F=F, store=JF_CONSOLE.store, owner_id=ADMIN_ID, chat_id=PRIMARY_CHAT_ID
 )
+
+JF_REGISTRY_AUDIT = jf_registry_audit.register(
+    dp, bot=bot, F=F, owner_id=ADMIN_ID, db_path=DB_PATH, version="0.23.0",
+)
+
+# Runtime dispatcher audit from the parallel 0.16.0 implementation.  It probes
+# the actual installed aiogram filters and complements the static Self-Audit.
+import jf_registry
+JF_REGISTRY = jf_registry.register(
+    dp, bot, F, owner_id=ADMIN_ID, version=jf_console.PROJECT_VERSION,
+    project_dir=os.path.dirname(os.path.abspath(__file__)),
+)
+
+# One lifecycle owner tracks task creation, completion, cancellation and restart
+# metadata. Durable work is replayed by its domain queue/recovery worker.
+import jf_task_manager
+import jf_db
+TASK_MANAGER = jf_task_manager.TaskManager(DB_PATH, DB_LOCK)
 
 
 DELIVERY_QUEUE = None
@@ -487,18 +506,18 @@ def init_db():
 
 def migrate_db():
     def migrate(conn):
-        user_cols = {row["name"] for row in conn.execute("PRAGMA table_info(users)").fetchall()}
-        report_cols = {row["name"] for row in conn.execute("PRAGMA table_info(reports)").fetchall()}
+        jf_db.ensure_columns(conn, "users", [
+            ("reports_count", "INTEGER NOT NULL DEFAULT 0"),
+            ("blocked", "INTEGER NOT NULL DEFAULT 0"),
+            ("telegram_blocked", "INTEGER NOT NULL DEFAULT 0"),
+        ])
+        added_report_cols = set(jf_db.ensure_columns(conn, "reports", [
+            ("target_key", "TEXT NOT NULL DEFAULT ''"),
+            ("delivery_status", "TEXT NOT NULL DEFAULT 'pending'"),
+            ("admin_message_ids", "TEXT NOT NULL DEFAULT '[]'"),
+        ]))
 
-        if "reports_count" not in user_cols:
-            conn.execute("ALTER TABLE users ADD COLUMN reports_count INTEGER NOT NULL DEFAULT 0")
-        if "blocked" not in user_cols:
-            conn.execute("ALTER TABLE users ADD COLUMN blocked INTEGER NOT NULL DEFAULT 0")
-        if "telegram_blocked" not in user_cols:
-            conn.execute("ALTER TABLE users ADD COLUMN telegram_blocked INTEGER NOT NULL DEFAULT 0")
-
-        if "target_key" not in report_cols:
-            conn.execute("ALTER TABLE reports ADD COLUMN target_key TEXT NOT NULL DEFAULT ''")
+        if "target_key" in added_report_cols:
             rows = conn.execute(
                 "SELECT id, target_text, target_user_id FROM reports"
             ).fetchall()
@@ -526,14 +545,6 @@ def migrate_db():
                 (row["reporter_id"], row["target_key"], row["keep_id"]),
             )
 
-        if "delivery_status" not in report_cols:
-            conn.execute(
-                "ALTER TABLE reports ADD COLUMN delivery_status TEXT NOT NULL DEFAULT 'pending'"
-            )
-        if "admin_message_ids" not in report_cols:
-            conn.execute(
-                "ALTER TABLE reports ADD COLUMN admin_message_ids TEXT NOT NULL DEFAULT '[]'"
-            )
 
         conn.execute(
             """
@@ -5163,21 +5174,14 @@ async def group_confirm(callback: CallbackQuery):
         )
 
     with suppress(Exception):
-        await callback.message.edit_reply_markup(
-            reply_markup=InlineKeyboardMarkup(
-                inline_keyboard=[[
-                    InlineKeyboardButton(
-                        text="✓ Правила подтверждены",
-                        callback_data=f"fm:confirmed:{chat_id}:{target_user_id}",
-                    )
-                ]]
-            )
-        )
+        # Confirmation is final; remove the one-shot button instead of
+        # rendering an unhandled fm:confirmed callback as a dead button.
+        await callback.message.edit_reply_markup(reply_markup=None)
 
     await callback.answer("Правила подтверждены. Роль участника назначается отдельно.")
 
 
-@dp.message(F.chat.type.in_({"group", "supergroup"}), F.from_user.is_bot == False, F.text.regexp(r"(?is)^\s*(?!/)(?!калл(?:\s|$))(?!рестники(?:\s|$))(?!(?:выдать|снять)\s+рест(?:\s|$)).+"))
+@dp.message(F.chat.type.in_({"group", "supergroup"}), F.from_user.is_bot == False, F.text.regexp(r"(?is)^\s*(?!/)(?!калл(?:\s|$))(?!рестники(?:\s|$))(?!(?:взять|выдать|снять)\s+рест(?:\s|$)).+"))
 async def group_passive_member_sync(message: Message):
     if not message.from_user or message.from_user.is_bot or has_bot_command_entity(message):
         return
@@ -6262,7 +6266,7 @@ async def game_poll_callback(callback: CallbackQuery):
             await bot.pin_chat_message(callback.message.chat.id,msg.message_id,disable_notification=True)
         with suppress(Exception):
             await callback.message.delete()
-        asyncio.create_task(expire_game_poll(pid,minutes*60))
+        TASK_MANAGER.spawn(expire_game_poll(pid,minutes*60))
         await safe_callback_answer(callback,'Опрос запущен.')
         return
 
@@ -6434,7 +6438,7 @@ async def expire_game_poll(poll_id, seconds):
         ))
         with suppress(Exception):
             await bot.pin_chat_message(int(poll["chat_id"]), msg.message_id, disable_notification=True)
-        asyncio.create_task(expire_game_poll(tie_id, tie_minutes * 60))
+        TASK_MANAGER.spawn(expire_game_poll(tie_id, tie_minutes * 60))
         await bot.send_message(
             int(poll["chat_id"]),
             "◈ Tiebreak\n\n" + "\n".join(f"• {g['name']} — {counts.get(int(g['id']), 0)}" for g in tie_games)
@@ -6829,7 +6833,7 @@ async def mafia_cmd(message: Message):
         group_db_op(lambda conn:(conn.execute("UPDATE mafia_games SET lobby_message_id=? WHERE id=?",(sent.message_id,game["id"])),conn.commit()))
         if cmdcfg.get_bool("mafia", "pin_lobby"):
             await _pin_lobby_message(message.chat.id,sent.message_id)
-        asyncio.create_task(expire_mafia_lobby(message.chat.id, game["id"], sent.message_id))
+        TASK_MANAGER.spawn(expire_mafia_lobby(message.chat.id, game["id"], sent.message_id))
     else:
         if game["lobby_message_id"]:
             await _update_mafia_lobby_message(game)
@@ -9292,7 +9296,7 @@ async def spy_callback(callback: CallbackQuery):
         # Long network operations belong in a background task; otherwise the
         # client can remain stuck on the loading state and a slow DM can block
         # the whole launch handler.
-        asyncio.create_task(_spy_launch_game_task(game_id, int(callback.message.chat.id), int(callback.message.message_id)))
+        TASK_MANAGER.spawn(_spy_launch_game_task(game_id, int(callback.message.chat.id), int(callback.message.message_id)))
         return
 
     if action == "skip_discussion":
@@ -9944,6 +9948,8 @@ async def main():
     init_db()
     migrate_db()
     init_group_db()
+    # Create task inventory only after DB restore/validation, never before.
+    TASK_MANAGER.init()
     # The database has now passed recovery checks. Bind/initialize command
     # settings only after restoration, so a missing/corrupt DB cannot be
     # accidentally shadowed by import-time CREATE TABLE statements.
@@ -10004,10 +10010,10 @@ async def main():
     # Keep references so these long-running workers are not garbage-collected
     # and can be cancelled cleanly on shutdown (Render restarts).
     background_tasks = [
-        asyncio.create_task(_spy_recovery_worker(), name="spy-recovery"),
-        asyncio.create_task(JF_TIMERS.run_forever(), name="jf-timers"),
-        asyncio.create_task(JF_AI_ANALYTICS.run_forever(), name="jf-ai-analytics"),
-        asyncio.create_task(role_sync_worker(), name="jf-role-sync"),
+        TASK_MANAGER.spawn(_spy_recovery_worker(), name="spy-recovery"),
+        TASK_MANAGER.spawn(JF_TIMERS.run_forever(), name="jf-timers"),
+        TASK_MANAGER.spawn(JF_AI_ANALYTICS.run_forever(), name="jf-ai-analytics"),
+        TASK_MANAGER.spawn(role_sync_worker(), name="jf-role-sync"),
     ]
 
     DELIVERY_QUEUE = asyncio.Queue()
@@ -10052,26 +10058,27 @@ async def main():
             )
 
     http_runner = await start_http_server()
-    asyncio.create_task(game_poll_refresh_worker())
-    asyncio.create_task(game_poll_expiry_recovery_worker())
-    asyncio.create_task(mafia_expiry_recovery_worker())
-    asyncio.create_task(schedule_worker())
-    feature_maintenance_task = asyncio.create_task(feature_maintenance_worker(), name="justice-feature-maintenance")
-    console_maintenance_task = asyncio.create_task(JF_CONSOLE.run_forever(), name="justice-console-maintenance")
+    TASK_MANAGER.spawn(game_poll_refresh_worker())
+    TASK_MANAGER.spawn(game_poll_expiry_recovery_worker())
+    TASK_MANAGER.spawn(mafia_expiry_recovery_worker())
+    TASK_MANAGER.spawn(schedule_worker())
+    feature_maintenance_task = TASK_MANAGER.spawn(feature_maintenance_worker(), name="justice-feature-maintenance")
+    console_maintenance_task = TASK_MANAGER.spawn(JF_CONSOLE.run_forever(), name="justice-console-maintenance")
 
     delivery_tasks = [
-        asyncio.create_task(delivery_worker(i + 1), name=f"delivery-{i + 1}")
+        TASK_MANAGER.spawn(delivery_worker(i + 1), name=f"delivery-{i + 1}")
         for i in range(DELIVERY_WORKERS)
     ]
+    TASK_MANAGER.spawn(JF_RAFFLES.publication_worker(), name="raffle-publication-worker")
     broadcast_tasks = [
-        asyncio.create_task(broadcast_worker(i + 1), name=f"broadcast-{i + 1}")
+        TASK_MANAGER.spawn(broadcast_worker(i + 1), name=f"broadcast-{i + 1}")
         for i in range(BROADCAST_WORKERS)
     ]
 
     await enqueue_pending_notifications()
 
-    polling_task = asyncio.create_task(polling_loop(), name="telegram-polling")
-    fatal_task = asyncio.create_task(FATAL_EVENT.wait(), name="fatal-error-watcher")
+    polling_task = TASK_MANAGER.spawn(polling_loop(), name="telegram-polling")
+    fatal_task = TASK_MANAGER.spawn(FATAL_EVENT.wait(), name="fatal-error-watcher")
 
     try:
         done, _ = await asyncio.wait(
@@ -10119,6 +10126,7 @@ async def main():
             with suppress(asyncio.CancelledError, Exception):
                 await fatal_task
 
+        await TASK_MANAGER.cancel_all()
         logger.info("Stopping bot...")
         with suppress(Exception):
             await dp.stop_polling()

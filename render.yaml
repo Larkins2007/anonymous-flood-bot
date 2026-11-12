@@ -9,7 +9,7 @@ services:
       - key: BOT_TOKEN
         sync: false
       - key: ADMIN_ID
-        value: "1682289834"
+        sync: false
       - key: PRIMARY_CHAT_ID
         sync: false
       - key: JF_ALLOW_EMPTY_DB_BOOTSTRAP

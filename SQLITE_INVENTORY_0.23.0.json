@@ -1,0 +1,109 @@
+{
+  "count": 26,
+  "sites": [
+    {
+      "file": "bot.py",
+      "line": 391
+    },
+    {
+      "file": "jf_automod.py",
+      "line": 19
+    },
+    {
+      "file": "jf_chatconfig.py",
+      "line": 66
+    },
+    {
+      "file": "jf_clean.py",
+      "line": 14
+    },
+    {
+      "file": "jf_community.py",
+      "line": 57
+    },
+    {
+      "file": "jf_console.py",
+      "line": 133
+    },
+    {
+      "file": "jf_console.py",
+      "line": 1366
+    },
+    {
+      "file": "jf_console.py",
+      "line": 1500
+    },
+    {
+      "file": "jf_console.py",
+      "line": 1500
+    },
+    {
+      "file": "jf_db.py",
+      "line": 19
+    },
+    {
+      "file": "jf_db.py",
+      "line": 63
+    },
+    {
+      "file": "jf_economy.py",
+      "line": 81
+    },
+    {
+      "file": "jf_manager.py",
+      "line": 128
+    },
+    {
+      "file": "jf_modvote.py",
+      "line": 18
+    },
+    {
+      "file": "jf_network.py",
+      "line": 15
+    },
+    {
+      "file": "jf_pets.py",
+      "line": 57
+    },
+    {
+      "file": "jf_profiles.py",
+      "line": 27
+    },
+    {
+      "file": "jf_raffles.py",
+      "line": 15
+    },
+    {
+      "file": "jf_registry_audit.py",
+      "line": 357
+    },
+    {
+      "file": "jf_reports.py",
+      "line": 16
+    },
+    {
+      "file": "jf_reputation.py",
+      "line": 27
+    },
+    {
+      "file": "jf_social.py",
+      "line": 135
+    },
+    {
+      "file": "jf_stats.py",
+      "line": 26
+    },
+    {
+      "file": "jf_timers.py",
+      "line": 23
+    },
+    {
+      "file": "tools/sqlite_lock_probe.py",
+      "line": 9
+    },
+    {
+      "file": "tools/sqlite_lock_probe.py",
+      "line": 10
+    }
+  ]
+}

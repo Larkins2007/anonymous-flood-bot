@@ -1,0 +1,4 @@
+writer_wait_ms=231.56
+hold_target_ms=200
+timeout_ms=2000
+result=acquired

@@ -76,6 +76,12 @@ class Spec:
     custom: bool = False
     feature: bool = False           # не команда, а «функция» (приветствие, поздравления…)
     aliases: tuple = ()             # нормализуемые текстовые алиасы для центральной проверки доступа
+    # --- 0.16.0 machine-readable contract (optional, backward-compatible) ---
+    module: str = ""                # owning Python module, e.g. "jf_manager"
+    handler_id: str = ""            # stable handler identity, e.g. "JF_MANAGER.handle"
+    callback_prefixes: tuple = ()   # callback_data prefixes owned by this command
+    dependencies: tuple = ()        # required module/table/env keys
+    registration_status: str = "declared"  # declared | registered | orphan | unknown
 
 
 CATEGORIES = {
@@ -97,18 +103,185 @@ CATEGORIES = {
     "anon": ("🤫", "Связь с админами"),
     "custom": ("✨", "Свои команды"),
     "system": ("⚙️", "Система"),
+    "economy": ("💰", "Экономика"),
 }
 
 REGISTRY: dict[str, Spec] = {}
 
+# Runtime metadata attached after registration (mutable side-channel).
+COMMAND_META: dict[str, dict] = {}
+
+# Legacy internal gate keys used by modules → canonical REGISTRY keys.
+LEGACY_KEY_MAP: dict[str, str] = {
+    "mod_add": "mgr_mod_add",
+    "mod_remove": "mgr_mod_remove",
+    "mod_promote": "mgr_mod_promote",
+    "mod_demote": "mgr_mod_demote",
+    "mod_list": "mgr_mod_list",
+    "who_assigned": "mgr_who_assigned",
+    "mod_log": "mgr_mod_log",
+    "ban": "mgr_ban",
+    "unban": "mgr_unban",
+    "kick": "mgr_kick",
+    "warn": "mgr_warn",
+    "warnings": "mgr_warnings",
+    "warn_view": "mgr_warnings",
+    "warn_list": "mgr_warn_list",
+    "warn_remove": "mgr_warn_remove",
+    "mute": "mgr_mute",
+    "unmute": "mgr_unmute",
+    "mute_list": "mgr_mute_list",
+    "mute_check": "mgr_mute_check",
+    "ban_list": "mgr_ban_list",
+    "reason": "mgr_reason",
+    "access_view": "mgr_access_view",
+    "access_view_self": "mgr_access_view_self",
+    "access_edit": "mgr_access_set",
+    "access_log": "mgr_access_log",
+    "setting_warn_limit": "mgr_setting_warn_limit",
+    "setting_warn_period": "mgr_setting_warn_period",
+    "setting_warn_ban": "mgr_setting_warn_ban",
+    "setting_mute_period": "mgr_setting_mute_period",
+    "setting_ban_period": "mgr_setting_ban_period",
+    "rank_labels": "mgr_rank_labels",
+    "rank_label_set": "mgr_rank_labels",
+    "rank_labels_reset": "mgr_rank_labels_reset",
+}
+
+
+def canonical_key(key: str) -> str:
+    """Resolve a legacy or alias gate key to the canonical REGISTRY key."""
+    raw = str(key or "").strip()
+    if not raw:
+        return raw
+    if raw in REGISTRY:
+        return raw
+    mapped = LEGACY_KEY_MAP.get(raw)
+    if mapped and mapped in REGISTRY:
+        return mapped
+    return raw
+
 
 def register(spec: Spec) -> Spec:
     REGISTRY[spec.key] = spec
+    meta = COMMAND_META.setdefault(spec.key, {})
+    if spec.module:
+        meta["module"] = spec.module
+    if spec.handler_id:
+        meta["handler_id"] = spec.handler_id
+    if spec.callback_prefixes:
+        meta["callback_prefixes"] = tuple(spec.callback_prefixes)
+    if spec.dependencies:
+        meta["dependencies"] = tuple(spec.dependencies)
+    meta.setdefault("registration_status", spec.registration_status or "declared")
     return spec
+
+
+def set_command_meta(key: str, **kwargs) -> None:
+    """Attach or update runtime metadata for a registered command."""
+    meta = COMMAND_META.setdefault(key, {})
+    for k, v in kwargs.items():
+        if v is not None:
+            meta[k] = v
+
+
+def get_command_meta(key: str) -> dict:
+    return dict(COMMAND_META.get(key) or {})
 
 
 def unregister(key: str) -> None:
     REGISTRY.pop(key, None)
+    COMMAND_META.pop(key, None)
+
+
+def list_registry(*, category: Optional[str] = None, enabled_only: bool = False) -> list[dict]:
+    """Machine-readable snapshot of every Spec + metadata."""
+    rows = []
+    for key, spec in sorted(REGISTRY.items()):
+        if category and spec.category != category:
+            continue
+        enabled = True
+        try:
+            enabled = is_enabled(key)
+        except Exception:
+            pass
+        if enabled_only and not enabled:
+            continue
+        meta = get_command_meta(key)
+        access_val = spec.access
+        where_val = spec.where
+        try:
+            access_val = get_str(key, "access")
+            where_val = get_str(key, "where")
+        except Exception:
+            pass
+        rows.append({
+            "key": key,
+            "title": spec.title,
+            "emoji": spec.emoji,
+            "category": spec.category,
+            "access": access_val,
+            "where": where_val,
+            "enabled": enabled,
+            "feature": bool(spec.feature),
+            "custom": bool(spec.custom),
+            "aliases": list(spec.aliases or ()),
+            "triggers": list(spec.triggers or ()),
+            "module": meta.get("module") or spec.module or "",
+            "handler_id": meta.get("handler_id") or spec.handler_id or "",
+            "callback_prefixes": list(meta.get("callback_prefixes") or spec.callback_prefixes or ()),
+            "dependencies": list(meta.get("dependencies") or spec.dependencies or ()),
+            "registration_status": meta.get("registration_status") or spec.registration_status or "declared",
+        })
+    return rows
+
+
+def describe_command(key: str) -> Optional[dict]:
+    """Full description of one command by canonical or legacy key."""
+    canon = canonical_key(key)
+    if canon not in REGISTRY:
+        return None
+    for row in list_registry():
+        if row["key"] == canon:
+            out = dict(row)
+            out["canonical_key"] = canon
+            out["requested_key"] = key
+            out["legacy_mapped"] = canon != key
+            return out
+    return None
+
+
+def find_orphans() -> dict:
+    """Find Specs without handler metadata and legacy keys pointing to missing Specs."""
+    specs_without_handler = []
+    for key, spec in sorted(REGISTRY.items()):
+        if spec.feature or spec.custom:
+            continue
+        meta = get_command_meta(key)
+        handler = meta.get("handler_id") or spec.handler_id or ""
+        module = meta.get("module") or spec.module or ""
+        if not handler and not module:
+            specs_without_handler.append(key)
+    unknown_legacy = sorted(
+        leg for leg, canon in LEGACY_KEY_MAP.items()
+        if canon not in REGISTRY
+    )
+    return {
+        "specs_without_handler_meta": specs_without_handler,
+        "legacy_keys_pointing_missing_spec": unknown_legacy,
+        "registry_size": len(REGISTRY),
+        "meta_size": len(COMMAND_META),
+    }
+
+
+def find_unregistered_gates(gate_keys: list) -> list:
+    """Return gate keys that cannot be resolved to a REGISTRY entry."""
+    missing = []
+    for raw in gate_keys:
+        canon = canonical_key(str(raw))
+        if canon not in REGISTRY:
+            missing.append(str(raw))
+    return sorted(set(missing))
 
 
 def common_params(spec: Spec) -> tuple:

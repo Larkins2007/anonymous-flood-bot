@@ -1,4 +1,72 @@
+## 0.23.0 — Consolidated reliability and release gate (2026-11-12)
+
+- Consolidated the two supplied 0.16.0 code lines, retaining the runtime handler registry audit and the static Self-Audit.
+- Added `jf_db.py`: one connection helper, identifier-validated/idempotent additive migrations, SQLite integrity checks and atomic online backup.
+- Migrated core `bot.migrate_db()` additions and the task inventory store to the shared SQLite primitives; legacy connection sites remain inventoried for incremental migration rather than mass-rewritten.
+- Added static SQLite connection inventory and a disposable writer-lock wait probe.
+- Added a durable raffle publication outbox. Explicit Telegram rejections are retried with backoff; ambiguous transport outcomes and interrupted sends become `uncertain` and are not blindly resent, preventing automatic duplicate announcements.
+- Added the raffle publication worker to the supervised task manager.
+- Added release documentation, upgrade guidance, acceptance checklist, SHA-256 manifest and an offline release gate.
+- Offline verification: 40/40 test modules pass, including migration idempotency, backup restore integrity, raffle retry/no-duplicate handling and task lifecycle checks.
+- Live Telegram, Render, production database restore and Groq provider checks remain external acceptance gates and were not performed.
+
+## 0.17.0 — Background task lifecycle (2026-11-12)
+
+- Added `jf_task_manager.py`, a single task supervisor for bot-owned asyncio tasks.
+- All `asyncio.create_task` calls in `bot.py` now route through `TASK_MANAGER.spawn`.
+- Added durable `jf_background_tasks` inventory with purpose, stop policy, restart policy, timestamps, terminal status and errors.
+- Startup marks leftover `running` rows as `interrupted`; arbitrary coroutine objects are not falsely claimed to resume. Existing durable domain queues and recovery workers remain responsible for replaying pending work.
+- Shutdown cancels and awaits every task tracked by the manager.
+
+## 0.16.1 — P1 hardening follow-up (2026-11-12)
+
+### Fixed
+- Removed the hard-coded owner Telegram ID from `render.yaml`; `ADMIN_ID` must be configured as a secret/environment value. Startup already stops with an explicit error when it is absent or invalid.
+- Excluded `взять рест` from the passive group-message handler so it can reach the self-rest feature handler.
+- Removed the dead `fm:confirmed:` button after successful rules confirmation; the one-shot confirmation keyboard is cleared.
+- Bumped runtime registry version to 0.16.1.
+
+### Tests
+- Added regression checks for Render owner configuration, passive rest routing and removal of the unhandled confirmation callback.
+
 # Changelog
+
+## 0.16.0 — Core Audit & Command Registry (2026-11-11)
+
+### Added
+- Machine-readable command contract on `cmdcfg.Spec` (module, handler_id, callback_prefixes, dependencies, registration_status).
+- `COMMAND_META`, `LEGACY_KEY_MAP`, `canonical_key()`, `list_registry()`, `describe_command()`, `find_orphans()`, `find_unregistered_gates()`.
+- New module `jf_registry_audit.py`: registry map, callback inventory, legacy-gate check, dependency check, SQLite schema probe, background-task inventory.
+- Owner-only `/jf_self_audit` (private chat): read-only Self-Audit report in HTML, no automatic mutations.
+- Tests: `test_registry_audit.py`, `test_self_audit_core.py`, `test_disabled_bypass.py`, `test_callback_map.py`, `test_p1_fixes_0_16.py`.
+
+### Fixed (P1)
+- URL whitelist in `jf_chatconfig.py` no longer uses SQL `LIKE` prefix matching; uses `urlparse` origin (scheme/host/port) + optional path prefix. Blocks host spoofing and userinfo tricks.
+- Raffle finish message in `jf_raffles.py` reports publication failure honestly when `send_message` fails; winners remain saved.
+- `jf_fun.py` `reply()` sends Telegram HTML with `parse_mode="HTML"`.
+
+### Changed
+- `jf_manager._gate` uses central `cmdcfg.canonical_key` instead of a local mapping dict.
+- `VERSION` / `PROJECT_VERSION` → 0.16.0.
+
+### Safety
+- Self-Audit never changes settings, permissions, data or source code.
+- All existing 32 offline test modules remain green; 5 new modules added (37 total).
+
+
+# Changelog
+
+## 0.15.3 — Advisor / Watch persistence and delivery reliability (2026-11-11)
+
+- Added the persistent `jf_ai_watch_interactions` table for local actor→recipient counters and timestamps. It stores no message text, usernames, display names or evidence; Groq receives only temporary aliases and aggregate counts.
+- Completed the additive Watch migration with `occurrence_count`, backfilled from legacy `repeat_count` and retained all earlier evidence. `last_seen_at` is backfilled from `created_at` when absent.
+- Implemented conservative local signals for explicit promotional Telegram links and disclosure of another participant's contact details. Added a bounded multi-message 4.4 stream signal; one long message or a bare link/contact does not trigger it. Signals remain owner-review evidence, never automatic sanctions.
+- Preserved rules 4.3 and 4.5 and their existing behavior. Added an explicit 4.6 technical-failure review note for 4.4 signals and explicit prompt protection for constructive criticism under 16.6 / 16.8.
+- Standardized durable delivery retries for Advisor reports and Watch notices: 1, 5, 15 and 60 minutes, five attempts maximum. After the fifth failure the record remains in the database as failed, with no further delivery loop; a one-time owner notice is retried until successfully sent and marked.
+- Added terminal delivery failures to `/jf_ai_audit`; `/jf_ai_watch` shows occurrence and delivery counts. Confirmed `/jf_ai_watch_clear confirm` now clears both Watch records and interaction counters, but does not touch the chat archive, edit history or reports.
+- Added bounded backoff after semantic JSON/provider failures and a JSON-object response mode for Groq. Flood/owner memory compaction now claims its next run window before provider I/O, preventing repeated calls when the provider returns an empty result or quota error.
+- Fixed two stale test fixtures in `test_ai.py`: one sensitive example was not relevant to the test query, and one role-context example fell outside the configured 24-hour window. The production redaction and role-context logic were not weakened.
+- Added migration, interaction privacy, local-detector, 4.4 exception, retry schedule and terminal-notice regression tests. No new Render environment variables. No GitHub `main` changes, commits, pushes or deployment.
 
 ## 0.15.2 — Provider billing diagnostics (2026-11-09)
 

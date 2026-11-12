@@ -1,5 +1,7 @@
 """Telegram chat configuration and conservative link filtering for Justice Faite."""
 from __future__ import annotations
+
+from urllib.parse import urlparse
 import re
 import sqlite3
 import threading
@@ -21,6 +23,33 @@ URL_PATTERN = r"(?isu)^.*(?:https?://|www\.)[^\s<>]+|^.*(?:t\.me|telegram\.me)/[
 
 
 def _now(): return datetime.now(timezone.utc).isoformat()
+
+
+
+def _normalize_url_for_match(value: str):
+    """Return dict(scheme, host, port, path) or None if unusable."""
+    raw = (value or "").strip()
+    if not raw:
+        return None
+    if "://" not in raw:
+        raw = "https://" + raw
+    try:
+        parsed = urlparse(raw)
+    except Exception:
+        return None
+    host = (parsed.hostname or "").casefold().strip(".")
+    if not host:
+        return None
+    if parsed.username or parsed.password:
+        return None
+    scheme = (parsed.scheme or "https").casefold()
+    if scheme not in ("http", "https"):
+        return None
+    port = parsed.port
+    if port is None:
+        port = 443 if scheme == "https" else 80
+    path = parsed.path or "/"
+    return {"scheme": scheme, "host": host, "port": int(port), "path": path}
 
 
 def _url(value):
@@ -58,8 +87,30 @@ class Store:
         self.run(lambda c: c.execute("INSERT INTO jf_chatconfig_settings VALUES(?,?,?,?,?) ON CONFLICT(chat_id,key) DO UPDATE SET value=excluded.value,updated_by=excluded.updated_by,updated_at=excluded.updated_at", (chat_id,key,str(value),actor,_now())))
         self.run(lambda c: c.execute("INSERT INTO jf_chatconfig_audit(chat_id,actor_id,action,details,created_at) VALUES(?,?,?,?,?)", (chat_id,actor,"setting",f"{key}={value}",_now())))
     def allowed(self, chat_id, url):
-        u = _url(url)
-        return bool(self.run(lambda c: c.execute("SELECT 1 FROM jf_chatconfig_whitelist WHERE chat_id=? AND ? LIKE url || '%' LIMIT 1", (chat_id,u)).fetchone()))
+        """Allow only when the candidate URL's origin matches a whitelist entry.
+
+        Uses urlparse (scheme + hostname + port). No SQL LIKE wildcards.
+        Subdomains are NOT implied; each host must be listed explicitly.
+        """
+        candidate = _normalize_url_for_match(url)
+        if not candidate:
+            return False
+        rows = self.run(lambda c: c.execute(
+            "SELECT url FROM jf_chatconfig_whitelist WHERE chat_id=?", (chat_id,)
+        ).fetchall()) or []
+        for (entry,) in rows:
+            allowed = _normalize_url_for_match(entry)
+            if not allowed:
+                continue
+            if (candidate["scheme"] == allowed["scheme"]
+                    and candidate["host"] == allowed["host"]
+                    and candidate["port"] == allowed["port"]):
+                # Optional path prefix: entry path must be a prefix of candidate path
+                ep = allowed["path"]
+                cp = candidate["path"]
+                if ep in ("", "/") or cp == ep or cp.startswith(ep.rstrip("/") + "/"):
+                    return True
+        return False
 
 
 class ChatConfig:

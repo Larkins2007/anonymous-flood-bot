@@ -21,7 +21,7 @@ EXISTING_ALIASES = {
     "rest": ("выдать рест", "/rest", "/jf_rest"),
     "rest_self": ("взять рест", "/take_rest"),
     "unrest": ("снять рест", "/unrest"),
-    "restlist": ("рестники", "/jf_restlist"),
+    "restlist": ("рестники", "/jf_restlist", "/restlist", "restlist"),
     "warn": ("/jf_warn",),
     "warnings": ("/jf_warnings",),
     "warn_remove": ("/jf_warn_remove",),
@@ -308,6 +308,8 @@ EXTRA = [
     ("memory_save", "Сохранить память", "📝", "system", ("/jf_memory_save",), "owner", "private", "Добавить новую запись в память проекта."),
     ("memory_search", "Поиск по памяти", "🔎", "system", ("/jf_memory_search",), "owner", "private", "Найти сохранённые сообщения и требования."),
     ("chatlog_status", "Архив переписки флуда", "📚", "system", ("/jf_chatlog",), "owner", "private", "Показать статистику архива сообщений флуда и технических логов."),
+    ("registry_audit", "Аудит реестра команд", "🧾", "system", ("/jf_registry",), "owner", "private", "Только чтение: сверить каталог команд с реально зарегистрированными обработчиками и вывести отчёт."),
+    ("inline_guard", "Защита от inline-спама", "🛡️", "system", ("/inline_guard",), "owner", "private", "Настроить защиту от сообщений inline-ботов в личной панели владельца."),
 
     # Free community raffles and bounded cleanup.
     ("raffles_help", "Справка по розыгрышам", "🎉", "events", ("/jf_raffles",), "members", "Справка по бесплатным розыгрышам."),

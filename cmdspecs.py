@@ -130,7 +130,7 @@ def load() -> None:
     S(Spec(
         "restlist", "Рестники", "📋", "community",
         "Кто сейчас на ресте и до какого числа.",
-        triggers=("рестники", "/jf_restlist"), access="members", access_options=("owner", "admins", "members", "all"),
+        triggers=("рестники", "/jf_restlist", "/restlist", "restlist"), access="members", access_options=("owner", "admins", "members", "all"),
         where="both", cooldown_default=15,
         menu=(("jf_restlist", "📋 Кто на ресте"),),
         params=(

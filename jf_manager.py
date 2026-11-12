@@ -492,30 +492,8 @@ class Manager:
         # policy instead of falling back to the retired per-chat access table.
         if cmdcfg.access_was_checked(message):
             return True
-        central_keys = {
-            "mod_add": "mgr_mod_add", "mod_remove": "mgr_mod_remove",
-            "mod_promote": "mgr_mod_promote", "mod_demote": "mgr_mod_demote",
-            "rank_label_set": "mgr_rank_labels",
-            "mod_list": "mgr_mod_list", "who_assigned": "mgr_who_assigned",
-            "mod_log": "mgr_mod_log", "ban": "mgr_ban", "unban": "mgr_unban",
-            "kick": "mgr_kick", "warn": "mgr_warn", "warnings": "mgr_warnings",
-            "warn_view": "mgr_warnings", "warn_list": "mgr_warn_list",
-            "warn_remove": "mgr_warn_remove",
-            "mute": "mgr_mute", "unmute": "mgr_unmute", "mute_list": "mgr_mute_list",
-            "mute_check": "mgr_mute_check", "ban_list": "mgr_ban_list",
-            "reason": "mgr_reason", "access_view": "mgr_access_view",
-            "access_view_self": "mgr_access_view_self",
-            "access_edit": "mgr_access_set", "access_log": "mgr_access_log",
-            "setting_warn_limit": "mgr_setting_warn_limit",
-            "setting_warn_period": "mgr_setting_warn_period",
-            "setting_warn_ban": "mgr_setting_warn_ban",
-            "setting_mute_period": "mgr_setting_mute_period",
-            "setting_ban_period": "mgr_setting_ban_period",
-            "rank_labels": "mgr_rank_labels",
-            "rank_label_set": "mgr_rank_labels",
-            "rank_labels_reset": "mgr_rank_labels_reset",
-        }
-        central_key = central_keys.get(key)
+        # 0.16.0: legacy → canonical mapping lives in cmdcfg.LEGACY_KEY_MAP.
+        central_key = cmdcfg.canonical_key(key)
         if central_key in cmdcfg.REGISTRY:
             return await cmdcfg.gate(message, central_key, notify=not silent, commit=False)
         rank = await self._rank(int(message.chat.id), int(message.from_user.id))

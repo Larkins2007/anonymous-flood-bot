@@ -1,0 +1,45 @@
+JUSTICE FAITE MANAGER — TEST RESULTS 0.15.3
+Date: 2026-11-11
+Scope: Advisor / Watch persistence, retries, privacy and provider resilience.
+
+1. Full regression
+Command: python3 tests/run_all.py
+Result: PASS — 32/32 test modules passed; process exit code 0.
+The runner's entrypoint audit confirmed that every test_* function is invoked in all 32 test modules.
+
+2. Targeted checks
+- python3 tests/test_ai.py — PASS.
+- python3 tests/test_console.py — PASS.
+- PYTHONPATH=tests/stubs python3 tests/test_ai_analytics.py — PASS.
+- PYTHONPATH=tests/stubs python3 tests/test_justice_core.py — PASS.
+- python3 -m compileall -q . — PASS.
+
+3. SQLite migration smoke test
+A working copy of the supplied SQLite database was migrated twice; the uploaded original database was not modified.
+- PRAGMA integrity_check: ok.
+- Existing Watch alert rows: 14 before and after migration.
+- All original alert rows and evidence, plus all other legacy fields, were preserved; only empty last_seen_at metadata was backfilled from created_at.
+- occurrence_count added/backfilled.
+- jf_ai_watch_interactions created with exactly: chat_id, actor_user_id, target_user_id, interaction_count, first_seen_at, last_seen_at.
+- The interaction table contains counters/timestamps only; no message body, username, display name or evidence columns.
+- Repeated initialization is idempotent.
+
+4. Baseline note
+The initial 0.15.2 full-suite run in this environment did not finish within the command execution window, so it is not reported as a complete baseline result. Direct testing exposed stale fixtures in tests/test_ai.py: one secret-bearing fixture did not match the retrieval query and another timestamp was outside the configured 24-hour context window. The fixtures were corrected; production redaction and context selection rules were not weakened.
+
+5. User-provided runtime log review
+The supplied database passed PRAGMA integrity_check. It contained 12,521 archived chat messages, 10,000 runtime log entries (ring buffer), 16 AI reports, 14 Watch alerts, 567 hourly statistics rows and 114 daily statistics rows.
+Observed runtime error patterns in the supplied 10,000-row runtime window:
+- 8 Groq HTTP 429/quota or rate-limit responses.
+- 93 non-JSON semantic response errors.
+- 3 empty memory-summary responses.
+- 6 TelegramRetryAfter / GetUpdates flood-control events.
+- 13 Telegram timeout / Bad Gateway / disconnected-network events.
+- 0 TelegramConflictError entries.
+These are counts/patterns only; message text and identifiers are intentionally omitted.
+
+6. Verification boundary
+Verified locally: Python compilation, offline regression suite, targeted tests, migration on a working DB copy, SQLite integrity and preservation of Watch evidence.
+Not verified: live Telegram polling/delivery, live Groq quota/connectivity, Render runtime, production restart behavior or deployment. Offline tests use stubs for external services.
+
+No Render environment variables were added. No GitHub main changes, commits, pushes, Render configuration changes or deployment were performed. The uploaded production database and secrets are not included in the release archive.

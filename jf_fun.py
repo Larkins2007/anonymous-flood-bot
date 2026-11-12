@@ -9,8 +9,13 @@ class Fun:
  def register(self):
   if not self.registered:self.dp.message.register(self.handle,self.F.chat.type.in_(GROUP_TYPES),self.F.text.regexp(COMMAND_PATTERN));self.registered=True
  async def reply(self,m,t):
-  try:await m.reply(t,disable_web_page_preview=True)
-  except TypeError:await m.reply(t)
+  try:await m.reply(t,parse_mode="HTML",disable_web_page_preview=True)
+  except TypeError:
+   try:await m.reply(t,parse_mode="HTML")
+   except Exception:await m.reply(t)
+  except Exception:
+   try:await m.reply(t,disable_web_page_preview=True)
+   except Exception:await m.reply(t)
  async def handle(self,m):
   if not getattr(m,"from_user",None) or getattr(m.from_user,"is_bot",False):return
   raw=(m.text or "").strip();first=raw.splitlines()[0] if raw else ""

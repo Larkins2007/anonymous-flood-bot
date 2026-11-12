@@ -17,6 +17,7 @@ import time
 from datetime import datetime, timedelta, timezone
 from collections import defaultdict, deque
 from typing import Deque
+from urllib.parse import urlsplit
 
 import aiohttp
 
@@ -44,9 +45,37 @@ def clean_ai_text(value):
 
 
 class AIProviderError(RuntimeError):
-    def __init__(self, status: int, detail: str):
+    """Sanitized provider failure with a user-safe, actionable category."""
+
+    def __init__(self, status: int, detail: str, code: str = "", error_type: str = ""):
         super().__init__(detail)
-        self.status = status
+        self.status = int(status)
+        self.detail = str(detail or "")[:500]
+        self.code = str(code or "")[:100]
+        self.error_type = str(error_type or "")[:100]
+        fingerprint = " ".join((self.detail, self.code, self.error_type)).casefold()
+        quota_markers = (
+            "you have no credits remaining", "no credits remaining", "insufficient_quota",
+            "insufficient quota", "credit balance", "out of credits", "billing hard limit",
+            "billing_limit", "payment required", "add credits", "purchase credits",
+            "exceeded your current quota", "account has no credits", "quota_exceeded",
+        )
+        rate_markers = (
+            "rate_limit", "rate limit", "too many requests", "requests per minute",
+            "tokens per minute", "rpm limit", "tpm limit", "try again later",
+        )
+        if any(marker in fingerprint for marker in quota_markers):
+            self.kind = "quota"
+        elif self.status == 429 or any(marker in fingerprint for marker in rate_markers):
+            self.kind = "rate_limit"
+        elif self.status in {401, 403}:
+            self.kind = "auth"
+        elif self.status == 404:
+            self.kind = "model_or_endpoint"
+        elif self.status >= 500:
+            self.kind = "upstream"
+        else:
+            self.kind = "provider_rejected"
 
 
 GROUP_TYPES = {"group", "supergroup"}
@@ -659,16 +688,24 @@ class JusticeAI:
         async with aiohttp.ClientSession(timeout=timeout) as session:
             async with session.post(self.base_url, json=payload, headers=headers) as response:
                 if response.status >= 400:
-                    try: data = await response.json()
-                    except Exception: data = {}
+                    # Some OpenAI-compatible endpoints return JSON errors, others
+                    # return plain text. Preserve the classification fields but
+                    # never echo raw provider details or credentials into Telegram.
+                    raw_body = await response.text()
+                    try:
+                        data = json.loads(raw_body) if raw_body else {}
+                    except (TypeError, ValueError):
+                        data = {}
                     error_data = data.get("error") if isinstance(data, dict) else None
                     if isinstance(error_data, dict):
-                        detail = error_data.get("message") or "ошибка провайдера"
+                        detail = error_data.get("message") or raw_body or "ошибка провайдера"
+                        code = error_data.get("code") or ""
+                        error_type = error_data.get("type") or ""
                     elif isinstance(error_data, str):
-                        detail = error_data
+                        detail, code, error_type = error_data, "", ""
                     else:
-                        detail = "ошибка провайдера"
-                    raise AIProviderError(response.status, str(detail)[:220])
+                        detail, code, error_type = raw_body or "ошибка провайдера", "", ""
+                    raise AIProviderError(response.status, str(detail)[:500], str(code), str(error_type))
                 data = await response.json()
         answer = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "").strip()
         if not answer:
@@ -726,8 +763,16 @@ class JusticeAI:
                 return await self.reply(m, str(exc))
         if low.startswith("/jf_ai"):
             status = "🟢 подключён" if self.ready else "⚪ пока не настроен"
+            owner_config = ""
+            if is_owner_private:
+                # Show endpoint host/model only; never expose the API key or URL path.
+                try:
+                    endpoint_host = urlsplit(self.base_url).hostname or "не определён"
+                except ValueError:
+                    endpoint_host = "не определён"
+                owner_config = f"\nEndpoint: {endpoint_host}\nМодель: {self.model or 'не указана'}\n"
             return await self.reply(m, "Justice AI\n"
-                f"Статус: {status}.\n"
+                f"Статус: {status}.{owner_config}\n"
                 "Вызов: Джастис, помоги придумать тему для флуда.\n"
                 "Очистить оперативный контекст: /jf_ai_reset.\n"
                 "В ЛС владельца: /jf_ai_memory — личная память; /jf_ai_memory_save категория | заголовок | текст — сохранить заметку; "
@@ -793,14 +838,21 @@ class JusticeAI:
         except asyncio.TimeoutError:
             return await self.reply(m, "Ответ занял слишком много времени. Попробуй ещё раз чуть позже.")
         except AIProviderError as exc:
-            logger.warning("Justice AI provider rejected request | chat_type=%s status=%s", chat_type, exc.status)
-            if exc.status == 429:
-                return await self.reply(m, "Groq временно ограничил запросы из-за лимита тарифа. Подожди немного и попробуй снова.")
-            if exc.status in {401, 403}:
-                return await self.reply(m, "Groq не принял API-ключ. Администрации нужно проверить JF_AI_API_KEY в Render.")
-            if exc.status == 404:
-                return await self.reply(m, "Groq не нашёл указанную модель или endpoint. Администрации нужно проверить настройки Justice AI.")
-            return await self.reply(m, "Groq отклонил запрос. Администрации стоит проверить настройки и журнал сервиса.")
+            logger.warning(
+                "Justice AI provider rejected request | chat_type=%s status=%s kind=%s",
+                chat_type, exc.status, exc.kind,
+            )
+            if exc.kind == "quota":
+                return await self.reply(m, "Сейчас не могу ответить: у подключённого AI-провайдера закончились кредиты. Администрации нужно проверить баланс биллинга и выбранный API endpoint.")
+            if exc.kind == "rate_limit":
+                return await self.reply(m, "Сейчас достигнут временный лимит запросов AI-провайдера. Попробуй повторить чуть позже.")
+            if exc.kind == "auth":
+                return await self.reply(m, "AI-провайдер не принял API-ключ или не дал доступ к модели. Администрации нужно проверить ключ и разрешения в настройках сервиса.")
+            if exc.kind == "model_or_endpoint":
+                return await self.reply(m, "AI-провайдер не нашёл выбранную модель или endpoint. Администрации нужно проверить JF_AI_MODEL и JF_AI_BASE_URL.")
+            if exc.kind == "upstream":
+                return await self.reply(m, "AI-провайдер временно недоступен. Попробуй повторить позже.")
+            return await self.reply(m, "AI-провайдер отклонил запрос. Администрации нужно проверить журнал сервиса.")
         except Exception:
             logger.exception("Justice AI request failed | chat_type=%s", chat_type)
             return await self.reply(m, "Не удалось получить ответ от AI-провайдера. Администрации стоит проверить настройки и журнал сервиса.")
