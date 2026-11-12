@@ -268,7 +268,7 @@ JF_AI_ANALYTICS = jf_ai_analytics.register(
 )
 
 JF_REGISTRY_AUDIT = jf_registry_audit.register(
-    dp, bot=bot, F=F, owner_id=ADMIN_ID, db_path=DB_PATH, version="0.24.0",
+    dp, bot=bot, F=F, owner_id=ADMIN_ID, db_path=DB_PATH, version="0.24.1",
 )
 
 # Runtime dispatcher audit from the parallel 0.16.0 implementation.  It probes
@@ -5717,35 +5717,131 @@ async def delcommand_cmd(message: Message):
     await message.reply(f"{title('🗑 Команда удалена')}\n\n{bullet('Готово.')}")
 
 
-async def send_personal_command_help(message: Message):
-    """Detailed, access-aware command guide sent only in the user's private chat."""
-    uid = int(message.from_user.id) if message.from_user else 0
-    primary_chat = resolve_primary_chat_id(PRIMARY_CHAT_ID) or int(message.chat.id)
+async def _help_visible_specs(uid: int, private_chat_id: int):
+    primary_chat = resolve_primary_chat_id(PRIMARY_CHAT_ID) or int(private_chat_id)
     level, rank, is_member = await cmdcfg._access_context(uid, int(primary_chat))
-    blocks = ["📖 СПРАВОЧНИК JUSTICE FAITE", "\nЗдесь собраны команды, которые доступны именно тебе в основном чате и личном диалоге."]
-    for cat, (emoji, label) in cmdcfg.CATEGORIES.items():
-        items = []
-        for spec in sorted(cmdcfg.specs_in(cat), key=lambda item: item.title.casefold()):
-            if spec.feature or not spec.triggers:
-                continue
-            visible_in_group = cmdcfg.visible(spec.key, chat_type="group", level=level, rank=rank,
-                                               is_member=is_member, user_id=uid, chat_id=int(primary_chat))
-            visible_in_private = cmdcfg.visible(spec.key, chat_type="private", level=level, rank=rank,
-                                                is_member=is_member, user_id=uid, chat_id=int(message.chat.id))
-            if not (visible_in_group or visible_in_private):
-                continue
-            trigger = next((t for t in spec.triggers if t != "кнопка в меню"), None)
-            if not trigger:
-                continue
-            desc = (spec.desc or spec.title).strip().replace("\n", " ")
-            items.append(f"{trigger}\n{desc[:260]}")
-        if items:
-            blocks.append(f"{emoji} {label}\n" + "\n\n".join(items))
-    if len(blocks) == 2:
-        blocks.append("Пока нет доступных команд для этого аккаунта.")
-    text = "\n\n".join(blocks)
-    for chunk in jfui.split_chunks(text):
-        await message.answer(chunk, disable_web_page_preview=True)
+    visible_specs = []
+    for spec in cmdcfg.REGISTRY.values():
+        if spec.feature or not spec.triggers:
+            continue
+        in_group = cmdcfg.visible(spec.key, chat_type="group", level=level, rank=rank,
+                                  is_member=is_member, user_id=uid, chat_id=int(primary_chat))
+        in_private = cmdcfg.visible(spec.key, chat_type="private", level=level, rank=rank,
+                                    is_member=is_member, user_id=uid, chat_id=int(private_chat_id))
+        if in_group or in_private:
+            visible_specs.append(spec)
+    return primary_chat, visible_specs
+
+
+def _help_category_keyboard(specs):
+    rows, row = [], []
+    for key, (emoji, label) in cmdcfg.CATEGORIES.items():
+        if not any(spec.category == key for spec in specs):
+            continue
+        row.append(InlineKeyboardButton(text=f"{emoji} {label}", callback_data=f"jfhelp:cat:{key}:0"))
+        if len(row) == 2:
+            rows.append(row); row = []
+    if row:
+        rows.append(row)
+    return InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _help_category_page(specs, category: str, page: int = 0):
+    items = sorted((x for x in specs if x.category == category), key=lambda x: x.title.casefold())
+    page_size = 8
+    pages = max(1, (len(items) + page_size - 1) // page_size)
+    page = max(0, min(int(page), pages - 1))
+    rows = []
+    chunk = items[page * page_size:(page + 1) * page_size]
+    for i in range(0, len(chunk), 2):
+        pair = chunk[i:i + 2]
+        rows.append([InlineKeyboardButton(text=f"{x.emoji} {x.title}"[:60], callback_data=f"jfhelp:cmd:{x.key}") for x in pair])
+    nav = []
+    if page > 0:
+        nav.append(InlineKeyboardButton(text="‹ Назад", callback_data=f"jfhelp:cat:{category}:{page-1}"))
+    if page + 1 < pages:
+        nav.append(InlineKeyboardButton(text="Далее ›", callback_data=f"jfhelp:cat:{category}:{page+1}"))
+    if nav:
+        rows.append(nav)
+    rows.append([InlineKeyboardButton(text="⌂ Все разделы", callback_data="jfhelp:home")])
+    return items, page, pages, InlineKeyboardMarkup(inline_keyboard=rows)
+
+
+def _help_command_card(spec):
+    trigger = next((str(x) for x in spec.triggers if str(x).startswith("/")), str(spec.triggers[0]))
+    access = cmdcfg.ACCESS_LABELS.get(spec.access, spec.access)
+    where = cmdcfg.WHERE_LABELS.get(spec.where, spec.where)
+    lines = [f"{spec.emoji} {spec.title}", "", "📌 Что делает", (spec.desc or "Описание этой команды пока не заполнено.").strip(),
+             "", "⌨️ Как вызвать", f"{trigger}", "", f"👥 Кто может использовать: {access}", f"📍 Где работает: {where}"]
+    aliases = [str(x) for x in spec.triggers if str(x) != trigger]
+    if aliases:
+        lines += ["", "🔎 Другие варианты вызова", *[f"• {x}" for x in aliases[:8]]]
+    if spec.params:
+        lines += ["", "⚙️ Дополнительные настройки"]
+        for param in spec.params:
+            detail = f" — {param.help}" if getattr(param, "help", "") else ""
+            lines.append(f"• {param.title}{detail}")
+    lines += ["", "Если команда требует участника, ответь на его сообщение или укажи @username/ID — конкретный формат зависит от команды."]
+    return "\n".join(lines)[:3900]
+
+
+async def send_personal_command_help(message: Message):
+    """Access-aware interactive command directory for the current Telegram user."""
+    uid = int(message.from_user.id) if message.from_user else 0
+    _primary, specs = await _help_visible_specs(uid, int(message.chat.id))
+    text = ("📖 СПРАВОЧНИК JUSTICE FAITE\n\n"
+            "Выбери раздел. Внутри каждой команды есть описание, способ вызова, "
+            "права доступа и дополнительные параметры. Список автоматически "
+            "отфильтрован по твоим правам.")
+    keyboard = _help_category_keyboard(specs)
+    await message.answer(text, reply_markup=keyboard, disable_web_page_preview=True)
+
+
+@dp.callback_query(F.data.startswith("jfhelp:"))
+async def personal_help_callback(callback: CallbackQuery):
+    if not callback.from_user or not callback.message or callback.message.chat.type != "private":
+        await callback.answer("Открой справочник в личном диалоге с ботом.", show_alert=True)
+        return
+    uid = int(callback.from_user.id)
+    # Re-evaluate the caller's effective access on every button press; never trust
+    # the fact that a button was visible when the original menu was rendered.
+    await cmdcfg._access_context(uid, int(resolve_primary_chat_id(PRIMARY_CHAT_ID) or PRIMARY_CHAT_ID))
+    _primary, specs = await _help_visible_specs(uid, int(callback.message.chat.id))
+    parts = (callback.data or "").split(":")
+    action = parts[1] if len(parts) > 1 else "home"
+    if action == "home":
+        text = ("📖 СПРАВОЧНИК JUSTICE FAITE\n\n"
+                "Выбери раздел. Здесь отображаются только команды, доступные твоему аккаунту.")
+        markup = _help_category_keyboard(specs)
+    elif action == "cat" and len(parts) >= 4:
+        category = parts[2]
+        try: page = int(parts[3])
+        except ValueError: page = 0
+        if category not in cmdcfg.CATEGORIES or not any(x.category == category for x in specs):
+            await callback.answer("Этот раздел недоступен.", show_alert=True); return
+        items, page, pages, markup = _help_category_page(specs, category, page)
+        emoji, label = cmdcfg.CATEGORIES[category]
+        text = f"{emoji} {label}\n\nВыбери команду. Страница {page+1} из {pages}."
+        if not items:
+            text += "\nВ этом разделе пока нет доступных команд."
+    elif action == "cmd" and len(parts) >= 3:
+        key = parts[2]
+        spec = next((x for x in specs if x.key == key), None)
+        if spec is None:
+            await callback.answer("Команда недоступна для твоего уровня доступа.", show_alert=True); return
+        text = _help_command_card(spec)
+        markup = InlineKeyboardMarkup(inline_keyboard=[
+            [InlineKeyboardButton(text="‹ К разделу", callback_data=f"jfhelp:cat:{spec.category}:0")],
+            [InlineKeyboardButton(text="⌂ Все разделы", callback_data="jfhelp:home")],
+        ])
+    else:
+        await callback.answer("Не удалось открыть этот раздел.", show_alert=True); return
+    try:
+        await callback.message.edit_text(text, reply_markup=markup, disable_web_page_preview=True)
+    except TelegramBadRequest as exc:
+        if "message is not modified" not in str(exc).casefold():
+            raise
+    await callback.answer()
 
 
 @dp.message(Command("help"))
@@ -5891,10 +5987,6 @@ async def synchronize_known_member_roles(chat_id: int) -> dict:
 async def synchronize_registered_role_ids(chat_id: int, *, allow_empty: bool = False) -> dict:
     """Check owner-registered IDs and update the two public role-list posts."""
     mappings = group_db_op(lambda conn: jf_role_registry.rows(conn, chat_id))
-    if not mappings and not allow_empty:
-        return {"registered": 0, "active": 0, "left": 0, "errors": 0,
-                "posts": ["Публикации не изменены: сначала зарегистрируй Telegram ID командой /roleid."],
-                "details": []}
     active, left, errors, details = set(), 0, 0, []
     for row in mappings:
         uid, role_name, role_key = int(row["user_id"]), str(row["role_name"]), str(row["role_key"])
@@ -5930,6 +6022,17 @@ async def synchronize_registered_role_ids(chat_id: int, *, allow_empty: bool = F
             errors += 1
             details.append(f"{role_name}: {type(exc).__name__}")
             logger.exception("Registered role check failed | chat=%s role=%s user=%s", chat_id, role_name, uid)
+
+    # Include roles detected automatically from Telegram sender_tag/custom_title.
+    # Membership events clear these assignments on leave; ordinary messages and
+    # /syncroles refresh known users. The Bot API cannot enumerate every member.
+    observed = group_db_op(lambda conn: conn.execute(
+        "SELECT DISTINCT rs.role_key FROM role_state rs "
+        "JOIN group_members gm ON gm.chat_id=rs.chat_id AND gm.user_id=rs.user_id "
+        "WHERE rs.chat_id=? AND rs.user_id IS NOT NULL AND rs.status IN ('taken','busy') AND gm.active=1",
+        (chat_id,),
+    ).fetchall())
+    active.update(str(row["role_key"]) for row in observed)
 
     # A failed lookup means membership is unknown, not that the person left.
     # Keep the published lists untouched until every registered ID was checked.

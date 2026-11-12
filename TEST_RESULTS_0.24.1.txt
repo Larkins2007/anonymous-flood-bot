@@ -1,0 +1,6 @@
+Justice Faite Manager 0.24.1 — offline test results
+
+Full test suite: 41/41 modules passed.
+Command guide: category keyboard, per-command cards, access filtering.
+Role sync: automatic observed tags merged with owner-registered ID mappings.
+Live Telegram/Render tests: not run.

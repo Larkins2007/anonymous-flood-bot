@@ -1,0 +1,11 @@
+Justice Faite Manager 0.24.0 — offline test results
+
+Command: python -B tests/run_all.py
+Result: PASS
+Test modules: 41/41
+Test-entrypoint audit: PASS (all test_* functions invoked)
+New module: tests/test_role_registry.py — PASS
+
+The suite uses offline stubs. It does not verify live Telegram permissions, real message edits in @Justice_faite, Render deployment, or a live Groq request.
+
+Exact release ZIP: CRC verified; extracted archive test suite also passed 41/41 modules.

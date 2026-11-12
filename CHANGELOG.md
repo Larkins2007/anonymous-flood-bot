@@ -1,3 +1,10 @@
+## 0.24.1 — Interactive help and automatic roster reconciliation (2026-11-13)
+
+- Replaced the private `/help` text dump with access-aware inline category navigation, paginated command lists, and per-command cards.
+- Re-checks access on every callback so users cannot open admin-only command details.
+- `/syncroles` now merges recognized Telegram member tags with explicitly registered ID mappings when rendering the two roster posts.
+- Membership leave events release roles; unknown members are not guessed.
+
 ## 0.24.0 — Command guide, role roster and Justice trigger (2026-11-13)
 
 - Added a private command guide opened from `/help` in the primary chat or `/start help` in DM.
