@@ -1,3 +1,12 @@
+## 0.24.0 — Command guide, role roster and Justice trigger (2026-11-13)
+
+- Added a private command guide opened from `/help` in the primary chat or `/start help` in DM.
+- Added owner-only `/roleid` and `/roleid_remove` to bind character roles to numeric Telegram IDs.
+- Extended `/syncroles` to verify registered IDs and refresh info-channel posts 40/41; transient lookup failures preserve existing publications.
+- Kept legacy Telegram role-tag synchronization and connected the owner console sync action to the new roster flow.
+- Restricted Justice AI invocation to `Джастис ` without a comma or alternate trigger; improved context interpretation instructions.
+- Added 1 offline test module; command catalog now has 291 entries, including 288 non-feature commands.
+
 ## 0.23.0 — Consolidated reliability and release gate (2026-11-12)
 
 - Consolidated the two supplied 0.16.0 code lines, retaining the runtime handler registry audit and the static Self-Audit.

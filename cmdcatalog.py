@@ -51,6 +51,8 @@ EXTRA = [
     # single configurable access layer. Resource ownership and hierarchy checks
     # remain inside the relevant module as data-integrity safeguards.
     ("role_status", "Статус персонажа", "🏷️", "roles", ("/role_status",), "members", "group", "Установить статус персонажа: свободна, ожидает или резерв. Дополнительно проверяется Telegram-администратор/владелец."),
+    ("roleid", "Привязать роль к Telegram ID", "🪪", "roles", ("/roleid",), "owner", "private", "Владелец привязывает персонажа к числовому Telegram ID для автоматической синхронизации занятых ролей."),
+    ("roleid_remove", "Удалить привязку роли", "🗑️", "roles", ("/roleid_remove",), "owner", "private", "Удалить сохранённую привязку персонажа к Telegram ID."),
     ("mgr_help", "Справка модерации", "🛡️", "moderation", ("/jf_manager",), "members", "group", "Справка по модерации Justice Faite."),
     ("community_help", "Справка по сообществу", "👥", "community", ("/jf_community",), "members", "group", "Справка по кланам, кружкам, заметкам и закладкам."),
     ("mgr_mod_add", "Назначить модератора", "➕", "moderation", ("+модер", "+админ", "!модер", "!!модер", "!!!модер", "!!!!модер", "/jf_mod"), "rank_3", "Назначить модераторский ранг участнику."),
@@ -278,7 +280,7 @@ EXTRA = [
     ("pet_home_actions", "Действия дома", "🏡", "community", ("дом действия",), "members", "Показать доступные варианты оформления дома."),
     ("ai_help", "Справка Justice AI", "🧠", "ai", ("/jf_ai",), "members", "Посмотреть состояние и способы обращения к разговорному помощнику."),
     ("ai_reset", "Очистить контекст Justice AI", "🧹", "ai", ("/jf_ai_reset",), "members", "Удалить краткий контекст личного диалога с помощником."),
-    ("ai_ask", "Обратиться к Justice AI", "💬", "ai", ("джастис,", "помощник,"), "members", "Задать вопрос разговорному AI по прямому обращению."),
+    ("ai_ask", "Обратиться к Justice AI", "💬", "ai", ("джастис",), "members", "Задать вопрос разговорному AI по прямому обращению."),
 
     # Advisory moderation vote (no automatic sanctions).
     ("modvote_help", "Справка по голосованиям модерации", "🗳️", "moderation", ("/jf_modvote",), "members", "Справка по рекомендательным голосованиям."),

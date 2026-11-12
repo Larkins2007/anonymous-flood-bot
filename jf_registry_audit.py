@@ -420,7 +420,7 @@ def run_self_audit(
     *,
     db_path: str = "",
     task_registry: Optional[dict] = None,
-    version: str = "0.23.0",
+    version: str = "0.24.0",
 ) -> AuditReport:
     """Full Core Self-Audit. Read-only. Never modifies state."""
     t0 = time.monotonic()
@@ -538,7 +538,7 @@ _owner_id: int = 0
 _bot = None
 _db_path: str = ""
 _task_registry_getter: Optional[Callable[[], dict]] = None
-_version: str = "0.23.0"
+_version: str = "0.24.0"
 
 
 def configure(
@@ -547,7 +547,7 @@ def configure(
     owner_id: int = 0,
     db_path: str = "",
     task_registry_getter: Optional[Callable[[], dict]] = None,
-    version: str = "0.23.0",
+    version: str = "0.24.0",
 ) -> None:
     global _bot, _owner_id, _db_path, _task_registry_getter, _version
     _bot = bot
@@ -595,7 +595,7 @@ async def handle_self_audit_command(message) -> None:
                 return
 
 
-def register(dp, bot, F, *, owner_id: int = 0, db_path: str = "", version: str = "0.23.0",
+def register(dp, bot, F, *, owner_id: int = 0, db_path: str = "", version: str = "0.24.0",
              task_registry_getter=None):
     """Register /jf_self_audit for the owner private chat."""
     from aiogram.filters import Command

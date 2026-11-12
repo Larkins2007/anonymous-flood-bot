@@ -52,6 +52,7 @@ from aiogram.types import (
 
 import cmdcfg
 import cmdspecs
+import jf_role_registry
 import settings_panel
 import ui as jfui
 from ui import title, section, bullet, note, divider, warning
@@ -267,7 +268,7 @@ JF_AI_ANALYTICS = jf_ai_analytics.register(
 )
 
 JF_REGISTRY_AUDIT = jf_registry_audit.register(
-    dp, bot=bot, F=F, owner_id=ADMIN_ID, db_path=DB_PATH, version="0.23.0",
+    dp, bot=bot, F=F, owner_id=ADMIN_ID, db_path=DB_PATH, version="0.24.0",
 )
 
 # Runtime dispatcher audit from the parallel 0.16.0 implementation.  It probes
@@ -806,6 +807,7 @@ def init_group_db():
             );
             """
         )
+        jf_role_registry.init(conn)
         conn.commit()
     db_transaction(op)
 
@@ -1993,6 +1995,15 @@ async def start(
         m = re.match(r"^/start\s+spy(?:join)?_(\d+)$", text, flags=re.IGNORECASE)
         if m:
             await spy_handle_deep_link(message, int(m.group(1)))
+            return
+        if re.match(r"^/start\s+help(?:_[a-z0-9_-]+)?$", text, flags=re.IGNORECASE):
+            if not await cmdcfg.gate(message, "start"):
+                return
+            register_user(message.from_user)
+            if is_blocked(message.from_user.id):
+                await message.answer("Доступ ограничен для этого аккаунта.")
+                return
+            await send_personal_command_help(message)
             return
     if not await cmdcfg.gate(message, "start"):
         return
@@ -5706,42 +5717,57 @@ async def delcommand_cmd(message: Message):
     await message.reply(f"{title('🗑 Команда удалена')}\n\n{bullet('Готово.')}")
 
 
+async def send_personal_command_help(message: Message):
+    """Detailed, access-aware command guide sent only in the user's private chat."""
+    uid = int(message.from_user.id) if message.from_user else 0
+    primary_chat = resolve_primary_chat_id(PRIMARY_CHAT_ID) or int(message.chat.id)
+    level, rank, is_member = await cmdcfg._access_context(uid, int(primary_chat))
+    blocks = ["📖 СПРАВОЧНИК JUSTICE FAITE", "\nЗдесь собраны команды, которые доступны именно тебе в основном чате и личном диалоге."]
+    for cat, (emoji, label) in cmdcfg.CATEGORIES.items():
+        items = []
+        for spec in sorted(cmdcfg.specs_in(cat), key=lambda item: item.title.casefold()):
+            if spec.feature or not spec.triggers:
+                continue
+            visible_in_group = cmdcfg.visible(spec.key, chat_type="group", level=level, rank=rank,
+                                               is_member=is_member, user_id=uid, chat_id=int(primary_chat))
+            visible_in_private = cmdcfg.visible(spec.key, chat_type="private", level=level, rank=rank,
+                                                is_member=is_member, user_id=uid, chat_id=int(message.chat.id))
+            if not (visible_in_group or visible_in_private):
+                continue
+            trigger = next((t for t in spec.triggers if t != "кнопка в меню"), None)
+            if not trigger:
+                continue
+            desc = (spec.desc or spec.title).strip().replace("\n", " ")
+            items.append(f"{trigger}\n{desc[:260]}")
+        if items:
+            blocks.append(f"{emoji} {label}\n" + "\n\n".join(items))
+    if len(blocks) == 2:
+        blocks.append("Пока нет доступных команд для этого аккаунта.")
+    text = "\n\n".join(blocks)
+    for chunk in jfui.split_chunks(text):
+        await message.answer(chunk, disable_web_page_preview=True)
+
+
 @dp.message(Command("help"))
 async def help_cmd(message: Message):
     if message.chat.type in {"group", "supergroup"} and not is_primary_chat(message.chat.id):
         return
     if not await cmdcfg.gate(message, "help"):
         return
-    uid = int(message.from_user.id) if message.from_user else 0
-    level, rank, is_member = await cmdcfg._access_context(uid, int(message.chat.id))
-    chat_type = message.chat.type
-    compact = cmdcfg.get_bool("help", "compact")
-    show_custom = cmdcfg.get_bool("help", "show_custom")
-    blocks = []
-    for cat, (emoji, label) in cmdcfg.CATEGORIES.items():
-        if cat == "custom" and not show_custom:
-            continue
-        items = []
-        for spec in sorted(cmdcfg.specs_in(cat), key=lambda s: s.title):
-            if spec.feature or not spec.triggers:
-                continue
-            if not cmdcfg.visible(spec.key, chat_type=chat_type, level=level, rank=rank,
-                                  is_member=is_member, user_id=uid, chat_id=int(message.chat.id)):
-                continue
-            trigger = next((t for t in spec.triggers if t != "кнопка в меню"), None)
-            if not trigger:
-                continue
-            items.append(bullet(trigger if compact else f"{trigger} — {spec.emoji} {spec.title}"))
-        if items:
-            blocks.append("\n".join([section(f"{emoji} {label}")] + items))
-    head = "Команды флуда" if chat_type in {"group", "supergroup"} else "Справка"
-    tail = note("Настройки каждой команды: /settings") if level == "owner" and chat_type == "private" else None
-    body = "\n\n".join([title(head)] + (blocks or [bullet("Нет доступных команд.")]) + ([tail] if tail else []))
-    for i, chunk in enumerate(jfui.split_chunks(body)):
-        if i == 0:
-            await cmdcfg.respond(message, "help", chunk)
-        else:
-            await message.answer(chunk)
+    if message.chat.type in {"group", "supergroup"}:
+        try:
+            me = await bot.get_me()
+            username = str(getattr(me, "username", "") or "").lstrip("@")
+            if not username:
+                raise ValueError("bot username unavailable")
+            keyboard = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text="📖 Открыть справочник в личке", url=f"https://t.me/{username}?start=help")
+            ]])
+            await message.answer("📖 Подробные объяснения команд находятся в личном диалоге с ботом.\nНажми кнопку ниже, чтобы открыть справочник.", reply_markup=keyboard, disable_web_page_preview=True)
+        except Exception:
+            await message.answer("📖 Открой личный диалог с ботом и отправь /start help — там будет подробный справочник команд.")
+        return
+    await send_personal_command_help(message)
 
 
 async def synchronize_known_member_roles(chat_id: int) -> dict:
@@ -5862,18 +5888,176 @@ async def synchronize_known_member_roles(chat_id: int) -> dict:
     }
 
 
+async def synchronize_registered_role_ids(chat_id: int, *, allow_empty: bool = False) -> dict:
+    """Check owner-registered IDs and update the two public role-list posts."""
+    mappings = group_db_op(lambda conn: jf_role_registry.rows(conn, chat_id))
+    if not mappings and not allow_empty:
+        return {"registered": 0, "active": 0, "left": 0, "errors": 0,
+                "posts": ["Публикации не изменены: сначала зарегистрируй Telegram ID командой /roleid."],
+                "details": []}
+    active, left, errors, details = set(), 0, 0, []
+    for row in mappings:
+        uid, role_name, role_key = int(row["user_id"]), str(row["role_name"]), str(row["role_key"])
+        try:
+            member = await bot.get_chat_member(chat_id, uid)
+            user = getattr(member, "user", None)
+            if not user or getattr(user, "is_bot", False):
+                errors += 1
+                details.append(f"{role_name}: Telegram вернул некорректного участника")
+                continue
+            if not _chat_member_is_active(member):
+                left += 1
+                mark_member_left(chat_id, uid)
+                group_db_op(lambda conn, rk=role_key, u=uid: (
+                    conn.execute("UPDATE role_state SET user_id=NULL,status='free' WHERE chat_id=? AND role_key=?", (chat_id, rk)),
+                    conn.execute("UPDATE group_members SET role_key=NULL,role_name=NULL WHERE chat_id=? AND user_id=? AND role_key=?", (chat_id, u, rk)),
+                ))
+                continue
+            active.add(role_key)
+            upsert_group_member(chat_id, user, active=True, confirmed=True)
+            def assign_registered_role(conn, u=uid, rk=role_key, rn=role_name):
+                previous = conn.execute("SELECT role_key FROM group_members WHERE chat_id=? AND user_id=?", (chat_id, u)).fetchone()
+                if previous and previous["role_key"] and str(previous["role_key"]) != rk:
+                    conn.execute("UPDATE role_state SET user_id=NULL,status='free' WHERE chat_id=? AND role_key=? AND user_id=?",
+                                 (chat_id, str(previous["role_key"]), u))
+                conn.execute("UPDATE group_members SET role_key=?,role_name=?,confirmed=1,active=1,left_at=NULL WHERE chat_id=? AND user_id=?", (rk,rn,chat_id,u))
+                conn.execute("UPDATE role_state SET user_id=?,status='busy' WHERE chat_id=? AND role_key=?", (u,chat_id,rk))
+            group_db_op(assign_registered_role)
+        except (TelegramForbiddenError, TelegramNotFound, TelegramBadRequest):
+            errors += 1
+            details.append(f"{role_name}: Telegram не разрешил проверить участника")
+        except Exception as exc:
+            errors += 1
+            details.append(f"{role_name}: {type(exc).__name__}")
+            logger.exception("Registered role check failed | chat=%s role=%s user=%s", chat_id, role_name, uid)
+
+    # A failed lookup means membership is unknown, not that the person left.
+    # Keep the published lists untouched until every registered ID was checked.
+    if errors:
+        return {"registered": len(mappings), "active": len(active), "left": left,
+                "errors": errors, "posts": ["Публикации не изменены: есть ошибки проверки статусов."],
+                "details": details[:15]}
+
+    # Render in the canonical region order; only confirmed active IDs get a yellow heart.
+    first_regions = {"Mondstadt", "Liyue", "Inazuma", "Sumeru", "Fontaine"}
+    def render(regions):
+        blocks = []
+        for header, entries in _ROLE_GROUPS:
+            names = [name for name, _english in entries]
+            role_region = next((region for name, _english, region in ROLE_CATALOG if name == names[0]), "") if names else ""
+            if (role_region in first_regions) != regions:
+                continue
+            lines = [header]
+            for name in names:
+                key = normalize_role(name)
+                lines.append(f"{name} - {'💛' if key in active else ''}")
+            blocks.append("\n".join(lines))
+        return "\n".join(blocks)
+
+    post_results = []
+    channel = os.getenv("ROLE_INFO_CHANNEL", "@Justice_faite").strip() or "@Justice_faite"
+    for message_id, region_group in ((40, True), (41, False)):
+        body = render(region_group)
+        try:
+            await bot.edit_message_text(chat_id=channel, message_id=message_id, text=body,
+                                        disable_web_page_preview=True)
+            post_results.append(f"Пост {message_id}: обновлён")
+        except TelegramBadRequest as exc:
+            if "message is not modified" in str(exc).casefold():
+                post_results.append(f"Пост {message_id}: уже актуален")
+            else:
+                errors += 1
+                post_results.append(f"Пост {message_id}: ошибка редактирования ({type(exc).__name__})")
+        except Exception as exc:
+            errors += 1
+            post_results.append(f"Пост {message_id}: ошибка редактирования ({type(exc).__name__})")
+            logger.exception("Role roster post update failed | post=%s", message_id)
+
+    return {"registered": len(mappings), "active": len(active), "left": left,
+            "errors": errors, "posts": post_results, "details": details[:15]}
+
+
+@dp.message(Command("roleid"), F.chat.type == "private")
+async def roleid_cmd(message: Message):
+    if not message.from_user or int(message.from_user.id) != ADMIN_ID:
+        return
+    raw = re.sub(r"^/roleid(?:@[A-Za-z0-9_]+)?\s*", "", message.text or "", count=1, flags=re.IGNORECASE).strip()
+    if not raw:
+        await message.answer("Привязка одной роли:\n/roleid Аль-Хайтам — 123456789\n\nМассовая загрузка: отправь /roleid и затем пары «Персонаж — Telegram ID», каждая с новой строки.\nУдаление: /roleid_remove Аль-Хайтам")
+        return
+    parsed, invalid = jf_role_registry.parse_lines(raw)
+    if not parsed:
+        # Single-line shorthand: `/roleid Аль-Хайтам 123456789`.
+        match = re.match(r"^(.+?)\s+(\d{5,16})$", raw)
+        if match:
+            parsed = [(match.group(1).strip(), int(match.group(2)))]
+    if not parsed:
+        await message.answer("Не нашёл пары «имя персонажа — числовой Telegram ID». Проверь формат.")
+        return
+    applied, rejected = [], []
+    seen_ids = set()
+    for name, user_id in parsed:
+        role = role_for(name)
+        if not role:
+            rejected.append(f"{name}: персонаж не найден в каталоге")
+            continue
+        if user_id in seen_ids:
+            rejected.append(f"{name}: повторяется Telegram ID в этом сообщении")
+            continue
+        seen_ids.add(user_id)
+        try:
+            group_db_op(lambda conn, r=role, u=user_id: jf_role_registry.upsert(
+                conn, PRIMARY_CHAT_ID, normalize_role(r["name"]), r["name"], u, ADMIN_ID))
+            applied.append(f"{role['name']} → {user_id}")
+        except Exception as exc:
+            rejected.append(f"{name}: конфликт привязки ({type(exc).__name__})")
+    text = [f"Сохранено привязок: {len(applied)}"]
+    if applied: text += applied[:40]
+    if rejected or invalid:
+        text.append("Не обработано:")
+        text += rejected[:20]
+        text += [f"Строка {n}: неверный формат" for n, _ in invalid[:10]]
+    await message.answer("\n".join(text)[:3900])
+
+
+@dp.message(Command("roleid_remove"), F.chat.type == "private")
+async def roleid_remove_cmd(message: Message):
+    if not message.from_user or int(message.from_user.id) != ADMIN_ID:
+        return
+    name = (message.text or "").partition(" ")[2].strip()
+    role = role_for(name)
+    if not role:
+        await message.answer("Укажи имя персонажа из каталога: /roleid_remove Аль-Хайтам")
+        return
+    removed = group_db_op(lambda conn: jf_role_registry.remove(conn, PRIMARY_CHAT_ID, normalize_role(role["name"])))
+    if removed:
+        sync = await synchronize_registered_role_ids(PRIMARY_CHAT_ID, allow_empty=True)
+        await message.answer("Привязка удалена. " + " ".join(sync["posts"]))
+    else:
+        await message.answer("У этой роли нет привязки.")
+
+
 @dp.message(Command("syncroles"))
 async def sync_roles_cmd(message: Message):
     if not await cmdcfg.gate(message, "syncroles"):
         return
-    result = await synchronize_known_member_roles(PRIMARY_CHAT_ID)
+    # Preserve legacy sender-tag synchronization and then reconcile the owner roster.
+    legacy = await synchronize_known_member_roles(PRIMARY_CHAT_ID)
+    result = await synchronize_registered_role_ids(PRIMARY_CHAT_ID)
+    report = ["◈ Синхронизация занятых ролей", f"Известных участников проверено: {legacy['checked']}", f"Зарегистрировано ID: {result['registered']}",
+              f"Сейчас в чате: {result['active']}", f"Вышли: {result['left']}",
+              f"Ошибок: {result['errors']}", *result["posts"]]
+    if result["details"]: report += ["", *result["details"]]
     report_to = ADMIN_ID if cmdcfg.get_str("syncroles", "report_to") != "here" else message.chat.id
-    await bot.send_message(report_to, result["report"])
+    await bot.send_message(report_to, "\n".join(report))
 
 
 async def _console_sync_roles() -> str:
-    result = await synchronize_known_member_roles(PRIMARY_CHAT_ID)
-    return result["report"]
+    legacy = await synchronize_known_member_roles(PRIMARY_CHAT_ID)
+    roster = await synchronize_registered_role_ids(PRIMARY_CHAT_ID)
+    return (legacy["report"] + "\n\nСписок занятых ролей:\n" +
+            f"ID: {roster['registered']} · в чате: {roster['active']} · вышли: {roster['left']} · ошибки: {roster['errors']}\n" +
+            "\n".join(roster["posts"]))
 
 
 # The owner console's role button runs a real Telegram check, not only a redraw
