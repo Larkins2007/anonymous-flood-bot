@@ -47,6 +47,39 @@
 
 # Changelog
 
+## 0.26.0
+
+### Members & roles (priority)
+- New module `jf_members.py`: unified member identity, status model (active/left/kicked/restricted/unknown/inactive), activity tracking, and durable event journal (`jf_member_events`, `jf_member_meta`).
+- Additive schema only — no deletion of historical `group_members` / `role_*` data.
+- `mark_member_left` routes through the unified layer; leave releases role and records history + events.
+- Role assignment API with conflict detection and force-reassign; conflicts logged as events.
+- `/syncroles` report now separates list-1 / list-2 success, exact free count (catalog − taken), conflict count; partial publish is honest.
+- Old channel posts 40 and 41 remain never edited.
+
+### Economy
+- Shop items gained real slots (badge/frame/showcase/background/accessory).
+- Commands: `Надеть`, `Снять`, `Витрина`; inventory shows equipped loadout.
+- Table `jf_economy_equipped`; helper `get_equipped_items` for profile cards.
+
+### Tests
+- `test_members_unified`, `test_syncroles_publish`, `test_economy_equip` (+ prior 0.25.0 regression).
+
+
+## 0.25.0
+
+### Critical
+- **/syncroles** больше не редактирует исторические посты 40 и 41 в канале.
+  Каждая успешная синхронизация **отправляет новые** сообщения со списками ролей.
+  Старые сообщения остаются нетронутыми.
+- Отчёт `/syncroles` расширен: занято/свободно (оценка), число новых сообщений,
+  явное указание, что посты 40/41 не менялись, и оговорка про ограничения Bot API.
+- Добавлен cooldown (~90 с) для не-владельцев против случайных повторных публикаций.
+
+### Notes
+- Версия с 0.24.1 → 0.25.0 из-за изменения контракта публикации ролей.
+
+
 ## 0.16.0 — Core Audit & Command Registry (2026-11-11)
 
 ### Added

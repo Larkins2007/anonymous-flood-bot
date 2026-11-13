@@ -1,4 +1,6 @@
-# Justice Faite Manager — v0.24.1
+# Justice Faite Manager — v0.26.0
+
+Unified members layer (`jf_members`), hardened `/syncroles` (never edits posts 40/41; honest partial publish), equippable economy showcase. See `CHANGELOG.md` and `UPGRADE_0.25.0_TO_0.26.0.md`.
 
 aiogram 3 + SQLite, запуск на Render (`python bot.py`). Последние изменения Justice AI / Watch / Advisor описаны в `CHANGELOG.md`, `ADVISOR_WATCH_0.15.0.md`, `UPGRADE_0.15.1.md`, `AI_IDENTITY_VOICE_0.15.1.md` и `RENDER_PERSISTENCE_0.15.0.md`. Вход во флуд через бота **удалён**: бот работает с теми, кто уже во флуде, и с анонимной связью.
 
