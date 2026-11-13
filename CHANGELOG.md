@@ -47,6 +47,15 @@
 
 # Changelog
 
+## 0.26.1
+
+### Critical
+- `/syncroles` sends both role lists **only to the owner private chat** (`ADMIN_ID`).
+- No messages to `@Justice_faite` / `ROLE_INFO_CHANNEL`; posts 40/41 are never edited or touched.
+- Empty list sections are reported as empty, not as a hard publish error.
+- Long lists are split under the 4096 Telegram limit.
+- Membership check errors no longer block delivery of the known lists to the owner.
+
 ## 0.26.0
 
 ### Members & roles (priority)

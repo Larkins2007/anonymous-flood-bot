@@ -6033,12 +6033,8 @@ async def synchronize_registered_role_ids(chat_id: int, *, allow_empty: bool = F
     ).fetchall())
     active.update(str(row["role_key"]) for row in observed)
 
-    # A failed lookup means membership is unknown, not that the person left.
-    # Keep the published lists untouched until every registered ID was checked.
-    if errors:
-        return {"registered": len(mappings), "active": len(active), "left": left,
-                "errors": errors, "posts": ["Публикации не изменены: есть ошибки проверки статусов."],
-                "details": details[:15]}
+    # Membership lookup errors do not block sending the current known lists to the owner DM.
+    # Unknown membership is not treated as leave; active set already excludes failed IDs.
 
     # Render in the canonical region order; only confirmed active IDs get a yellow heart.
     first_regions = {"Mondstadt", "Liyue", "Inazuma", "Sumeru", "Fontaine"}
@@ -6056,45 +6052,76 @@ async def synchronize_registered_role_ids(chat_id: int, *, allow_empty: bool = F
             blocks.append("\n".join(lines))
         return "\n".join(blocks)
 
-    # Never edit historical posts 40/41. Always publish fresh list messages.
-    # Track each list independently so partial success is reported honestly.
+    # Role lists go ONLY to the owner private chat (ADMIN_ID).
+    # Never edit historical posts 40/41. Never post to the public channel.
     post_results = []
-    channel = os.getenv("ROLE_INFO_CHANNEL", "@Justice_faite").strip() or "@Justice_faite"
+    owner_id = int(ADMIN_ID or 0)
     published = 0
     list1_ok = False
     list2_ok = False
+
+    async def _send_owner_chunks(label: str, body: str) -> tuple[bool, str]:
+        """Send one list to owner DM; split at 4000 chars on blank lines when needed."""
+        if owner_id <= 0:
+            return False, f"{label}: ADMIN_ID не задан — список некуда отправить"
+        text_body = (body or "").strip()
+        if not text_body:
+            return False, f"{label}: список пуст (нет строк каталога для этого раздела)"
+        chunks = []
+        if len(text_body) <= 4000:
+            chunks = [text_body]
+        else:
+            parts, buf = [], []
+            for line in text_body.split("\n"):
+                candidate = ("\n".join(buf + [line])) if buf else line
+                if len(candidate) > 4000 and buf:
+                    parts.append("\n".join(buf))
+                    buf = [line]
+                else:
+                    buf.append(line)
+            if buf:
+                parts.append("\n".join(buf))
+            chunks = parts or [text_body[:4000]]
+        sent_ids = []
+        try:
+            for i, chunk in enumerate(chunks):
+                header = f"{label}" + (f" · часть {i+1}/{len(chunks)}" if len(chunks) > 1 else "")
+                payload = f"{header}\n\n{chunk}" if not chunk.startswith("✦") else chunk
+                if len(chunks) > 1 and not chunk.startswith(label):
+                    payload = f"{header}\n\n{chunk}"
+                sent = await bot.send_message(
+                    chat_id=owner_id,
+                    text=payload[:4096],
+                    disable_web_page_preview=True,
+                )
+                sent_ids.append(int(getattr(sent, "message_id", 0) or 0))
+            return True, f"{label}: отправлено вам в ЛС ({len(sent_ids)} сообщ., id={sent_ids})"
+        except TelegramForbiddenError:
+            return False, f"{label}: бот не может писать вам в ЛС — откройте диалог с ботом"
+        except TelegramBadRequest as exc:
+            return False, f"{label}: ошибка отправки в ЛС ({type(exc).__name__}: {str(exc)[:80]})"
+        except Exception as exc:
+            logger.exception("Role list DM failed | owner=%s label=%s", owner_id, label)
+            return False, f"{label}: ошибка отправки в ЛС ({type(exc).__name__})"
+
     list_labels = (
         (True, "Список 1 (Mondstadt–Fontaine)"),
         (False, "Список 2 (Natlan и прочие)"),
     )
-    for idx, (region_group, label) in enumerate(list_labels):
+    for idx_list, (region_group, label) in enumerate(list_labels):
         body = render(region_group)
-        if not body.strip():
-            post_results.append(f"{label}: пустой список, сообщение не отправлено")
-            continue
-        try:
-            sent = await bot.send_message(
-                chat_id=channel,
-                text=body,
-                disable_web_page_preview=True,
-            )
+        ok, note = await _send_owner_chunks(label, body)
+        post_results.append(note)
+        if ok:
             published += 1
-            mid = int(getattr(sent, "message_id", 0) or 0)
-            post_results.append(f"{label}: отправлено (message_id={mid})")
-            if idx == 0:
+            if idx_list == 0:
                 list1_ok = True
             else:
                 list2_ok = True
-        except TelegramForbiddenError:
-            errors += 1
-            post_results.append(f"{label}: НЕТ ПРАВ на отправку в {channel}")
-        except TelegramBadRequest as exc:
-            errors += 1
-            post_results.append(f"{label}: ошибка отправки ({type(exc).__name__}: {str(exc)[:80]})")
-        except Exception as exc:
-            errors += 1
-            post_results.append(f"{label}: ошибка отправки ({type(exc).__name__})")
-            logger.exception("Role roster new post failed | channel=%s region=%s", channel, label)
+        else:
+            # Empty catalog section is informational, not a hard error.
+            if "список пуст" not in note.casefold() and "ADMIN_ID не задан" not in note:
+                errors += 1
 
     conflicts = group_db_op(lambda conn: jf_members.find_role_conflicts(conn, chat_id))
     conflict_count = len(conflicts)
@@ -6241,7 +6268,8 @@ async def sync_roles_cmd(message: Message):
         f"Новых сообщений со списками: {published}",
         f"Ошибок: {result.get('errors', 0)}",
         "",
-        "Старые посты 40 и 41 не изменялись.",
+        "Списки ролей отправлены только вам в личные сообщения.",
+        "Публичный канал и посты 40/41 не затрагивались.",
     ]
     report.extend(result.get("posts") or [])
     if result.get("details"):
@@ -6262,7 +6290,7 @@ async def _console_sync_roles() -> str:
         + f"Список 1: {'ok' if roster.get('list1_ok') else 'fail'} · Список 2: {'ok' if roster.get('list2_ok') else 'fail'}\n"
         + f"Занято: {roster.get('taken', 0)} · Свободно: {roster.get('free', 0)} · Конфликты: {roster.get('conflicts', 0)}\n"
         + f"Новых сообщений отправлено: {published}\n"
-        + "Старые посты 40/41 не изменялись.\n"
+        + "Списки только в ЛС владельца; канал/посты 40/41 не трогались.\n"
         + "\n".join(roster.get("posts") or [])
     )
 
