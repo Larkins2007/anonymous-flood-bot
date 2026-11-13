@@ -27,23 +27,32 @@ FARM_COOLDOWN_HOURS = 4
 DAY_OFFSET_HOURS = int(__import__("os").getenv("JF_ECONOMY_UTC_OFFSET_HOURS", "3") or "3")
 ECONOMY_CLOCK_LABEL = "MSK" if DAY_OFFSET_HOURS == 3 else f"UTC{DAY_OFFSET_HOURS:+d}"
 SHOP = {
-    "значок": {"price": 30, "desc": "Коллекционный значок профиля"},
-    "рамка": {"price": 60, "desc": "Декоративная рамка профиля"},
-    "плюш": {"price": 45, "desc": "Коллекционная мягкая игрушка"},
-    "фон": {"price": 80, "desc": "Тематический фон профиля"},
-    "открытка": {"price": 15, "desc": "Коллекционная открытка"},
-    "книга": {"price": 35, "desc": "Декоративная книга для витрины"},
-    "брелок": {"price": 25, "desc": "Коллекционный брелок"},
-    "чашка": {"price": 30, "desc": "Чашка с символикой Justice Faite"},
-    "медаль": {"price": 70, "desc": "Декоративная медаль достижения"},
-    "постер": {"price": 55, "desc": "Тематический постер"},
-    "шарф": {"price": 40, "desc": "Декоративный шарф"},
-    "значок-клуба": {"price": 50, "desc": "Значок дружеской команды"},
+    # slot: which showcase slot the item can occupy when equipped
+    "значок": {"price": 30, "desc": "Значок профиля — можно надеть в слот «значок»", "slot": "badge", "emoji": "🎖️"},
+    "рамка": {"price": 60, "desc": "Рамка профиля — слот «рамка»", "slot": "frame", "emoji": "🖼️"},
+    "плюш": {"price": 45, "desc": "Плюш для витрины — слот «витрина»", "slot": "showcase", "emoji": "🧸"},
+    "фон": {"price": 80, "desc": "Фон карточки — слот «фон»", "slot": "background", "emoji": "🌄"},
+    "открытка": {"price": 15, "desc": "Открытка в витрине — слот «витрина»", "slot": "showcase", "emoji": "💌"},
+    "книга": {"price": 35, "desc": "Книга в витрине — слот «витрина»", "slot": "showcase", "emoji": "📖"},
+    "брелок": {"price": 25, "desc": "Брелок — слот «аксессуар»", "slot": "accessory", "emoji": "🔑"},
+    "чашка": {"price": 30, "desc": "Чашка Justice Faite — слот «витрина»", "slot": "showcase", "emoji": "☕"},
+    "медаль": {"price": 70, "desc": "Медаль — слот «значок»", "slot": "badge", "emoji": "🏅"},
+    "постер": {"price": 55, "desc": "Постер — слот «фон»", "slot": "background", "emoji": "🪧"},
+    "шарф": {"price": 40, "desc": "Шарф — слот «аксессуар»", "slot": "accessory", "emoji": "🧣"},
+    "значок-клуба": {"price": 50, "desc": "Значок клуба — слот «значок»", "slot": "badge", "emoji": "💠"},
+}
+SHOP_SLOTS = ("badge", "frame", "showcase", "background", "accessory")
+SLOT_LABELS = {
+    "badge": "Значок",
+    "frame": "Рамка",
+    "showcase": "Витрина",
+    "background": "Фон",
+    "accessory": "Аксессуар",
 }
 COMMANDS = (
     "/jf_economy", "баланс", "кошелёк", "кошелек", "топ богатых", "ферма", "фарм", "работа",
     "собрать", "посадить", "профессии", "профессия", "образование", "учиться", "магазин",
-    "купить", "инвентарь", "подарить", "задания", "задание", "достижения", "перевести",
+    "купить", "инвентарь", "надеть", "снять", "витрина", "подарить", "задания", "задание", "достижения", "перевести",
     "отн искры подарок", "отн подарок", "отн подарок витрина", "отн прем", "отн прем подарок", "отн задания", "отн история",
 )
 # `отн история связи` belongs to jf_social; prevent the broad economy-history
@@ -115,6 +124,9 @@ class Store:
             CREATE TABLE IF NOT EXISTS jf_economy_inventory(
                 chat_id INTEGER NOT NULL,user_id INTEGER NOT NULL,item TEXT NOT NULL,quantity INTEGER NOT NULL DEFAULT 0 CHECK(quantity>=0),
                 PRIMARY KEY(chat_id,user_id,item));
+            CREATE TABLE IF NOT EXISTS jf_economy_equipped(
+                chat_id INTEGER NOT NULL,user_id INTEGER NOT NULL,slot TEXT NOT NULL,item TEXT NOT NULL,
+                equipped_at TEXT NOT NULL, PRIMARY KEY(chat_id,user_id,slot));
             -- Retained only to preserve old farms from previous versions during upgrades.
             CREATE TABLE IF NOT EXISTS jf_economy_farms(
                 chat_id INTEGER NOT NULL,user_id INTEGER NOT NULL,crop TEXT NOT NULL,planted_at TEXT NOT NULL,
@@ -295,8 +307,18 @@ class Economy:
         if low in {"посадить", "учиться"} or low.startswith(("посадить ", "профессия", "профессии", "образование", "учиться ")):
             return await self.reply(m, "🌿 Мы упростили экономику: посадка растений, семена, курсы и профессии больше не нужны. Напиши <code>Ферма</code>, чтобы сразу получить жетоны; следующий сбор откроется через 4 часа.")
         if low == "магазин":
-            items = "\n".join(f"• <b>{esc(k)}</b> — {v['price']} {CURRENCY}. {esc(v['desc'])}." for k,v in SHOP.items())
-            return await self.reply(m, "🛍️ <b>Магазин Justice Faite</b>\n" + items + "\nПокупка: <code>Купить название</code>. Доступно 12 предметов, все только декоративные.")
+            items = "\n".join(
+                f"• <b>{esc(k)}</b> — {v['price']} {CURRENCY}. {esc(v['desc'])}."
+                for k, v in SHOP.items()
+            )
+            return await self.reply(
+                m,
+                "🛍️ <b>Магазин Justice Faite</b>\n"
+                + items
+                + "\nПокупка: <code>Купить название</code>."
+                + "\nНадеть: <code>Надеть название</code> · Снять: <code>Снять слот</code>."
+                + "\nСлоты: значок, рамка, витрина, фон, аксессуар. Витрина: <code>Витрина</code>.",
+            )
         if low in {"отн подарок витрина", "отн подарок витрина общая"}:
             rows = self.store.run(lambda c: c.execute(
                 "SELECT from_id,to_id,item,created_at FROM jf_economy_gifts WHERE chat_id=? ORDER BY id DESC LIMIT 10",
@@ -320,8 +342,65 @@ class Economy:
             return await self.reply(m, "💎 В Justice Faite нет платного VIP и покупаемых привилегий. Декоративные предметы за игровые жетоны находятся в команде <code>Магазин</code>. История уже подаренных предметов: <code>.отн подарок витрина общая</code>. Подарить предмет можно ответом на сообщение: <code>.отн подарок значок</code>.")
         if low == "инвентарь":
             rows = self.store.run(lambda c: c.execute("SELECT item,quantity FROM jf_economy_inventory WHERE chat_id=? AND user_id=? AND quantity>0 ORDER BY item", (chat, uid)).fetchall())
+            equipped = self.store.run(lambda c: c.execute("SELECT slot,item FROM jf_economy_equipped WHERE chat_id=? AND user_id=?", (chat, uid)).fetchall())
+            eq_map = {str(r["slot"]): str(r["item"]) for r in equipped}
             body = "\n".join(f"• {esc(r['item'])} × {r['quantity']}" for r in rows)
-            return await self.reply(m, "🎒 <b>Инвентарь</b>\n" + (body or "Пока пусто."))
+            eq_lines = []
+            for slot in SHOP_SLOTS:
+                item = eq_map.get(slot)
+                if item:
+                    meta = SHOP.get(item, {})
+                    eq_lines.append(f"• {SLOT_LABELS.get(slot, slot)}: {meta.get('emoji','')} {esc(item)}")
+            eq_block = ("\n\n<b>Надето</b>\n" + "\n".join(eq_lines)) if eq_lines else "\n\nНадетых предметов нет. <code>Надеть название</code>"
+            return await self.reply(m, "🎒 <b>Инвентарь</b>\n" + (body or "Пока пусто.") + eq_block)
+        if low.startswith("надеть "):
+            item = first[len("надеть "):].strip().casefold()
+            if item not in SHOP:
+                return await self.reply(m, "Такого предмета нет в магазине. Напиши <code>Магазин</code>.")
+            slot = SHOP[item]["slot"]
+            def equip(c):
+                row = c.execute("SELECT quantity FROM jf_economy_inventory WHERE chat_id=? AND user_id=? AND item=?", (chat, uid, item)).fetchone()
+                if not row or int(row[0]) < 1:
+                    raise ValueError("Сначала купи этот предмет: <code>Купить " + item + "</code>.")
+                c.execute(
+                    "INSERT INTO jf_economy_equipped(chat_id,user_id,slot,item,equipped_at) VALUES(?,?,?,?,?) "
+                    "ON CONFLICT(chat_id,user_id,slot) DO UPDATE SET item=excluded.item,equipped_at=excluded.equipped_at",
+                    (chat, uid, slot, item, iso()),
+                )
+            try:
+                self.store.run(equip, immediate=True)
+            except ValueError as e:
+                return await self.reply(m, str(e))
+            return await self.reply(m, f"✨ Надето: <b>{esc(item)}</b> → слот «{esc(SLOT_LABELS.get(slot, slot))}».")
+        if low.startswith("снять "):
+            token = first[len("снять "):].strip().casefold()
+            # accept slot label or key
+            slot = None
+            for key, label in SLOT_LABELS.items():
+                if token in {key, label.casefold()}:
+                    slot = key
+                    break
+            if slot is None and token in SHOP:
+                slot = SHOP[token]["slot"]
+            if slot is None:
+                return await self.reply(m, "Укажи слот: значок, рамка, витрина, фон, аксессуар.")
+            def unequip(c):
+                cur = c.execute("DELETE FROM jf_economy_equipped WHERE chat_id=? AND user_id=? AND slot=?", (chat, uid, slot))
+                return cur.rowcount
+            removed = self.store.run(unequip, immediate=True)
+            if not removed:
+                return await self.reply(m, f"В слоте «{esc(SLOT_LABELS.get(slot, slot))}» ничего не надето.")
+            return await self.reply(m, f"Слот «{esc(SLOT_LABELS.get(slot, slot))}» освобождён.")
+        if low == "витрина":
+            equipped = self.store.run(lambda c: c.execute("SELECT slot,item FROM jf_economy_equipped WHERE chat_id=? AND user_id=? ORDER BY slot", (chat, uid)).fetchall())
+            if not equipped:
+                return await self.reply(m, "Витрина пуста. Купи предмет в магазине и надень: <code>Надеть постер</code>.")
+            lines = []
+            for r in equipped:
+                item = str(r["item"])
+                meta = SHOP.get(item, {})
+                lines.append(f"{meta.get('emoji','•')} <b>{esc(SLOT_LABELS.get(str(r['slot']), r['slot']))}</b>: {esc(item)}")
+            return await self.reply(m, "🪞 <b>Твоя витрина</b>\n" + "\n".join(lines))
         if low == "отн подарок витрина моя":
             rows = self.store.run(lambda c: c.execute(
                 "SELECT from_id,item,created_at FROM jf_economy_gifts WHERE chat_id=? AND to_id=? ORDER BY id DESC LIMIT 15",
@@ -416,3 +495,26 @@ def register(dp, bot, F, db_path, lock=None):
     module = Economy(dp, bot, F, db_path, lock=lock)
     module.register()
     return module
+
+def get_equipped_items(store, chat_id, user_id):
+    """Return ordered equipped showcase for profile cards."""
+    try:
+        rows = store.run(lambda c: c.execute(
+            "SELECT slot,item FROM jf_economy_equipped WHERE chat_id=? AND user_id=?",
+            (int(chat_id), int(user_id)),
+        ).fetchall())
+    except Exception:
+        return []
+    out = []
+    for r in rows:
+        item = str(r["item"])
+        meta = SHOP.get(item, {})
+        out.append({
+            "slot": str(r["slot"]),
+            "label": SLOT_LABELS.get(str(r["slot"]), str(r["slot"])),
+            "item": item,
+            "emoji": meta.get("emoji", ""),
+            "desc": meta.get("desc", ""),
+        })
+    return out
+

@@ -228,7 +228,7 @@ def load() -> None:
     ))
     S(Spec(
         "syncroles", "Синхронизация ролей", "♻️", "roles",
-        "Сверить теги участников в Telegram с базой бота.",
+        "Сверить известных участников и реестр ID, опубликовать новые списки ролей (старые посты 40/41 не редактируются).",
         triggers=("/syncroles",), access="owner", access_options=("owner", "admins"), where="both",
         menu=(("syncroles", "♻️ Синхронизировать роли"),),
         params=(

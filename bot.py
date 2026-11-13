@@ -53,6 +53,7 @@ from aiogram.types import (
 import cmdcfg
 import cmdspecs
 import jf_role_registry
+import jf_members
 import settings_panel
 import ui as jfui
 from ui import title, section, bullet, note, divider, warning
@@ -69,6 +70,10 @@ PRIMARY_CHAT_ID = int(os.getenv("PRIMARY_CHAT_ID", "0") or "0")
 JF_ALLOW_EMPTY_DB_BOOTSTRAP = os.getenv("JF_ALLOW_EMPTY_DB_BOOTSTRAP", "false").strip().casefold() in {"1", "true", "yes", "on"}
 JF_STORAGE_DURABLE = os.getenv("JF_STORAGE_DURABLE", "false").strip().casefold() in {"1", "true", "yes", "on"}
 ROLE_SYNC_INTERVAL_SECONDS = max(300, int(os.getenv("ROLE_SYNC_INTERVAL_SECONDS", "300") or "300"))
+
+_SYNCROLES_LAST: dict[int, float] = {}
+_SYNCROLES_LOCK: asyncio.Lock | None = None
+_SYNCROLES_COOLDOWN_SECONDS = 90
 
 DB_PATH = os.getenv("DB_PATH", "users.db").strip() or "users.db"
 # Capture the true pre-start state before module registration can touch SQLite.
@@ -808,6 +813,7 @@ def init_group_db():
             """
         )
         jf_role_registry.init(conn)
+        jf_members.init_schema(conn)
         conn.commit()
     db_transaction(op)
 
@@ -4622,24 +4628,13 @@ def get_role_history(chat_id, user_id, limit=20):
 
 
 def mark_member_left(chat_id, user_id):
+    """Mark leave via unified members layer; history and role release are preserved."""
     def op(conn):
-        row = conn.execute("SELECT role_key, role_name, tag FROM group_members WHERE chat_id=? AND user_id=?", (chat_id,user_id)).fetchone()
-        stamp = now()
-        conn.execute(
-            "UPDATE group_members SET active=0, left_at=?, confirmed=0 WHERE chat_id=? AND user_id=?",
-            (stamp,chat_id,user_id),
-        )
-        if row and row["role_key"]:
-            conn.execute(
-                "INSERT INTO role_history(chat_id,user_id,role_key,role_name,tag,event,created_at) VALUES(?,?,?,?,?,?,?)",
-                (chat_id,user_id,row["role_key"],row["role_name"] or row["role_key"],row["tag"] or "","left",stamp),
-            )
-            conn.execute(
-                "UPDATE role_state SET user_id=NULL,status='free',bot_managed=0,legacy_marker='' WHERE chat_id=? AND role_key=? AND user_id=?",
-                (chat_id,row["role_key"],user_id),
-            )
+        jf_members.init_schema(conn)
+        before = jf_members.get_member(conn, chat_id, user_id)
+        jf_members.mark_leave(conn, chat_id, user_id, reason=jf_members.STATUS_LEFT, source="leave", release_role=True)
         conn.commit()
-        return dict(row) if row else None
+        return before
     return group_db_op(op)
 
 
@@ -5985,7 +5980,11 @@ async def synchronize_known_member_roles(chat_id: int) -> dict:
 
 
 async def synchronize_registered_role_ids(chat_id: int, *, allow_empty: bool = False) -> dict:
-    """Check owner-registered IDs and update the two public role-list posts."""
+    """Check owner-registered IDs and publish fresh public role-list messages.
+
+    Historical channel posts 40 and 41 are never edited. Each successful run
+    sends new messages with the current taken/free markers.
+    """
     mappings = group_db_op(lambda conn: jf_role_registry.rows(conn, chat_id))
     active, left, errors, details = set(), 0, 0, []
     for row in mappings:
@@ -6057,27 +6056,85 @@ async def synchronize_registered_role_ids(chat_id: int, *, allow_empty: bool = F
             blocks.append("\n".join(lines))
         return "\n".join(blocks)
 
+    # Never edit historical posts 40/41. Always publish fresh list messages.
+    # Track each list independently so partial success is reported honestly.
     post_results = []
     channel = os.getenv("ROLE_INFO_CHANNEL", "@Justice_faite").strip() or "@Justice_faite"
-    for message_id, region_group in ((40, True), (41, False)):
+    published = 0
+    list1_ok = False
+    list2_ok = False
+    list_labels = (
+        (True, "Список 1 (Mondstadt–Fontaine)"),
+        (False, "Список 2 (Natlan и прочие)"),
+    )
+    for idx, (region_group, label) in enumerate(list_labels):
         body = render(region_group)
+        if not body.strip():
+            post_results.append(f"{label}: пустой список, сообщение не отправлено")
+            continue
         try:
-            await bot.edit_message_text(chat_id=channel, message_id=message_id, text=body,
-                                        disable_web_page_preview=True)
-            post_results.append(f"Пост {message_id}: обновлён")
-        except TelegramBadRequest as exc:
-            if "message is not modified" in str(exc).casefold():
-                post_results.append(f"Пост {message_id}: уже актуален")
+            sent = await bot.send_message(
+                chat_id=channel,
+                text=body,
+                disable_web_page_preview=True,
+            )
+            published += 1
+            mid = int(getattr(sent, "message_id", 0) or 0)
+            post_results.append(f"{label}: отправлено (message_id={mid})")
+            if idx == 0:
+                list1_ok = True
             else:
-                errors += 1
-                post_results.append(f"Пост {message_id}: ошибка редактирования ({type(exc).__name__})")
+                list2_ok = True
+        except TelegramForbiddenError:
+            errors += 1
+            post_results.append(f"{label}: НЕТ ПРАВ на отправку в {channel}")
+        except TelegramBadRequest as exc:
+            errors += 1
+            post_results.append(f"{label}: ошибка отправки ({type(exc).__name__}: {str(exc)[:80]})")
         except Exception as exc:
             errors += 1
-            post_results.append(f"Пост {message_id}: ошибка редактирования ({type(exc).__name__})")
-            logger.exception("Role roster post update failed | post=%s", message_id)
+            post_results.append(f"{label}: ошибка отправки ({type(exc).__name__})")
+            logger.exception("Role roster new post failed | channel=%s region=%s", channel, label)
 
-    return {"registered": len(mappings), "active": len(active), "left": left,
-            "errors": errors, "posts": post_results, "details": details[:15]}
+    conflicts = group_db_op(lambda conn: jf_members.find_role_conflicts(conn, chat_id))
+    conflict_count = len(conflicts)
+    for c in conflicts[:10]:
+        details.append(
+            f"Конфликт роли {c.get('role_name')}: user_ids={c.get('user_ids')}"
+        )
+        jf_members.log_event  # keep name bound for static analysis
+    def _log_conflicts(conn):
+        jf_members.init_schema(conn)
+        for c in conflicts:
+            for uid in c.get("user_ids") or []:
+                jf_members.log_event(
+                    conn, chat_id, int(uid), jf_members.EVENT_ROLE_CONFLICT,
+                    payload=f"role={c.get('role_name')};users={c.get('user_ids')}",
+                    source="syncroles",
+                )
+        conn.commit()
+    if conflicts:
+        group_db_op(_log_conflicts)
+
+    catalog_size = len(ROLE_CATALOG) if ROLE_CATALOG else 0
+    taken = len(active)
+    free_exact = max(0, catalog_size - taken) if catalog_size else 0
+
+    return {
+        "registered": len(mappings),
+        "active": len(active),
+        "left": left,
+        "errors": errors,
+        "posts": post_results,
+        "details": details[:20],
+        "published": published,
+        "list1_ok": list1_ok,
+        "list2_ok": list2_ok,
+        "taken": taken,
+        "free": free_exact,
+        "conflicts": conflict_count,
+        "checked_users": len(mappings),
+    }
 
 
 @dp.message(Command("roleid"), F.chat.type == "private")
@@ -6144,13 +6201,53 @@ async def roleid_remove_cmd(message: Message):
 async def sync_roles_cmd(message: Message):
     if not await cmdcfg.gate(message, "syncroles"):
         return
+    uid = int(message.from_user.id) if message.from_user else 0
+    is_owner = uid == int(ADMIN_ID)
+    # Rate-limit parallel / repeated runs (owner is never blocked hard).
+    global _SYNCROLES_LOCK
+    if _SYNCROLES_LOCK is None:
+        _SYNCROLES_LOCK = asyncio.Lock()
+    async with _SYNCROLES_LOCK:
+        import time as _time
+        now = _time.monotonic()
+        last = float(_SYNCROLES_LAST.get(uid, 0) or 0)
+        if not is_owner and (now - last) < _SYNCROLES_COOLDOWN_SECONDS:
+            wait = int(_SYNCROLES_COOLDOWN_SECONDS - (now - last))
+            await message.answer(f"Синхронизация уже выполнялась недавно. Подождите ещё ~{wait} с.")
+            return
+        _SYNCROLES_LAST[uid] = now
+
     # Preserve legacy sender-tag synchronization and then reconcile the owner roster.
+    # Old channel posts 40 and 41 are never edited — fresh lists are published.
     legacy = await synchronize_known_member_roles(PRIMARY_CHAT_ID)
     result = await synchronize_registered_role_ids(PRIMARY_CHAT_ID)
-    report = ["◈ Синхронизация занятых ролей", f"Известных участников проверено: {legacy['checked']}", f"Зарегистрировано ID: {result['registered']}",
-              f"Сейчас в чате: {result['active']}", f"Вышли: {result['left']}",
-              f"Ошибок: {result['errors']}", *result["posts"]]
-    if result["details"]: report += ["", *result["details"]]
+    taken = int(result.get("taken") or 0)
+    free_exact = int(result.get("free") or 0)
+    published = int(result.get("published") or 0)
+    list1_ok = bool(result.get("list1_ok"))
+    list2_ok = bool(result.get("list2_ok"))
+    conflicts = int(result.get("conflicts") or 0)
+    report = [
+        "◈ Синхронизация ролей",
+        f"Известных участников проверено: {legacy.get('checked', 0)}",
+        f"Зарегистрировано ID в реестре: {result.get('registered', 0)}",
+        f"Подтверждено в чате: {result.get('active', 0)}",
+        f"Отмечено вышедшими: {result.get('left', 0)}",
+        f"Ролей занято (подтверждено): {taken}",
+        f"Ролей свободно: {free_exact}",
+        f"Конфликтов ролей: {conflicts}",
+        f"Список 1 отправлен: {'да' if list1_ok else 'нет'}",
+        f"Список 2 отправлен: {'да' if list2_ok else 'нет'}",
+        f"Новых сообщений со списками: {published}",
+        f"Ошибок: {result.get('errors', 0)}",
+        "",
+        "Старые посты 40 и 41 не изменялись.",
+    ]
+    report.extend(result.get("posts") or [])
+    if result.get("details"):
+        report += ["", "Детали:", *result["details"]]
+    report.append("")
+    report.append("Сверка выполнена по известным и зарегистрированным участникам. Полный список всех участников группы через Bot API недоступен.")
     report_to = ADMIN_ID if cmdcfg.get_str("syncroles", "report_to") != "here" else message.chat.id
     await bot.send_message(report_to, "\n".join(report))
 
@@ -6158,9 +6255,16 @@ async def sync_roles_cmd(message: Message):
 async def _console_sync_roles() -> str:
     legacy = await synchronize_known_member_roles(PRIMARY_CHAT_ID)
     roster = await synchronize_registered_role_ids(PRIMARY_CHAT_ID)
-    return (legacy["report"] + "\n\nСписок занятых ролей:\n" +
-            f"ID: {roster['registered']} · в чате: {roster['active']} · вышли: {roster['left']} · ошибки: {roster['errors']}\n" +
-            "\n".join(roster["posts"]))
+    published = int(roster.get("published") or 0)
+    return (
+        legacy.get("report", "") + "\n\nСписок занятых ролей:\n"
+        + f"ID: {roster.get('registered', 0)} · в чате: {roster.get('active', 0)} · вышли: {roster.get('left', 0)} · ошибки: {roster.get('errors', 0)}\n"
+        + f"Список 1: {'ok' if roster.get('list1_ok') else 'fail'} · Список 2: {'ok' if roster.get('list2_ok') else 'fail'}\n"
+        + f"Занято: {roster.get('taken', 0)} · Свободно: {roster.get('free', 0)} · Конфликты: {roster.get('conflicts', 0)}\n"
+        + f"Новых сообщений отправлено: {published}\n"
+        + "Старые посты 40/41 не изменялись.\n"
+        + "\n".join(roster.get("posts") or [])
+    )
 
 
 # The owner console's role button runs a real Telegram check, not only a redraw
