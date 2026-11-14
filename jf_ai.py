@@ -104,6 +104,13 @@ class JusticeAI:
         if not self.registered:
             self.dp.message.register(self.handle, self.F.chat.type.in_(GROUP_TYPES), self.F.text.regexp(PATTERN))
             self.dp.message.register(self.handle, self.F.chat.type == "private", self.F.text.regexp(OWNER_PRIVATE_PATTERN))
+            self.dp.message.register(
+                self.handle,
+                self.F.chat.type == "private",
+                self.F.text,
+                ~self.F.text.startswith("/"),
+                lambda m: bool(self.owner_id and m.from_user and int(m.from_user.id) == self.owner_id),
+            )
             self.registered = True
 
     async def reply(self, m, text):
@@ -736,9 +743,12 @@ class JusticeAI:
                 "В групповом контексте Telegram ID, username, реальные имена и ID сообщений заменяются псевдонимами до отправки провайдеру. Запрос и контекст обрабатываются локальной моделью на подключённом планшете. Не отправляй секреты и личные документы.")
 
         match = re.match(r"(?isu)^\s*джастис\s+(.+)$", raw)
-        if not match:
+        if match:
+            prompt = match.group(1).strip()
+        elif is_owner_private:
+            prompt = raw
+        else:
             return
-        prompt = match.group(1).strip()
         if not prompt:
             return await self.reply(m, "Напиши вопрос после обращения: Джастис ... .")
         if len(prompt) > 2000:
