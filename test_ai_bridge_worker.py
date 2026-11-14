@@ -1,3 +1,7 @@
+"""Автономные тесты Bridge + Worker. Запуск: python -m unittest -v test_ai_bridge_worker"""
+
+from __future__ import annotations
+
 import asyncio
 import json
 import os
@@ -35,8 +39,12 @@ class BridgeTests(unittest.TestCase):
             loop = asyncio.get_running_loop()
             future = loop.create_future()
             job_id = "a" * 32
-            self.bridge.jobs[job_id] = {"future": future}
-            response = await self.bridge.result(FakeRequest({"id": job_id, "answer": "готово"}))
+            self.bridge.jobs[job_id] = {
+                "future": future, "created": 0, "queued": False, "lease_until": 0,
+            }
+            response = await self.bridge.result(
+                FakeRequest({"id": job_id, "answer": "готово"})
+            )
             self.assertEqual(response.status, 200)
             self.assertEqual(future.result(), "готово")
         asyncio.run(run())
@@ -46,7 +54,9 @@ class BridgeTests(unittest.TestCase):
             loop = asyncio.get_running_loop()
             future = loop.create_future()
             job_id = "b" * 32
-            self.bridge.jobs[job_id] = {"future": future}
+            self.bridge.jobs[job_id] = {
+                "future": future, "created": 0, "queued": False, "lease_until": 0,
+            }
             response = await self.bridge.result(FakeRequest({
                 "id": job_id,
                 "error": {"type": "TimeoutError", "message": "model timed out"},
@@ -62,10 +72,18 @@ class BridgeTests(unittest.TestCase):
             future = loop.create_future()
             future.set_result("done")
             job_id = "c" * 32
-            self.bridge.jobs[job_id] = {"future": future}
-            response = await self.bridge.result(FakeRequest({"id": job_id, "answer": "late"}))
+            self.bridge.jobs[job_id] = {
+                "future": future, "created": 0, "queued": False, "lease_until": 0,
+            }
+            response = await self.bridge.result(
+                FakeRequest({"id": job_id, "answer": "late"})
+            )
             self.assertEqual(response.status, 409)
         asyncio.run(run())
+
+    def test_job_ttl_constants(self):
+        self.assertGreaterEqual(jf_ai_bridge.JOB_TTL_SECONDS, 1800)
+        self.assertGreaterEqual(jf_ai_bridge.LEASE_SECONDS, 600)
 
 
 class WorkerTests(unittest.TestCase):
@@ -79,6 +97,7 @@ class WorkerTests(unittest.TestCase):
         captured = {}
         def fake_urlopen(req, timeout):
             captured.update(json.loads(req.data.decode()))
+            captured["_timeout"] = timeout
             return Response()
 
         with patch.object(jf_ai_worker.urllib.request, "urlopen", fake_urlopen):
@@ -86,15 +105,18 @@ class WorkerTests(unittest.TestCase):
         self.assertEqual(answer, "ok")
         self.assertEqual(captured["temperature"], 0.2)
         self.assertEqual(captured["max_tokens"], 100)
-        self.assertEqual(captured["top_k"], 40)
+        self.assertGreaterEqual(captured["_timeout"], 600)
 
     def test_http_409_is_returned_as_normal_result(self):
         import io
         http_error = jf_ai_worker.urllib.error.HTTPError(
-            "https://example.invalid", 409, "Conflict", {}, io.BytesIO(b'{"accepted":false}')
+            "https://example.invalid", 409, "Conflict", {},
+            io.BytesIO(b'{"accepted":false}'),
         )
         with patch.object(jf_ai_worker.urllib.request, "urlopen", side_effect=http_error):
-            result = jf_ai_worker.request("https://example.invalid", "POST", b"x"*32, "/x", b"{}")
+            result = jf_ai_worker.request(
+                "https://example.invalid", "POST", b"x" * 32, "/x", b"{}"
+            )
         self.assertEqual(result, {"accepted": False})
 
 

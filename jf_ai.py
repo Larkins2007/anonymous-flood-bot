@@ -81,7 +81,8 @@ class JusticeAI:
     def __init__(self, dp, bot, F):
         self.dp, self.bot, self.F = dp, bot, F
         self.enabled = os.getenv("JF_AI_ENABLED", "false").strip().casefold() in {"1", "true", "yes", "on"}
-        self.timeout = max(30, min(240, int(os.getenv("JF_AI_TIMEOUT", "240") or "240")))
+        # Long-running local generation support (up to 1 hour). Default 30 minutes.
+        self.timeout = max(60, min(3600, int(os.getenv("JF_AI_TIMEOUT", "1800") or "1800")))
         self.histories: dict[tuple[int, int], Deque[dict]] = defaultdict(lambda: deque(maxlen=12))
         self.last_call: dict[tuple[int, int], float] = {}
         self.minute_calls: dict[tuple[int, int], Deque[float]] = defaultdict(deque)
@@ -104,13 +105,6 @@ class JusticeAI:
         if not self.registered:
             self.dp.message.register(self.handle, self.F.chat.type.in_(GROUP_TYPES), self.F.text.regexp(PATTERN))
             self.dp.message.register(self.handle, self.F.chat.type == "private", self.F.text.regexp(OWNER_PRIVATE_PATTERN))
-            self.dp.message.register(
-                self.handle,
-                self.F.chat.type == "private",
-                self.F.text,
-                ~self.F.text.startswith("/"),
-                lambda m: bool(self.owner_id and m.from_user and int(m.from_user.id) == self.owner_id),
-            )
             self.registered = True
 
     async def reply(self, m, text):
@@ -228,19 +222,6 @@ class JusticeAI:
         chat = getattr(message, "chat", None)
         if not chat or int(getattr(chat, "id", 0) or 0) != int(self.primary_chat_id):
             return ""
-
-        reply_obj = getattr(message, "reply_to_message", None)
-        archive_intent = re.search(
-            r"(?iu)\b(?:архив|истори\w*|переписк\w*|сообщени\w*|"
-            r"писал\w*|говорил\w*|обсуждал\w*|конфликт\w*|ссор\w*|"
-            r"жалоб\w*|нарушен\w*|модерац\w*|участник\w*|роль\w*|"
-            r"доказательств\w*|вчера|позавчера|недавно|кто начал|"
-            r"кто виноват|что произошло|что случилось)\b",
-            str(prompt or ""),
-        )
-        if not archive_intent and reply_obj is None:
-            return ""
-
         try:
             columns = self.store.run(lambda c: {str(r[1]) for r in c.execute("PRAGMA table_info(jf_chat_message_log)").fetchall()})
             username_expr = "sender_username" if "sender_username" in columns else "'' AS sender_username"
@@ -256,7 +237,7 @@ class JusticeAI:
             ).fetchall())
             rows = list(reversed(rows))
             archive_rows = self.store.run(lambda c: c.execute(
-                f"SELECT {select} FROM jf_chat_message_log WHERE chat_id=? AND direction='in' ORDER BY message_at DESC,id DESC LIMIT 5000",
+                f"SELECT {select} FROM jf_chat_message_log WHERE chat_id=? AND direction='in' ORDER BY message_at DESC,id DESC LIMIT 25000",
                 (int(self.primary_chat_id),),
             ).fetchall())
             by_message = {int(r["message_id"]): r for r in archive_rows if int(r["message_id"] or 0)}
@@ -488,7 +469,7 @@ class JusticeAI:
                 relation_bits.append("упоминания — " + ", ".join(describe_uid(x) for x in current_targets[:8]))
 
             lines = []
-            for row in rows[-30:]:
+            for row in rows[-(self.context_recent_limit + 15):]:
                 uid = int(row["sender_user_id"] or 0)
                 alias = ensure_alias(uid)
                 body = self._safe_context_body(row["body"], name_alias_pairs)
@@ -627,7 +608,9 @@ class JusticeAI:
                 ))
             if dialogue:
                 blocks.append("ПОСЛЕДНИЙ ДИАЛОГ В ЛС:\n" + "\n".join(dialogue[-10:]))
-            return "\n\n".join(blocks)[-9000:]
+            joined = "\n\n".join(blocks)
+            speed = os.getenv("JF_AI_SPEED", "").strip().casefold() in {"1", "true", "yes", "on"}
+            return joined[(-4500 if speed else -7000):]
         except Exception:
             logger.exception("Could not build owner-private Justice AI context")
             return ""
@@ -643,7 +626,7 @@ class JusticeAI:
 
     @staticmethod
     def _completion_budget(prompt):
-        """Keep routine flood replies compact; reserve a larger budget for explicit deep dives."""
+        """Speed-first budgets: short by default, larger only for explicit deep dives."""
         question = str(prompt or "")
         for marker in ("ВОПРОС УЧАСТНИКА:", "ВОПРОС ВЛАДЕЛЬЦА:"):
             if marker in question:
@@ -654,21 +637,21 @@ class JusticeAI:
             r"перечисли|список|варианты|все способы)\b",
             question,
         )
-        return 650 if detailed else 260
+        # SPEED mode: even tighter defaults (env JF_AI_SPEED=1)
+        speed = os.getenv("JF_AI_SPEED", "").strip().casefold() in {"1", "true", "yes", "on"}
+        if detailed:
+            return 420 if speed else 520
+        return 140 if speed else 180
 
     async def _generate(self, key, prompt, system_prompt=None):
         if not self.bridge or not self.bridge.ready:
             raise RuntimeError("Локальная модель недоступна. Внешний API отключён.")
 
         messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}]
-        for item in list(self._history(key))[-4:]:
-            if isinstance(item, dict):
-                item = dict(item)
-                content = item.get("content", "")
-                if isinstance(content, str):
-                    item["content"] = content[-1800:]
-                messages.append(item)
-
+        # SPEED: send fewer history turns to cut prompt evaluation time
+        hist = self._history(key)
+        speed = os.getenv("JF_AI_SPEED", "").strip().casefold() in {"1", "true", "yes", "on"}
+        messages.extend(hist[-2:] if speed else hist[-3:])
         messages.append({"role": "user", "content": prompt})
 
         answer = await self.bridge.generate(
@@ -743,12 +726,9 @@ class JusticeAI:
                 "В групповом контексте Telegram ID, username, реальные имена и ID сообщений заменяются псевдонимами до отправки провайдеру. Запрос и контекст обрабатываются локальной моделью на подключённом планшете. Не отправляй секреты и личные документы.")
 
         match = re.match(r"(?isu)^\s*джастис\s+(.+)$", raw)
-        if match:
-            prompt = match.group(1).strip()
-        elif is_owner_private:
-            prompt = raw
-        else:
+        if not match:
             return
+        prompt = match.group(1).strip()
         if not prompt:
             return await self.reply(m, "Напиши вопрос после обращения: Джастис ... .")
         if len(prompt) > 2000:
@@ -805,7 +785,8 @@ class JusticeAI:
         except Exception:
             logger.exception("Justice AI request failed | chat_type=%s", chat_type)
             return await self.reply(m, "Не удалось получить ответ от локальной модели. Проверьте подключение планшета и журнал сервиса.")
-        self.histories[key].append({"role": "user", "content": model_prompt[-9000:]})
+        # Keep compact history entries (speed + less prompt bloat next turn)
+        self.histories[key].append({"role": "user", "content": model_prompt[-2500:]})
         self.histories[key].append({"role": "assistant", "content": answer})
         sent = await self.reply(m, answer)
         if is_private and self.store and sent is not None:
