@@ -221,6 +221,19 @@ class JusticeAI:
         chat = getattr(message, "chat", None)
         if not chat or int(getattr(chat, "id", 0) or 0) != int(self.primary_chat_id):
             return ""
+
+        reply_obj = getattr(message, "reply_to_message", None)
+        archive_intent = re.search(
+            r"(?iu)\b(?:архив|истори\w*|переписк\w*|сообщени\w*|"
+            r"писал\w*|говорил\w*|обсуждал\w*|конфликт\w*|ссор\w*|"
+            r"жалоб\w*|нарушен\w*|модерац\w*|участник\w*|роль\w*|"
+            r"доказательств\w*|вчера|позавчера|недавно|кто начал|"
+            r"кто виноват|что произошло|что случилось)\b",
+            str(prompt or ""),
+        )
+        if not archive_intent and reply_obj is None:
+            return ""
+
         try:
             columns = self.store.run(lambda c: {str(r[1]) for r in c.execute("PRAGMA table_info(jf_chat_message_log)").fetchall()})
             username_expr = "sender_username" if "sender_username" in columns else "'' AS sender_username"
@@ -236,7 +249,7 @@ class JusticeAI:
             ).fetchall())
             rows = list(reversed(rows))
             archive_rows = self.store.run(lambda c: c.execute(
-                f"SELECT {select} FROM jf_chat_message_log WHERE chat_id=? AND direction='in' ORDER BY message_at DESC,id DESC LIMIT 25000",
+                f"SELECT {select} FROM jf_chat_message_log WHERE chat_id=? AND direction='in' ORDER BY message_at DESC,id DESC LIMIT 5000",
                 (int(self.primary_chat_id),),
             ).fetchall())
             by_message = {int(r["message_id"]): r for r in archive_rows if int(r["message_id"] or 0)}
@@ -468,7 +481,7 @@ class JusticeAI:
                 relation_bits.append("упоминания — " + ", ".join(describe_uid(x) for x in current_targets[:8]))
 
             lines = []
-            for row in rows[-(self.context_recent_limit + 15):]:
+            for row in rows[-30:]:
                 uid = int(row["sender_user_id"] or 0)
                 alias = ensure_alias(uid)
                 body = self._safe_context_body(row["body"], name_alias_pairs)
@@ -641,7 +654,14 @@ class JusticeAI:
             raise RuntimeError("Локальная модель недоступна. Внешний API отключён.")
 
         messages = [{"role": "system", "content": system_prompt or SYSTEM_PROMPT}]
-        messages.extend(self._history(key))
+        for item in list(self._history(key))[-4:]:
+            if isinstance(item, dict):
+                item = dict(item)
+                content = item.get("content", "")
+                if isinstance(content, str):
+                    item["content"] = content[-1800:]
+                messages.append(item)
+
         messages.append({"role": "user", "content": prompt})
 
         answer = await self.bridge.generate(
