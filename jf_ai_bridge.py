@@ -147,7 +147,7 @@ class AIJobBridge:
             return web.Response(status=204)
 
         job["queued"] = False
-        job["lease_until"] = time.time() + 45
+        job["lease_until"] = time.time() + 210
 
         return web.json_response({
             "id": job["id"],

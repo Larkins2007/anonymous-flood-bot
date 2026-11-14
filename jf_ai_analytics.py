@@ -75,7 +75,7 @@ class JusticeAIAnalytics:
         self.periodic_hours = max(1, min(12, int(os.getenv("JF_AI_ANALYTICS_INTERVAL_HOURS", "3") or "3")))
         self.daily_hour = max(0, min(23, int(os.getenv("JF_AI_ANALYTICS_DAILY_HOUR", "21") or "21")))
         self.utc_offset = max(-12, min(14, int(os.getenv("JF_AI_ANALYTICS_UTC_OFFSET_HOURS", "3") or "3")))
-        self.timeout = max(10, min(90, int(os.getenv("JF_AI_TIMEOUT", "45") or "45")))
+        self.timeout = max(10, min(210, int(os.getenv("JF_AI_TIMEOUT", "210") or "210")))
         self.watch_enabled = os.getenv("JF_AI_WATCH_ENABLED", "true").strip().casefold() in {"1", "true", "yes", "on"}
         self.watch_poll_seconds = max(30, min(300, int(os.getenv("JF_AI_WATCH_POLL_SECONDS", "120") or "120")))
         # Detection remains frequent and cheap; owner notifications are separately
