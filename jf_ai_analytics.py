@@ -15,8 +15,6 @@ import sqlite3
 import time
 from datetime import datetime, timedelta, timezone
 
-import aiohttp
-
 from jf_ai import clean_ai_text
 
 logger = logging.getLogger("justice-faite-ai-analytics")
@@ -78,9 +76,6 @@ class JusticeAIAnalytics:
         self.daily_hour = max(0, min(23, int(os.getenv("JF_AI_ANALYTICS_DAILY_HOUR", "21") or "21")))
         self.utc_offset = max(-12, min(14, int(os.getenv("JF_AI_ANALYTICS_UTC_OFFSET_HOURS", "3") or "3")))
         self.timeout = max(10, min(90, int(os.getenv("JF_AI_TIMEOUT", "45") or "45")))
-        self.base_url = os.getenv("JF_AI_BASE_URL", "https://api.groq.com/openai/v1/chat/completions").strip()
-        self.api_key = os.getenv("JF_AI_API_KEY", "").strip()
-        self.model = os.getenv("JF_AI_MODEL", "openai/gpt-oss-20b").strip()
         self.watch_enabled = os.getenv("JF_AI_WATCH_ENABLED", "true").strip().casefold() in {"1", "true", "yes", "on"}
         self.watch_poll_seconds = max(30, min(300, int(os.getenv("JF_AI_WATCH_POLL_SECONDS", "120") or "120")))
         # Detection remains frequent and cheap; owner notifications are separately
@@ -417,13 +412,25 @@ class JusticeAIAnalytics:
                     logger.warning("Analytics report delivery attempt %s failed (%s); retry scheduled", attempts, error_name)
         await self._notify_pending_terminal_failures()
 
+    async def _local_response(self, payload):
+        bridge = getattr(self, "bridge", None)
+        if not bridge or not bridge.ready:
+            raise RuntimeError("Локальная модель недоступна.")
+        answer = await bridge.generate(
+            payload["messages"],
+            payload.get("max_completion_tokens", 500),
+            self.timeout,
+            payload.get("response_format"),
+        )
+        return {"choices": [{"message": {"content": str(answer or "")}}]}
+
     async def consolidate_flood_memory_once(self):
         """Create one compact, group-level memory summary from a bounded batch.
 
         Runs inside the existing analytics worker (no second task/collector). The
         provider receives no Telegram identifiers, usernames or display names.
         """
-        if not (self.flood_memory_enabled and self.enabled and self.api_key and self.base_url and self.model and self.chat_id):
+        if not (self.flood_memory_enabled and self.enabled and getattr(self, 'bridge', None) and self.bridge.ready and self.chat_id):
             return 0
         state = self.store.run(lambda c: dict(c.execute(
             "SELECT key,value FROM jf_ai_analytics_state WHERE key IN ('flood_memory_cursor','flood_memory_next_at')"
@@ -518,7 +525,6 @@ class JusticeAIAnalytics:
         user_content = ("Предыдущая сводная память (обнови и дополни только если новые сообщения это поддерживают):\n" + prior_summary[:1800] + "\n\n" if prior_summary else "")
         user_content += "Новая обезличенная выборка основного чата (повторы удалены):\n" + "\n".join(lines[-120:])[-12000:]
         payload = {
-            "model": self.model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": user_content},
@@ -533,13 +539,7 @@ class JusticeAIAnalytics:
             "UPDATE jf_ai_analytics_state SET value=? WHERE key='flood_memory_next_at'",
             ((now + timedelta(hours=self.flood_memory_interval_hours)).isoformat(),)
         ))
-        timeout = aiohttp.ClientTimeout(total=self.timeout)
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(self.base_url, json=payload, headers=headers) as response:
-                if response.status >= 400:
-                    raise RuntimeError(f"Flood memory provider HTTP {response.status}")
-                data = await response.json()
+        data = await self._local_response(payload)
         summary = clean_ai_text((((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""))
         if not summary:
             raise RuntimeError("Flood memory provider returned an empty summary")
@@ -584,7 +584,7 @@ class JusticeAIAnalytics:
 
     async def consolidate_owner_memory_once(self):
         """Compact owner-only private dialogue; never shares it with flood memory."""
-        if not (self.owner_memory_enabled and self.enabled and self.api_key and self.base_url and self.model and self.owner_id):
+        if not (self.owner_memory_enabled and self.enabled and getattr(self, 'bridge', None) and self.bridge.ready and self.owner_id):
             return 0
         state = self.store.run(lambda c: dict(c.execute(
             "SELECT key,value FROM jf_ai_analytics_state WHERE key IN ('owner_memory_cursor','owner_memory_next_at')"
@@ -651,19 +651,13 @@ class JusticeAIAnalytics:
         )
         user_content = ("Предыдущая сводка (обнови только при наличии новых подтверждений):\n" + prior[:1800] + "\n\n" if prior else "")
         user_content += "Новые сообщения личного диалога владельца:\n" + "\n".join(items[-80:])[-10000:]
-        payload = {"model": self.model, "messages": [{"role": "system", "content": system}, {"role": "user", "content": user_content}],
+        payload = {"messages": [{"role": "system", "content": system}, {"role": "user", "content": user_content}],
                    "max_completion_tokens": 450, "stream": False, "temperature": 0.1}
         self.store.run(lambda c: c.execute(
             "UPDATE jf_ai_analytics_state SET value=? WHERE key='owner_memory_next_at'",
             ((now + timedelta(hours=self.owner_memory_interval_hours)).isoformat(),)
         ))
-        timeout = aiohttp.ClientTimeout(total=self.timeout)
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(self.base_url, json=payload, headers=headers) as response:
-                if response.status >= 400:
-                    raise RuntimeError(f"Owner memory provider HTTP {response.status}")
-                data = await response.json()
+        data = await self._local_response(payload)
         summary = clean_ai_text((((data.get("choices") or [{}])[0].get("message") or {}).get("content") or ""))
         if not summary:
             raise RuntimeError("Owner memory provider returned an empty summary")
@@ -717,7 +711,7 @@ class JusticeAIAnalytics:
         return start, end, len(rows), int(participant_count or 0), sample
 
     async def _generate(self, report_type: str, hours: int):
-        if not (self.enabled and self.api_key and self.base_url and self.model):
+        if not (self.enabled and getattr(self, 'bridge', None) and self.bridge.ready):
             raise RuntimeError("AI analytics is not configured")
         start, end, message_count, participant_count, sample = await self._source_data(hours)
         stats = self.local_statistics(hours)
@@ -728,7 +722,6 @@ class JusticeAIAnalytics:
                      f"Сообщений в архиве: {message_count}. Уникальных авторов по внутреннему счётчику: {participant_count}.\n\n" \
                      f"Обезличенная выборка (повторы удалены, до 100 сообщений):\n{sample}"
             payload = {
-                "model": self.model,
                 "messages": [
                     {"role": "system", "content": ANALYSIS_SYSTEM},
                     {"role": "user", "content": f"Тип отчёта: {report_type}.\n{period}"},
@@ -736,20 +729,7 @@ class JusticeAIAnalytics:
                 "max_completion_tokens": 900,
                 "stream": False,
             }
-            timeout = aiohttp.ClientTimeout(total=self.timeout)
-            headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-            async with aiohttp.ClientSession(timeout=timeout) as session:
-                async with session.post(self.base_url, json=payload, headers=headers) as response:
-                    if response.status >= 400:
-                        detail = ""
-                        try:
-                            data = await response.json()
-                            error = data.get("error", {}) if isinstance(data, dict) else {}
-                            detail = error.get("message", "") if isinstance(error, dict) else str(error)
-                        except Exception:
-                            pass
-                        raise RuntimeError(f"AI provider HTTP {response.status}: {detail[:180]}")
-                    data = await response.json()
+            data = await self._local_response(payload)
             content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
             report = clean_ai_text(str(content).strip())
             if not report:
@@ -1235,8 +1215,8 @@ class JusticeAIAnalytics:
         return parsed
 
     async def _semantic_review_once(self):
-        """Review a bounded batch of new text with Groq; never execute moderation."""
-        if not (self.semantic_enabled and self.enabled and self.api_key and self.base_url and self.model):
+        """Review a bounded batch of new text with the local model; never execute moderation."""
+        if not (self.semantic_enabled and self.enabled and getattr(self, 'bridge', None) and self.bridge.ready):
             return 0
         state = self.store.run(lambda c: dict(c.execute(
             "SELECT key,value FROM jf_ai_analytics_state WHERE key IN ('semantic_cursor','next_semantic_scan')"
@@ -1286,7 +1266,7 @@ class JusticeAIAnalytics:
         candidates = candidates[:self.semantic_batch_size]
 
         # Resolve Telegram entities locally. Only pseudonyms and synthetic batch
-        # labels are sent to Groq; raw Telegram IDs, usernames and display names stay local.
+        # labels are sent to the local model; raw Telegram IDs, usernames and display names stay local.
         authors = {}
         id_map = {}
         prompt_lines = []
@@ -1392,7 +1372,6 @@ class JusticeAIAnalytics:
             "Выводи только JSON, не добавляй Markdown и пояснения вне JSON."
         )
         payload = {
-            "model": self.model,
             "messages": [
                 {"role": "system", "content": system},
                 {"role": "user", "content": "Проверь этот фрагмент. Локальные ID нужны только для привязки сигнала к доказательствам.\n" + self._pair_interaction_summary() + "\n" + "\n".join(prompt_lines)},
@@ -1402,36 +1381,7 @@ class JusticeAIAnalytics:
             "temperature": 0.1,
             "response_format": {"type": "json_object"},
         }
-        # Groq's gpt-oss models support a low reasoning budget and hidden
-        # reasoning output. Keep these provider-specific fields off other
-        # OpenAI-compatible endpoints.
-        if "groq.com" in self.base_url.casefold():
-            payload["reasoning_effort"] = "low"
-            payload["reasoning_format"] = "hidden"
-        timeout = aiohttp.ClientTimeout(total=self.timeout)
-        headers = {"Authorization": f"Bearer {self.api_key}", "Content-Type": "application/json"}
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(self.base_url, json=payload, headers=headers) as response:
-                if response.status >= 400:
-                    detail = ""
-                    try:
-                        data = await response.json()
-                        error = data.get("error", {}) if isinstance(data, dict) else {}
-                        detail = error.get("message", "") if isinstance(error, dict) else str(error)
-                    except Exception:
-                        pass
-                    if response.status == 429:
-                        lower = str(detail).casefold()
-                        delay = 6 * 3600 if ("tokens per day" in lower or "tpd" in lower or "daily token" in lower) else 300
-                        retry_after = response.headers.get("Retry-After")
-                        if retry_after:
-                            try:
-                                delay = max(60, min(6 * 3600, int(float(retry_after))))
-                            except (TypeError, ValueError):
-                                pass
-                        self._set_state_value("next_semantic_scan", (datetime.now(timezone.utc)+timedelta(seconds=delay)).isoformat())
-                    raise RuntimeError(f"AI semantic watch HTTP {response.status}")
-                data = await response.json()
+        data = await self._local_response(payload)
         content = (((data.get("choices") or [{}])[0].get("message") or {}).get("content") or "")
         parsed = self._json_object(content)
         signals = parsed.get("signals", [])
@@ -1577,12 +1527,12 @@ class JusticeAIAnalytics:
                 add(label, "fail", type(exc).__name__)
                 continue
             add(label, "ok" if ok else "fail", "" if ok else "таблица отсутствует")
-        configured = bool(self.api_key and self.base_url and self.model)
-        add("Groq настроен (ключ, URL, модель)", "ok" if configured else "warn", "" if configured else "нужны JF_AI_API_KEY / JF_AI_ENABLED")
+        configured = bool(getattr(self, "bridge", None) and self.bridge.ready)
+        add("Защищённый мост локальной модели подключён", "ok" if configured else "warn", "" if configured else "нужен защищённый мост и JF_AI_ENABLED")
         add("Аналитика включена", "ok" if self.enabled else "warn", "" if self.enabled else "JF_AI_ENABLED=false или JF_AI_ANALYTICS_ENABLED=false")
         add("Justice Watch включён", "ok" if self.watch_enabled else "warn")
         add("Семантический анализ", "ok" if (self.semantic_enabled and self.enabled and configured) else "warn",
-            "" if (self.semantic_enabled and self.enabled and configured) else "выключен или нет настроек Groq")
+            "" if (self.semantic_enabled and self.enabled and configured) else "выключен или мост недоступен")
         # Scheduler heartbeat: the loop must be alive when anything is enabled.
         if self.enabled or self.watch_enabled:
             if not self._heartbeat:
