@@ -5,6 +5,7 @@ services:
     buildCommand: pip install -r requirements.txt
     startCommand: python bot.py
     plan: free
+    healthCheckPath: /health
     envVars:
       - key: BOT_TOKEN
         sync: false
@@ -12,9 +13,13 @@ services:
         sync: false
       - key: PRIMARY_CHAT_ID
         sync: false
+      - key: JF_AI_BRIDGE_SECRET
+        sync: false
       - key: JF_ALLOW_EMPTY_DB_BOOTSTRAP
         value: "false"
       - key: JF_STORAGE_DURABLE
         value: "false"
       - key: ROLE_SYNC_INTERVAL_SECONDS
         value: "300"
+      - key: JF_AI_ENABLED
+        value: "false"

@@ -7607,8 +7607,17 @@ async def health(
 
 
 async def start_http_server():
-
-    app = web.Application()
+    # Bridge must already have been created in main() before background workers.
+    # Reuse the same instance so the in-memory queue and futures stay consistent.
+    ai_bridge = getattr(JF_AI, "bridge", None)
+    if ai_bridge is None:
+        from jf_ai_bridge import AIJobBridge
+        ai_bridge = AIJobBridge()
+        JF_AI.bridge = ai_bridge
+        JF_AI_ANALYTICS.bridge = ai_bridge
+    # Enforce the bridge body cap in aiohttp before handlers read request bodies.
+    app = web.Application(client_max_size=ai_bridge.max_body)
+    ai_bridge.register(app)
 
     app.router.add_get(
         "/",
@@ -10385,6 +10394,7 @@ async def main():
     if PRIMARY_CHAT_ID >= 0:
         raise RuntimeError("PRIMARY_CHAT_ID is invalid. The primary group ID must be negative.")
     JF_CONSOLE.primary_chat_id = PRIMARY_CHAT_ID
+    JF_AI.primary_chat_id = PRIMARY_CHAT_ID
     JF_AI_ANALYTICS.chat_id = PRIMARY_CHAT_ID
     cmdcfg.configure(bot=bot, owner_id=ADMIN_ID, primary_chat_id=PRIMARY_CHAT_ID, manager=JF_MANAGER)
     try:
@@ -10426,14 +10436,14 @@ async def main():
     # Resolve old STARTING games before polling: partial DM delivery must never
     # survive a process restart as a lobby that can be started again.
     await _spy_abort_interrupted_starts()
-    # Keep references so these long-running workers are not garbage-collected
-    # and can be cancelled cleanly on shutdown (Render restarts).
-    background_tasks = [
-        TASK_MANAGER.spawn(_spy_recovery_worker(), name="spy-recovery"),
-        TASK_MANAGER.spawn(JF_TIMERS.run_forever(), name="jf-timers"),
-        TASK_MANAGER.spawn(JF_AI_ANALYTICS.run_forever(), name="jf-ai-analytics"),
-        TASK_MANAGER.spawn(role_sync_worker(), name="jf-role-sync"),
-    ]
+
+    # Create the AI job bridge BEFORE any background AI workers start.
+    # This eliminates the previous race where JF_AI_ANALYTICS.run_forever()
+    # could begin before the bridge existed.
+    from jf_ai_bridge import AIJobBridge
+    ai_bridge = AIJobBridge()
+    JF_AI.bridge = ai_bridge
+    JF_AI_ANALYTICS.bridge = ai_bridge
 
     DELIVERY_QUEUE = asyncio.Queue()
     BROADCAST_QUEUE = asyncio.Queue()
@@ -10477,6 +10487,17 @@ async def main():
             )
 
     http_runner = await start_http_server()
+
+    # Start long-running workers only after the HTTP endpoints are listening.
+    # The bridge instance was created above, so analytics cannot queue work
+    # before a worker can reach the poll endpoint.
+    background_tasks = [
+        TASK_MANAGER.spawn(_spy_recovery_worker(), name="spy-recovery"),
+        TASK_MANAGER.spawn(JF_TIMERS.run_forever(), name="jf-timers"),
+        TASK_MANAGER.spawn(JF_AI_ANALYTICS.run_forever(), name="jf-ai-analytics"),
+        TASK_MANAGER.spawn(role_sync_worker(), name="jf-role-sync"),
+    ]
+
     TASK_MANAGER.spawn(game_poll_refresh_worker())
     TASK_MANAGER.spawn(game_poll_expiry_recovery_worker())
     TASK_MANAGER.spawn(mafia_expiry_recovery_worker())

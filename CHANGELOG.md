@@ -47,6 +47,17 @@
 
 # Changelog
 
+## 0.26.2 — Local Qwen release hardening (2026-11-14)
+
+- Created the single `AIJobBridge` instance in `main()` before scheduling background workers; the HTTP server reuses it.
+- Enforced the bridge request-body limit at the aiohttp application layer and rejected non-object JSON result payloads with HTTP 400.
+- Tightened HMAC header validation (signature format and nonce character/length constraints).
+- Expanded `tests_bridge.py` with real aiohttp HTTP tests for poll/result, invalid signatures, nonce replay, malformed JSON and oversized bodies.
+- Added `tests_release.py` for repeatable release-layout, configuration and startup-order checks.
+- Removed Python cache artifacts from the release package and corrected current README/worker setup instructions for the local-only AI path.
+- AI stays disabled by default. No live Telegram/Render/tablet end-to-end test is claimed.
+
+
 ## 0.26.1
 
 ### Critical
