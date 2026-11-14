@@ -171,19 +171,31 @@ class AIJobBridge:
 
         job_id = data.get("id")
         answer = data.get("answer")
+        error = data.get("error")
 
-        if not isinstance(job_id, str) or not isinstance(answer, str):
-            raise web.HTTPBadRequest()
+        if not isinstance(job_id, str) or len(job_id) != 32:
+            raise web.HTTPBadRequest(text="Некорректный id задания.")
 
-        if len(answer) > 16000:
-            raise web.HTTPRequestEntityTooLarge(
-                max_size=16000, actual_size=len(answer)
-            )
+        if (isinstance(answer, str)) == (isinstance(error, dict)):
+            raise web.HTTPBadRequest(text="Нужен ровно один результат: answer или error.")
 
         job = self.jobs.get(job_id)
-
         if not job or job["future"].done():
             return web.json_response({"accepted": False}, status=409)
 
-        job["future"].set_result(answer)
+        if isinstance(answer, str):
+            if not answer.strip():
+                raise web.HTTPBadRequest(text="Пустой ответ модели.")
+            if len(answer) > 16000:
+                raise web.HTTPRequestEntityTooLarge(
+                    max_size=16000, actual_size=len(answer)
+                )
+            job["future"].set_result(answer)
+        else:
+            error_type = str(error.get("type", "GenerationError"))[:80]
+            error_message = str(error.get("message", "Ошибка локальной генерации."))[:500]
+            job["future"].set_exception(
+                RuntimeError(f"Локальная генерация: {error_type}: {error_message}")
+            )
+
         return web.json_response({"accepted": True})
